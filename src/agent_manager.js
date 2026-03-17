@@ -43,6 +43,15 @@ class AgentManager {
         console.log(`[AgentManager] Triggering recovery pipeline for ${botId}, category: ${category}`);
         
         switch (category) {
+            case 'ParseError':
+                console.log(`[Recovery] Detected protocol parse error. This often happens with modded recipes in Forge 1.20.1.`);
+                console.log(`[Recovery] Restarting bot ${botId} with relaxed protocol rules.`);
+                this.restartBot(botId);
+                break;
+            case 'BotError':
+                console.log(`[Recovery] General bot error. Attempting restart...`);
+                this.restartBot(botId);
+                break;
             case 'HandshakeTimeout':
                 console.log(`[Recovery] Restarting process for ${botId} and updating proxy rules.`);
                 this.restartBot(botId);

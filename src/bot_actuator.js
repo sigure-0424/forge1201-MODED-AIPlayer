@@ -25,6 +25,20 @@ const bot = mineflayer.createBot({
 // Actually, let's wait for bot._client to be available
 bot.on('inject_allowed', () => {
     process.send({ type: 'LOG', data: `${botId} client injected, initializing FML3 handshake.` });
+    
+    // Forge 1.20.1 Protocol Patch: Avoid crashing on modded recipes and tags
+    // Some Forge servers send NBT that is not compatible with standard NMP/Prismarine-NBT parsers.
+    try {
+        const protocol = bot._client.deserializer.protocol;
+        if (protocol?.play?.toClient?.types) {
+            protocol.play.toClient.types.declare_recipes = 'native';
+            protocol.play.toClient.types.tags = 'native';
+            process.send({ type: 'LOG', data: 'Patched protocol for Forge 1.20.1 (Recipes and Tags set to native).' });
+        }
+    } catch (e) {
+        process.send({ type: 'LOG', data: `Protocol patch failed: ${e.message}` });
+    }
+
     const handshake = new ForgeHandshakeStateMachine(bot._client);
     
     handshake.on('handshake_complete', (registrySyncBuffer) => {
@@ -36,9 +50,8 @@ bot.on('inject_allowed', () => {
 
     // Handle packet parsing errors specifically
     bot._client.on('error', (err) => {
-        if (err.field === 'play.toClient') {
-            process.send({ type: 'ERROR', category: 'ParseError', details: `Failed to parse S2C packet: ${err.message}` });
-        }
+        // If it's a parse error, we already tried to patch it. If it still happens, we report it.
+        process.send({ type: 'ERROR', category: 'ParseError', details: `Failed to parse S2C packet: ${err.message} at ${err.field}` });
     });
 });
 
