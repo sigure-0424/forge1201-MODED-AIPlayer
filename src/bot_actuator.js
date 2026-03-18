@@ -18,11 +18,13 @@ try {
     const mcDataGlobal = require('minecraft-data')('1.20.1');
     if (mcDataGlobal && mcDataGlobal.protocol && mcDataGlobal.protocol.play && mcDataGlobal.protocol.play.toClient) {
         const types = mcDataGlobal.protocol.play.toClient.types;
-        types.declare_recipes = 'restBuffer';
-        types.tags = 'restBuffer';
-        types.advancements = 'restBuffer';
-        types.declare_commands = 'restBuffer';
-        console.log('[Actuator] Applied global protocol patches (Recipes/Tags/Advancements/Commands -> restBuffer).');
+        // Bypassing all problematic modded packets to prevent protocol stream desync
+        const bypass = ['declare_recipes', 'tags', 'advancements', 'declare_commands', 'unlock_recipes', 'craft_recipe_response', 'nbt_query_response'];
+        for (const p of bypass) {
+            types[p] = 'restBuffer';
+            if (types['packet_' + p]) types['packet_' + p] = 'restBuffer';
+        }
+        console.log('[Actuator] Applied global protocol bypasses.');
     }
 } catch (e) {
     console.error(`[Actuator] Global protocol patch failed: ${e.message}`);
@@ -62,15 +64,31 @@ bot.on('inject_allowed', () => {
             const parsed = injector.parseRegistryPayload(registrySyncBuffer);
             injector.injectBlockToRegistry(parsed);
             
-            // Solid block proxy to prevent void death
+            // Solid block proxy to prevent void death and pathfinder paralysis
+            const defaultBlock = { 
+                id: 0, 
+                name: 'mod_block', 
+                displayName: 'Mod Block', 
+                boundingBox: 'block', 
+                hardness: 1, 
+                diggable: true,
+                transparent: false,
+                material: 'rock',
+                states: []
+            };
+
             const handler = {
                 get: (target, prop) => {
                     if (prop in target) return target[prop];
-                    if (!isNaN(prop)) return { id: parseInt(prop), name: 'mod_block', boundingBox: 'block', hardness: 1 };
+                    if (!isNaN(prop)) {
+                        const id = parseInt(prop);
+                        return { ...defaultBlock, id };
+                    }
                     return undefined;
                 }
             };
             bot.registry.blocks = new Proxy(bot.registry.blocks, handler);
+            console.log('[Actuator] Applied comprehensive block proxy for modded IDs.');
         }, 100);
     });
 });
@@ -79,6 +97,10 @@ bot.loadPlugin(pathfinder);
 
 bot.on('spawn', () => {
     console.log('[Actuator] Bot spawned.');
+    
+    // Ensure registry consistency
+    if (!bot.registry.tags) bot.registry.tags = {};
+
     const debouncer = new EventDebouncer(bot);
     const nbtPatch = new InventoryNBTPatch(bot);
     const hazard = new CreateContraptionHazard(bot.pathfinder);
@@ -88,18 +110,29 @@ bot.on('spawn', () => {
     const mcData = require('minecraft-data')(bot.version);
     const movements = new Movements(bot, mcData);
     
-    // Forge safe movements: allow breaking most modded blocks if hardness is unknown
+    // Forge safe movements: allow breaking and walking on modded blocks
     movements.canDig = true;
     movements.allowSprinting = true;
     movements.allow1by1towers = true;
+    movements.allowParkour = true;
+    movements.digCost = 1;
+    movements.placeCost = 1;
     
     bot.pathfinder.setMovements(movements);
+    console.log('[Actuator] Pathfinder movements configured (Permissive Mode).');
+
     bot.chat('AI Player Online. Use "come" to test movement.');
 });
 
+// Pathfinder Debugging (Events are on bot, not bot.pathfinder)
+bot.on('path_update', (r) => {
+    if (r.status === 'success') console.log(`[Pathfinder] Path found: ${r.path.length} nodes.`);
+    else console.log(`[Pathfinder] Path failed: ${r.status}`);
+});
+bot.on('goal_reached', () => console.log('[Pathfinder] Goal reached!'));
+
 bot.on('death', () => {
     console.log('[Actuator] Bot died. Respawning...');
-    // Mineflayer usually auto-respawns, but we can force it just in case
     setTimeout(() => {
         try { bot.respawn(); } catch (e) {}
     }, 1000);
@@ -108,14 +141,21 @@ bot.on('death', () => {
 // Movement Test Command
 bot.on('chat', (username, message) => {
     if (username === bot.username) return;
-    if (message === 'come') {
+    if (message === 'come' || message === 'look') {
         const player = bot.players[username];
         if (!player || !player.entity) {
             bot.chat('I cannot see you!');
             return;
         }
-        bot.chat(`Coming to you, ${username}!`);
-        bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 1), true);
+        
+        bot.lookAt(player.entity.position.offset(0, player.entity.height, 0));
+        
+        if (message === 'come') {
+            bot.chat(`Coming to you, ${username}!`);
+            bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 1), true);
+        } else {
+            bot.chat('Looking at you!');
+        }
     } else if (message === 'stop') {
         bot.pathfinder.setGoal(null);
         bot.chat('Stopping.');
@@ -124,7 +164,6 @@ bot.on('chat', (username, message) => {
 
 bot._client.on('error', (err) => {
     console.error(`[Actuator] Protocol Error: ${err.message} at ${err.field}`);
-    // No longer sending ERROR to manager for minor parse errors to avoid crash loops
 });
 
 bot.on('error', (err) => {

@@ -26,25 +26,34 @@ class DynamicRegistryInjector {
         for (const buf of payloadBuffers) {
             try {
                 const str = buf.toString('utf8');
-                // Simple regex to find ResourceLocations
+                // Highly lenient regex to find ResourceLocations in binary/NBT data
                 const matches = str.match(/[a-z0-9_.-]+:[a-z0-9_.-]+/g);
                 
                 if (matches) {
                     for (const match of matches) {
-                        const matchIndex = buf.indexOf(Buffer.from(match, 'utf8'));
+                        const matchBuf = Buffer.from(match, 'utf8');
+                        const matchIndex = buf.indexOf(matchBuf);
                         if (matchIndex === -1) continue;
                         
-                        let offset = matchIndex + Buffer.from(match, 'utf8').length;
+                        let offset = matchIndex + matchBuf.length;
+                        let entryId;
                         
+                        // Try to extract the REAL ID if it follows the name in the binary stream
                         try {
-                            const { value: entryId, bytesRead } = this.readVarInt(buf, offset);
-                            const type = match.includes('block') || match.includes('ore') ? 'block' : 'item';
-                            
-                            if (!parsedEntries.find(e => e.name === match)) {
-                                parsedEntries.push({ id: entryId, name: match, type });
+                            const { value, bytesRead } = this.readVarInt(buf, offset);
+                            if (value >= 0 && value < 1000000) {
+                                entryId = value;
                             }
-                        } catch (e) {
-                            // ID reading failed, likely not a registry entry entry point
+                        } catch (e) {}
+                        
+                        // Fallback to synthetic ID if extraction fails
+                        if (entryId === undefined) {
+                            entryId = 20000 + parsedEntries.length;
+                        }
+                        
+                        if (!parsedEntries.find(e => e.name === match)) {
+                            const type = match.includes('block') || match.includes('ore') ? 'block' : 'item';
+                            parsedEntries.push({ id: entryId, name: match, type });
                         }
                     }
                 }
@@ -53,7 +62,7 @@ class DynamicRegistryInjector {
             }
         }
         
-        console.log(`[DynamicRegistry] Discovered ${parsedEntries.length} entries via heuristic.`);
+        console.log(`[DynamicRegistry] Discovered ${parsedEntries.length} entries via lenient heuristic.`);
         return parsedEntries;
     }
 
@@ -64,28 +73,37 @@ class DynamicRegistryInjector {
             if (entry.type === 'block') {
                 if (this.registry.blocksByName[entry.name]) continue;
 
-                this.registry.blocks[entry.id] = {
+                const blockData = {
                     id: entry.id,
                     name: entry.name,
                     displayName: entry.name,
                     hardness: 1.0,
                     diggable: true,
                     boundingBox: 'block',
+                    transparent: false,
                     material: 'rock',
                     harvestTools: {},
                     states: []
                 };
-                this.registry.blocksByName[entry.name] = this.registry.blocks[entry.id];
+                this.registry.blocks[entry.id] = blockData;
+                this.registry.blocksByName[entry.name] = blockData;
+                if (this.registry.blocksArray && !this.registry.blocksArray.includes(blockData)) {
+                    this.registry.blocksArray.push(blockData);
+                }
             } else if (entry.type === 'item') {
                 if (this.registry.itemsByName[entry.name]) continue;
 
-                this.registry.items[entry.id] = {
+                const itemData = {
                     id: entry.id,
                     name: entry.name,
                     displayName: entry.name,
                     stackSize: 64
                 };
-                this.registry.itemsByName[entry.name] = this.registry.items[entry.id];
+                this.registry.items[entry.id] = itemData;
+                this.registry.itemsByName[entry.name] = itemData;
+                if (this.registry.itemsArray && !this.registry.itemsArray.includes(itemData)) {
+                    this.registry.itemsArray.push(itemData);
+                }
             }
         }
         console.log('[DynamicRegistry] Injection complete.');
