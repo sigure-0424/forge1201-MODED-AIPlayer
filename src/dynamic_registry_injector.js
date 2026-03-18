@@ -55,36 +55,42 @@ class DynamicRegistryInjector {
 
     injectBlockToRegistry(parsedEntries) {
         console.log(`[DynamicRegistry] Injecting ${parsedEntries.length} entries...`);
-        
-        // Use Stone as a template for all modded blocks to ensure valid properties
-        const template = this.registry.blocksByName['stone'] || {
-            hardness: 1.5, resistance: 6, material: 'rock', boundingBox: 'block'
-        };
+        const template = this.registry.blocksByName['stone']; // 未知のMOD用フォールバック
 
         for (const entry of parsedEntries) {
             if (entry.type === 'block') {
-                const shortName = entry.name.replace('minecraft:', '');
-                if (this.registry.blocksByName[shortName]) continue;
+                // "minecraft:" や "forge:" などの名前空間を削除してバニラ名を取得
+                const shortName = entry.name.replace(/^[^:]+:/, '');
 
-                const blockData = {
-                    ...template,
-                    id: entry.id,
-                    name: entry.name,
-                    displayName: entry.name,
-                    states: [],
-                    minStateId: entry.id,
-                    maxStateId: entry.id,
-                    defaultState: entry.id
-                };
+                let finalBlockData;
+
+                if (this.registry.blocksByName[shortName]) {
+                    // ① バニラブロックの場合：既存の正確な物理データ（空気なら非固体）をコピーしてIDのみ更新
+                    const vanillaData = this.registry.blocksByName[shortName];
+                    finalBlockData = { ...vanillaData, id: entry.id, name: entry.name };
+                } else {
+                    // ② 完全な未知のMODブロックの場合：落下防止のためStoneとして登録
+                    finalBlockData = {
+                        ...template,
+                        id: entry.id,
+                        name: entry.name,
+                        displayName: entry.name,
+                        states: [],
+                        minStateId: entry.id,
+                        maxStateId: entry.id,
+                        defaultState: entry.id
+                    };
+
+                    if (this.registry.blockCollisionShapes) {
+                        this.registry.blockCollisionShapes.blocks[entry.name] = 1; // 1 = 固体キューブ
+                    }
+                }
 
                 // DIRECT INJECTION - NO PROXIES
-                this.registry.blocks[entry.id] = blockData;
-                this.registry.blocksByName[entry.name] = blockData;
-                if (this.registry.blocksByStateId) this.registry.blocksByStateId[entry.id] = blockData;
-                if (this.registry.blocksArray) this.registry.blocksArray.push(blockData);
-                if (this.registry.blockCollisionShapes) {
-                    this.registry.blockCollisionShapes.blocks[entry.name] = 1; // Solid
-                }
+                this.registry.blocks[entry.id] = finalBlockData;
+                this.registry.blocksByName[entry.name] = finalBlockData;
+                if (this.registry.blocksByStateId) this.registry.blocksByStateId[entry.id] = finalBlockData;
+                if (this.registry.blocksArray) this.registry.blocksArray.push(finalBlockData);
             } else {
                 if (this.registry.itemsByName[entry.name]) continue;
                 const itemData = { id: entry.id, name: entry.name, displayName: entry.name, stackSize: 64 };
