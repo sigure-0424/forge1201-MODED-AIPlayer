@@ -99,15 +99,6 @@ bot.on('spawn', () => {
     }, 500); // Check every 500ms
 });
 
-// SERVER VELOCITY SYNC
-bot._client.on('entity_velocity', (packet) => {
-    if (packet.entityId === bot.entity.id) {
-        console.log(`[Actuator] Recv Knockback: ${packet.velocityX}, ${packet.velocityY}, ${packet.velocityZ}`);
-        // The server sends velocity as 1/8000th of a block per tick.
-        bot.entity.velocity.set(packet.velocityX / 8000, packet.velocityY / 8000, packet.velocityZ / 8000);
-    }
-});
-
 // Chat Command Handler
 bot.on('chat', (username, message) => {
     if (username === bot.username) return;
