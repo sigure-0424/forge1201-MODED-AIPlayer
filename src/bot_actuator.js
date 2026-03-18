@@ -18,9 +18,9 @@ process.on('uncaughtException', (err) => {
 const botId = process.env.BOT_ID || 'Bot';
 const botOptions = process.env.BOT_OPTIONS ? JSON.parse(process.env.BOT_OPTIONS) : {};
 
-console.log(`[Actuator] Starting ${botId} for Forge 1.20.1...`);
+console.log(`[Actuator] Initializing ${botId} for Forge 1.20.1...`);
 
-// Global Protocol/NBT Bypasses
+// Protocol & NBT Bypasses
 try {
     const mcDataGlobal = require('minecraft-data')('1.20.1');
     const types = mcDataGlobal.protocol.play.toClient.types;
@@ -35,7 +35,7 @@ try {
     nbtProto.read = function (buffer, offset) {
         try { return originalRead.call(this, buffer, offset); } catch (e) { return nbtProto.readAnon(buffer, offset); }
     };
-    console.log('[Actuator] Protocol bypasses and NBT leniency applied.');
+    console.log('[Actuator] Global protocol/NBT patches applied.');
 } catch (e) { console.error(`[Actuator] Patch failed: ${e.message}`); }
 
 const bot = mineflayer.createBot({
@@ -53,7 +53,7 @@ bot.on('inject_allowed', () => {
     console.log('[Actuator] Connection allowed. Starting handshake machine...');
     const handshake = new ForgeHandshakeStateMachine(bot._client);
     handshake.on('handshake_complete', (registrySyncBuffer) => {
-        console.log('[Actuator] Handshake finalized. Injecting registries...');
+        console.log('[Actuator] Handshake complete. Processing registries via Vanilla-First Mode...');
         const injector = new DynamicRegistryInjector(bot.registry);
         const parsed = injector.parseRegistryPayload(registrySyncBuffer);
         injector.injectBlockToRegistry(parsed);
@@ -65,41 +65,36 @@ bot.loadPlugin(pathfinder);
 
 bot.on('spawn', () => {
     const pos = bot.entity.position;
-    console.log(`[Actuator] Bot spawned at ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`);
+    console.log(`[Actuator] Spawned at ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`);
     
+    // Enable physics explicitly
+    bot.physics.enabled = true;
     bot.entity.velocity.set(0, 0, 0);
 
-    // Wait for the terrain underneath to load before starting pathfinder and actions
-    const checkTerrainLoaded = setInterval(() => {
-        if (bot.entity && bot.blockAt(bot.entity.position) != null) {
-            clearInterval(checkTerrainLoaded);
+    // Movements Setup
+    const movements = new Movements(bot, mcData); 
+    movements.canDig = true;
+    movements.allowSprinting = true;
+    movements.allow1by1towers = false; 
+    movements.digCost = 10;
+    movements.placeCost = 10;
+    
+    bot.pathfinder.setMovements(movements);
+    bot.pathfinder.thinkTimeout = 4000; 
+    
+    console.log('[Actuator] Pathfinder and Physics initialized.');
+    bot.chat('Forge AI Player Ready.');
 
-            // Movements Setup
-            const movements = new Movements(bot, mcData);
-            movements.canDig = true;
-            movements.allowSprinting = true;
-            movements.allow1by1towers = true;
-            movements.digCost = 10;
-            movements.placeCost = 10;
-
-            bot.pathfinder.setMovements(movements);
-            bot.pathfinder.thinkTimeout = 4000; // Cap pathfinding time to prevent lockup
-
-            console.log('[Actuator] Pathfinder and Physics initialized (Terrain loaded).');
-            bot.chat('Forge AI Player Ready.');
-
-            // Periodic Heartbeat
-            setInterval(() => {
-                if (bot.entity) {
-                    const p = bot.entity.position;
-                    console.log(`[Heartbeat] Pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} | Ground: ${bot.entity.onGround} | Health: ${bot.health.toFixed(1)}`);
-                }
-            }, 10000);
+    // Periodic Heartbeat
+    setInterval(() => {
+        if (bot.entity) {
+            const p = bot.entity.position;
+            console.log(`[Heartbeat] Pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} | Ground: ${bot.entity.onGround} | Health: ${bot.health.toFixed(1)}`);
         }
-    }, 500); // Check every 500ms
+    }, 10000);
 });
 
-// Chat Command Handler
+// Command Handler
 bot.on('chat', (username, message) => {
     if (username === bot.username) return;
     const parts = message.toLowerCase().split(' ');
@@ -113,11 +108,11 @@ bot.on('chat', (username, message) => {
                 return;
             }
             bot.chat(`Coming to you, ${username}!`);
-            const goal = new goals.GoalFollow(player.entity, 1);
-            bot.pathfinder.setGoal(goal, true);
+            bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 1), true);
         } else if (cmd === 'status') {
             const p = bot.entity.position;
-            bot.chat(`Pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} | HP: ${bot.health.toFixed(0)} | Ground: ${bot.entity.onGround}`);
+            const b = bot.blockAt(p.offset(0, -0.5, 0));
+            bot.chat(`Pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} | Ground: ${bot.entity.onGround} | Block: ${b ? b.name : '?'}`);
         } else if (cmd === 'stop') {
             bot.pathfinder.setGoal(null);
             bot.chat('Stopped.');

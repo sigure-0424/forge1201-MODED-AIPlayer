@@ -1,5 +1,4 @@
-// dynamic_registry_injector.js
-
+// src/dynamic_registry_injector.js
 class DynamicRegistryInjector {
     constructor(registry) {
         this.registry = registry;
@@ -37,13 +36,13 @@ class DynamicRegistryInjector {
                         if (value >= 0 && value < 32767) entryId = value;
                     } catch (e) {}
                     
-                    if (entryId === undefined) entryId = 30000 + parsedEntries.length;
-                    
-                    if (!parsedEntries.find(e => e.name === name)) {
+                    if (entryId !== undefined) {
+                        // Simple block/item discrimination
                         const lower = name.toLowerCase();
                         const isBlock = lower.includes('block') || lower.includes('stone') || lower.includes('ore') || 
                                         lower.includes('dirt') || lower.includes('grass') || lower.includes('planks') ||
-                                        lower.includes('log') || lower.includes('plate') || lower.includes('base');
+                                        lower.includes('log') || lower.includes('plate') || lower.includes('base') ||
+                                        lower.includes('air') || lower.includes('water') || lower.includes('lava');
                         parsedEntries.push({ id: entryId, name, type: isBlock ? 'block' : 'item' });
                     }
                 }
@@ -54,52 +53,29 @@ class DynamicRegistryInjector {
     }
 
     injectBlockToRegistry(parsedEntries) {
-        console.log(`[DynamicRegistry] Injecting ${parsedEntries.length} entries...`);
-        const template = this.registry.blocksByName['stone']; // 未知のMOD用フォールバック
+        console.log(`[DynamicRegistry] Vanilla-First Mode: Mapping existing vanilla blocks only.`);
+        let mappedCount = 0;
 
         for (const entry of parsedEntries) {
             if (entry.type === 'block') {
-                // "minecraft:" や "forge:" などの名前空間を削除してバニラ名を取得
+                // Remove the namespace (e.g., minecraft:) to get the pure block name
                 const shortName = entry.name.replace(/^[^:]+:/, '');
+                
+                // Retrieve the vanilla block definition already held by Mineflayer
+                const vanillaBlock = this.registry.blocksByName[shortName];
 
-                let finalBlockData;
-
-                if (this.registry.blocksByName[shortName]) {
-                    // ① バニラブロックの場合：既存の正確な物理データ（空気なら非固体）をコピーしてIDのみ更新
-                    const vanillaData = this.registry.blocksByName[shortName];
-                    finalBlockData = { ...vanillaData, id: entry.id, name: entry.name };
-                } else {
-                    // ② 完全な未知のMODブロックの場合：落下防止のためStoneとして登録
-                    finalBlockData = {
-                        ...template,
-                        id: entry.id,
-                        name: entry.name,
-                        displayName: entry.name,
-                        states: [],
-                        minStateId: entry.id,
-                        maxStateId: entry.id,
-                        defaultState: entry.id
-                    };
-
-                    if (this.registry.blockCollisionShapes) {
-                        this.registry.blockCollisionShapes.blocks[entry.name] = 1; // 1 = 固体キューブ
+                if (vanillaBlock) {
+                    // Do not touch the array (blocksArray); only rewire the reference from the ID to the vanilla definition
+                    // This corrects Forge-specific ID shifts while preventing Pathfinder crashes
+                    this.registry.blocks[entry.id] = vanillaBlock;
+                    if (this.registry.blocksByStateId) {
+                        this.registry.blocksByStateId[entry.id] = vanillaBlock;
                     }
+                    mappedCount++;
                 }
-
-                // DIRECT INJECTION - NO PROXIES
-                this.registry.blocks[entry.id] = finalBlockData;
-                this.registry.blocksByName[entry.name] = finalBlockData;
-                if (this.registry.blocksByStateId) this.registry.blocksByStateId[entry.id] = finalBlockData;
-                if (this.registry.blocksArray) this.registry.blocksArray.push(finalBlockData);
-            } else {
-                if (this.registry.itemsByName[entry.name]) continue;
-                const itemData = { id: entry.id, name: entry.name, displayName: entry.name, stackSize: 64 };
-                this.registry.items[entry.id] = itemData;
-                this.registry.itemsByName[entry.name] = itemData;
-                if (this.registry.itemsArray) this.registry.itemsArray.push(itemData);
             }
         }
-        console.log('[DynamicRegistry] Injection complete.');
+        console.log(`[DynamicRegistry] Mapped ${mappedCount} vanilla blocks. Ignored MOD blocks.`);
     }
 }
 
