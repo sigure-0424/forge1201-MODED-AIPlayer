@@ -63,7 +63,8 @@ class DynamicRegistryInjector {
 
         for (const entry of parsedEntries) {
             if (entry.type === 'block') {
-                if (this.registry.blocksByName[entry.name]) continue;
+                const shortName = entry.name.replace('minecraft:', '');
+                if (this.registry.blocksByName[shortName]) continue;
 
                 const blockData = {
                     ...template,

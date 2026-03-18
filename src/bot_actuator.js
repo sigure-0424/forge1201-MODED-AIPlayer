@@ -69,27 +69,34 @@ bot.on('spawn', () => {
     
     bot.entity.velocity.set(0, 0, 0);
 
-    // Movements Setup
-    const movements = new Movements(bot, mcData); 
-    movements.canDig = true;
-    movements.allowSprinting = true;
-    movements.allow1by1towers = true;
-    movements.digCost = 10;
-    movements.placeCost = 10;
-    
-    bot.pathfinder.setMovements(movements);
-    bot.pathfinder.thinkTimeout = 4000; // Cap pathfinding time to prevent lockup
-    
-    console.log('[Actuator] Pathfinder and Physics initialized.');
-    bot.chat('Forge AI Player Ready.');
+    // Wait for the terrain underneath to load before starting pathfinder and actions
+    const checkTerrainLoaded = setInterval(() => {
+        if (bot.entity && bot.blockAt(bot.entity.position) != null) {
+            clearInterval(checkTerrainLoaded);
 
-    // Periodic Heartbeat
-    setInterval(() => {
-        if (bot.entity) {
-            const p = bot.entity.position;
-            console.log(`[Heartbeat] Pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} | Ground: ${bot.entity.onGround} | Health: ${bot.health.toFixed(1)}`);
+            // Movements Setup
+            const movements = new Movements(bot, mcData);
+            movements.canDig = true;
+            movements.allowSprinting = true;
+            movements.allow1by1towers = true;
+            movements.digCost = 10;
+            movements.placeCost = 10;
+
+            bot.pathfinder.setMovements(movements);
+            bot.pathfinder.thinkTimeout = 4000; // Cap pathfinding time to prevent lockup
+
+            console.log('[Actuator] Pathfinder and Physics initialized (Terrain loaded).');
+            bot.chat('Forge AI Player Ready.');
+
+            // Periodic Heartbeat
+            setInterval(() => {
+                if (bot.entity) {
+                    const p = bot.entity.position;
+                    console.log(`[Heartbeat] Pos: ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} | Ground: ${bot.entity.onGround} | Health: ${bot.health.toFixed(1)}`);
+                }
+            }, 10000);
         }
-    }, 10000);
+    }, 500); // Check every 500ms
 });
 
 // SERVER VELOCITY SYNC
@@ -98,20 +105,6 @@ bot._client.on('entity_velocity', (packet) => {
         console.log(`[Actuator] Recv Knockback: ${packet.velocityX}, ${packet.velocityY}, ${packet.velocityZ}`);
         // The server sends velocity as 1/8000th of a block per tick.
         bot.entity.velocity.set(packet.velocityX / 8000, packet.velocityY / 8000, packet.velocityZ / 8000);
-    }
-});
-
-// PASSIVE PHYSICS FALLBACK: Prevent floating when chunks are unloaded
-bot.on('physicsTick', () => {
-    if (!bot.entity) return;
-    const pos = bot.entity.position;
-    // When the bot is in an unloaded chunk, Mineflayer's physics engine simply returns without
-    // updating gravity, causing the bot to float. To "treat the server as the source of truth"
-    // and passively fall, we manually apply gravity if the block underneath cannot be resolved.
-    if (bot.blockAt(pos) == null) {
-        bot.entity.velocity.y -= 0.08; // gravity
-        bot.entity.velocity.y *= 0.98; // drag
-        bot.entity.position.add(bot.entity.velocity);
     }
 });
 

@@ -31,16 +31,16 @@ class MockAgentManager extends AgentManager {
 const manager = new MockAgentManager();
 let restartCalled = false;
 
-// Override restartBot to verify it was called
-manager.restartBot = (botId) => {
-    console.log(`[Test] restartBot called for ${botId}`);
+// Override scheduleRestart to verify it was called
+manager.scheduleRestart = (botId) => {
+    console.log(`[Test] scheduleRestart called for ${botId}`);
     restartCalled = true;
 };
 
 manager.startBot('test-bot', {});
 
 setTimeout(() => {
-    assert(restartCalled, 'restartBot should have been called upon HandshakeTimeout error');
+    assert(restartCalled, 'scheduleRestart should have been called upon HandshakeTimeout error');
     console.log('AgentManager recovery test PASSED!');
     process.exit(0);
 }, 1500);
