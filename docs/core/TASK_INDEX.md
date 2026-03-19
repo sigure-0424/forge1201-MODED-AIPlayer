@@ -3,6 +3,7 @@
 ## Active
 
 ## Completed
+- BUGFIX-20260319-001-missing-collectblock: Installed missing 'mineflayer-collectblock' to resolve crash on launch
 - TASK-20260319-001-finalize-npm-scripts: Finalize package.json npm scripts to run test suite
 - BUGFIX-20260318-002-fix-modded-block-interaction: Fix modded block interaction issues
 - TASK-20260318-002-documentation-alignment: Documentation Alignment and Finalization
