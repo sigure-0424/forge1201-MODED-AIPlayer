@@ -28,9 +28,12 @@ function resolveWslUrl(url) {
 }
 
 class LLMClient {
-    constructor(model = process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud', url = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate') {
+    constructor(model = process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud', url = process.env.OLLAMA_URL || 'http://127.0.0.1:11434/api/generate') {
         this.model = model;
-        this.url = resolveWslUrl(url);
+        // Node.js >= 18's fetch defaults to IPv6 ::1 for 'localhost', which Ollama often rejects.
+        // Force IPv4 loopback if localhost is specified.
+        let resolvedUrl = url.replace('http://localhost:', 'http://127.0.0.1:');
+        this.url = resolveWslUrl(resolvedUrl);
         console.log(`[LLMClient] Endpoint: ${this.url}  Model: ${this.model}`);
     }
 
