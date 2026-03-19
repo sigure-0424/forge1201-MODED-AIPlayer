@@ -1,0 +1,14 @@
+{
+  "create:andesite_casing": {
+    "solid": true,
+    "hardness": 2.0,
+    "transparent": false,
+    "boundingBox": "block"
+  },
+  "create:cogwheel": {
+    "solid": false,
+    "hardness": 1.0,
+    "transparent": true,
+    "boundingBox": "empty"
+  }
+}
