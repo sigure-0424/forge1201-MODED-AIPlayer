@@ -216,6 +216,15 @@ const LOG_NAMES = new Set([
 // FIX: ensureToolFor now also proactively crafts a speed-improving tool (axe for logs)
 // even when harvestTools is null, preventing the 30s-per-log timeout without an axe.
 async function ensureToolFor(block) {
+    // Skip fluids, air, and any block the registry marks as non-diggable.
+    // Calling this for water/lava would fall through to the default 'pickaxe'
+    // branch and trigger an expensive (and fatal-OOM) auto-craft loop.
+    if (!block) return;
+    const bname = block.name || '';
+    if (bname === 'air' || bname.includes('water') || bname.includes('lava') ||
+        bname === 'void_air' || bname === 'cave_air') return;
+    if (block.diggable === false) return;
+
     const toolCat = inferToolCategory(block);
     const hasRequirement = block.harvestTools && Object.keys(block.harvestTools).length > 0;
 
@@ -457,9 +466,13 @@ async function processActionQueue() {
                         if (fresh.length === 0) continue;
 
                         if (collected === 0 && pass.maxDistance === 32) {
-                            // Pre-check tool once before the first pass
+                            // Pre-check tool once before the first pass.
+                            // Verify the block type still matches — the position may have changed
+                            // (water flowed in, chunk unloaded) since findBlocks ran.
                             const firstBlock = bot.blockAt(fresh[0]);
-                            if (firstBlock) await ensureToolFor(firstBlock);
+                            if (firstBlock && firstBlock.type === blockId) {
+                                await ensureToolFor(firstBlock);
+                            }
                             bot.chat(`Collecting ${action.target}...`);
                         } else if (pass.maxDistance === 64) {
                             bot.chat(`Expanding search for more ${action.target}...`);
