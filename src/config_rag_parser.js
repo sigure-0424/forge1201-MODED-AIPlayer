@@ -59,9 +59,12 @@ class ConfigRAGParser {
         context += "\n=== AI INSTRUCTION FORMAT ===\n";
         context += "Output commands strictly in JSON format to be executed by the bot. Supported formats:\n";
         context += "- Follow a player: `{\"action\": \"come\", \"target\": \"player_name\"}`\n";
-        context += "- Break a block: `{\"action\": \"break\", \"target\": \"x,y,z\"}`\n";
         context += "- Stop current task: `{\"action\": \"stop\"}`\n";
         context += "- Get status: `{\"action\": \"status\"}`\n";
+        context += "- Go to coordinates: `{\"action\": \"goto\", \"x\": 100, \"y\": 64, \"z\": -200}`\n";
+        context += "- Search for a block: `{\"action\": \"search\", \"target\": \"diamond_ore\"}`\n";
+        context += "- Collect blocks: `{\"action\": \"collect\", \"target\": \"oak_log\", \"quantity\": 10, \"bounds\": {\"min\": {\"x\": 0, \"y\": 60, \"z\": 0}, \"max\": {\"x\": 10, \"y\": 70, \"z\": 10}}}` (bounds are optional)\n";
+        context += "- Give an item to a player: `{\"action\": \"give\", \"target\": \"player_name\", \"item\": \"iron_ingot\", \"quantity\": 5}`\n";
 
         return context;
     }
