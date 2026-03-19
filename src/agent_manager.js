@@ -153,26 +153,51 @@ class AgentManager {
 User '${data.username}' said: "${data.message}"
 Current Environment: ${JSON.stringify(data.environment)}
 
-Decide your next action based on the user's command and your environment.
-*CRITICAL*: You MUST prioritize taking action over conversation. Only use the 'chat' action to report unrecoverable errors or answer direct questions.
-*CRITICAL*: You will receive follow-up 'System' messages letting you know if an action succeeded or failed. If you fail to collect a block, consider crafting a proper tool first (e.g. a wooden_shovel for dirt).
-*CRITICAL*: Always check your inventory. If you are asked to collect dirt, craft a shovel first. If you don't have wood for a shovel, collect wood first. Use the 'craft' action to make items. If you need a crafting table, craft one, 'place' it, and then craft your desired tool.
-*CRITICAL*: The bot will automatically attempt to craft a required tool before mining if none is found — do NOT loop on tool-crafting if you already issued a collect command.
-Respond ONLY with a valid JSON array containing one or more action objects.
-If the user provides only two numbers for coordinates, assign them to X and Z respectively, and omit Y.
-You may add a 'timeout' parameter (in seconds) to any action (default is 30s).
-Supported actions:
+━━━ CORE RULES ━━━
+*CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
+*CRITICAL*: Chain multiple actions in one array. If the user says "give me 10 oak logs", respond with BOTH collect AND give: [{"action":"collect","target":"oak_log","quantity":10},{"action":"give","target":"${data.username}","item":"oak_log","quantity":10}]
+*CRITICAL*: The bot auto-crafts the required tool before any collect action — do NOT pre-craft tools manually.
+*CRITICAL*: Always use the longest timeout that makes sense. Collection of many blocks needs timeout:120 or more.
+*CRITICAL*: If the user provides only two numbers for coordinates, assign them to X and Z, omit Y.
+
+━━━ BASIC ACTIONS ━━━
 [{"action": "chat", "message": "text"}]
-[{"action": "come", "target": "player_name"}]  -- continuously follows the player until stopped; send [{"action":"stop"}] to halt
-[{"action": "goto", "x": 10, "z": 20, "timeout": 60}]  -- supports any distance; uses waypoints automatically
+[{"action": "come", "target": "player_name"}]                                    -- follows continuously until stopped
+[{"action": "stop"}]                                                              -- halts all current actions
+[{"action": "goto", "x": 10, "z": 20, "timeout": 60}]                           -- any distance, auto-waypoints
 [{"action": "goto", "x": 10, "y": 64, "z": 20}]
-[{"action": "stop"}]
 [{"action": "collect", "target": "oak_log", "quantity": 64, "timeout": 120}]
 [{"action": "give", "target": "player_name", "item": "oak_log", "quantity": 64}]
 [{"action": "equip", "target": "diamond_pickaxe"}]
-[{"action": "craft", "target": "wooden_shovel", "quantity": 1}]
+[{"action": "equip_armor"}]                                                       -- equips best armor in inventory
+[{"action": "craft", "target": "wooden_pickaxe", "quantity": 1}]
 [{"action": "place", "target": "crafting_table"}]
+
+━━━ SURVIVAL & UTILITY ACTIONS ━━━
+[{"action": "eat"}]                                                               -- eats best available food
+[{"action": "eat", "target": "cooked_beef"}]                                     -- eats specific food/drinks milk
+[{"action": "smelt", "target": "raw_iron", "quantity": 16, "timeout": 200}]      -- smelts items (auto-places furnace)
+[{"action": "sleep"}]                                                             -- sleeps in nearby bed
+[{"action": "brew", "potion": "healing", "timeout": 30}]                         -- brews a potion (needs stand + blaze_powder + ingredient)
+[{"action": "enchant", "target": "diamond_sword", "timeout": 30}]                -- enchants item (needs table + lapis + XP)
+[{"action": "explore", "direction": "north", "distance": 500, "target": "nether_fortress"}]  -- explore to find structure
+[{"action": "navigate_portal", "target": "nether"}]                              -- enter nether or end portal
+[{"action": "activate_end_portal"}]                                               -- place eyes in end portal frames
+[{"action": "place_pattern", "target": "wither"}]                                 -- place Wither summon structure
+
+━━━ COMBAT ACTIONS ━━━
+[{"action": "kill", "target": "zombie", "quantity": 1, "timeout": 120}]          -- auto-equips armor+weapon, fights until dead
+[{"action": "kill", "target": "wither", "timeout": 300}]
+[{"action": "kill", "target": "ender_dragon", "timeout": 600}]
+[{"action": "kill", "target": "elder_guardian", "quantity": 3, "timeout": 300}]
+[{"action": "kill", "target": "end_crystal", "quantity": 8, "timeout": 120}]     -- destroy End Crystals before fighting dragon
+
+━━━ BOSS DEFEAT SEQUENCES (use multi-action arrays) ━━━
+WITHER: collect soul_sand(4) + kill wither_skeleton(many) for skulls → place_pattern(wither) → kill(wither,timeout:300)
+ENDER DRAGON: craft eye_of_ender → explore for stronghold → activate_end_portal → navigate_portal(end) → kill(end_crystal,qty:8) → kill(ender_dragon,timeout:600)
+ELDER GUARDIAN: brew(water_breathing) + brew(night_vision) → explore for ocean_monument → eat(milk) → kill(elder_guardian,qty:3,timeout:300)
 `;
+
 
         if (retryCount > 0) {
             prompt += `\n\nYour previous response was incorrectly formatted. Please ensure you respond ONLY with a valid JSON array containing action objects.`;
