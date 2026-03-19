@@ -1,10 +1,36 @@
 // src/llm_client.js
 require('dotenv').config();
+const fs = require('fs');
+
+// In WSL2, 'localhost' / '127.0.0.1' resolves inside the Linux VM — not Windows.
+// If Ollama is running on the Windows host, replace localhost with the WSL2
+// default-gateway IP, which is the Windows host on the virtual network.
+function resolveWslUrl(url) {
+    if (!url.includes('localhost') && !url.includes('127.0.0.1')) return url;
+    try {
+        const version = fs.readFileSync('/proc/version', 'utf8').toLowerCase();
+        if (!version.includes('microsoft') && !version.includes('wsl')) return url;
+        // /proc/net/route: fields are tab-separated hex values, IPs in little-endian.
+        // Default route = Destination '00000000', Mask '00000000'.
+        for (const line of fs.readFileSync('/proc/net/route', 'utf8').split('\n').slice(1)) {
+            const f = line.trim().split(/\s+/);
+            if (f.length < 8 || f[1] !== '00000000' || f[7] !== '00000000') continue;
+            // Gateway field (f[2]) is 4-byte little-endian hex → reverse byte order for IP
+            const hex = f[2].padStart(8, '0');
+            const ip = [3, 2, 1, 0].map(i => parseInt(hex.slice(i * 2, i * 2 + 2), 16)).join('.');
+            if (ip === '0.0.0.0') continue;
+            const resolved = url.replace(/localhost|127\.0\.0\.1/, ip);
+            console.log(`[LLMClient] WSL2 detected — remapped localhost → ${ip}`);
+            return resolved;
+        }
+    } catch (_) {}
+    return url;
+}
 
 class LLMClient {
     constructor(model = process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud', url = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate') {
         this.model = model;
-        this.url = url;
+        this.url = resolveWslUrl(url);
         console.log(`[LLMClient] Endpoint: ${this.url}  Model: ${this.model}`);
     }
 
