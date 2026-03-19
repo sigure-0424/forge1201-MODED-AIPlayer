@@ -3,6 +3,7 @@
 ## Active
 
 ## Completed
+- TASK-20260319-001-finalize-npm-scripts: Finalize package.json npm scripts to run test suite
 - BUGFIX-20260318-002-fix-modded-block-interaction: Fix modded block interaction issues
 - TASK-20260318-002-documentation-alignment: Documentation Alignment and Finalization
 - BUGFIX-20260318-001-fix-infinite-login-loop: Fix 'unexpected tag end' crash and infinite login loop
