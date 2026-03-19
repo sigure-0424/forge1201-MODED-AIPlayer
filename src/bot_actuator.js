@@ -75,6 +75,15 @@ bot.on('spawn', async () => {
     movements.allow1by1towers = true;
     movements.maxDropDown = 4;
 
+    // Use cheap vanilla blocks for scaffolding
+    movements.scafoldingBlocks = [
+        bot.registry.blocksByName.dirt?.id,
+        bot.registry.blocksByName.cobblestone?.id,
+        bot.registry.blocksByName.netherrack?.id,
+        bot.registry.blocksByName.sand?.id
+    ].filter(id => id !== undefined);
+
+
     bot.pathfinder.setMovements(movements);
     // thinkTimeout: max ms A* may search before giving up on a path.
     // 5 000 ms caps peak heap at ~300 MB per failed attempt (10 000 ms OOM'd at ~600 MB).
@@ -320,7 +329,7 @@ async function ensureToolFor(block) {
             const toolR = bot.recipesFor(toolId, null, 1, true)[0];
             if (toolR) {
                 try {
-                    await withTimeout(bot.pathfinder.goto(new goals.GoalGetToBlock(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z)), 15000, 'goto table (auto-tool)', () => bot.pathfinder.setGoal(null));
+                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 1)), 15000, 'goto table (auto-tool)', () => bot.pathfinder.setGoal(null));
                     await bot.craft(toolR, 1, craftingTable);
                     bot.chat(`Crafted a ${toolName}!`);
                 } catch (e) { console.log(`[Actuator] auto-tool craft ${toolName}: ${e.message}`); }
@@ -395,16 +404,33 @@ async function processActionQueue() {
             if (action.action === 'chat') {
                 bot.chat(action.message);
 
-            // ── come (continuous follow via GoalFollow) ───────────────────────
+            // ── come (continuous follow via GoalNear loop) ───────────────────────
             } else if (action.action === 'come') {
                 const targetEntity = bot.players[action.target]?.entity;
                 if (targetEntity) {
                     bot.chat(`Following ${action.target}!`);
-                    bot.pathfinder.setGoal(new goals.GoalFollow(targetEntity, 2), true);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Now following ${action.target}.`, environment: getEnvironmentContext() } });
-                    await new Promise(resolve => {
-                        const check = setInterval(() => { if (currentCancelToken.cancelled) { clearInterval(check); resolve(); } }, 500);
-                    });
+
+                    while (!currentCancelToken.cancelled) {
+                        const currentTarget = bot.players[action.target]?.entity;
+                        if (!currentTarget) {
+                            bot.chat(`I lost sight of ${action.target}.`);
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Lost sight of ${action.target}.`, environment: getEnvironmentContext() } });
+                            break;
+                        }
+
+                        const dist = bot.entity.position.distanceTo(currentTarget.position);
+                        if (dist > 3) {
+                            try {
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(currentTarget.position.x, currentTarget.position.y, currentTarget.position.z, 2)), 10000, 'follow target', () => bot.pathfinder.setGoal(null));
+                            } catch (e) {
+                                // Ignore timeout/pathing errors during follow loop to prevent crash, just keep trying
+                            }
+                        } else {
+                            // Close enough, just wait a bit
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+                    }
                 } else {
                     bot.chat(`I cannot see ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to find ${action.target}.`, environment: getEnvironmentContext() } });
@@ -485,24 +511,41 @@ async function processActionQueue() {
                             triedSet.add(`${blockPos.x},${blockPos.y},${blockPos.z}`);
 
                             try {
-                                // Clear any stale pathfinder goal before each attempt
                                 bot.pathfinder.setGoal(null);
                                 const targetBlock = bot.blockAt(blockPos);
+
+                                // Step 1: Navigate to the block with a strict timeout
+                                try {
+                                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(blockPos.x, blockPos.y, blockPos.z, 2)), 15000, `goto ${action.target}`, () => bot.pathfinder.setGoal(null));
+                                } catch (gotoErr) {
+                                    throw new Error(`Failed to reach block: ${gotoErr.message}`);
+                                }
+
                                 await equipBestTool(targetBlock);
-                                // Cap per-block timeout at 20 s regardless of action.timeout.
-                                // The action timeout (e.g. 120 s) covers the whole batch;
-                                // one unreachable block must not monopolise the pathfinder
-                                // long enough to OOM (~600 MB per 10 s think cycle).
-                                const perBlockMs = Math.min(timeoutMs, 20000);
-                                await withTimeout(bot.collectBlock.collect(targetBlock), perBlockMs, `collect ${action.target}`, () => {
+
+                                // Check if the block has a mandatory tool requirement and we don't hold it
+                                if (targetBlock.harvestTools && Object.keys(targetBlock.harvestTools).length > 0) {
+                                    const heldItem = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+                                    if (!heldItem || !targetBlock.harvestTools[heldItem.type]) {
+                                        throw new Error(`Requires a specific tool to harvest (held: ${heldItem ? heldItem.name : 'nothing'})`);
+                                    }
+                                }
+
+                                // Step 2: Dig the block with a separate timeout based on hardness
+                                // Give it 10s base + extra time if it's a hard block
+                                const digTimeMs = targetBlock.digTime(bot.inventory.slots[bot.getEquipmentDestSlot('hand')]?.type || null, false, false, false, [], bot.entity.effects);
+                                const maxDigTime = 10000 + (digTimeMs > 0 ? digTimeMs : 0);
+
+                                await withTimeout(bot.collectBlock.collect(targetBlock), maxDigTime, `dig ${action.target}`, () => {
                                     bot.pathfinder.setGoal(null);
                                     if (bot.collectBlock.cancelTask) bot.collectBlock.cancelTask();
                                 });
+
                                 collected++;
                             } catch (err) {
                                 console.error(`[Actuator] Skipping block at ${blockPos}: ${err.message}`);
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Skipped block at ${blockPos}: ${err.message}`, environment: getEnvironmentContext() } });
-                                // continue to next block (was: break)
+                                // continue to next block
                             }
                         }
                     }
@@ -542,10 +585,10 @@ async function processActionQueue() {
                     if (recipe) {
                         bot.chat(`Crafting ${action.target}...`);
                         if (recipe.requiresTable) {
-                            const ctId = bot.registry.blocksByName['crafting_table'].id;
-                            const ct = bot.findBlock({ matching: ctId, maxDistance: 32 });
+                            const ctId = bot.registry.blocksByName['crafting_table']?.id;
+                            const ct = ctId !== undefined ? bot.findBlock({ matching: ctId, maxDistance: 32 }) : null;
                             if (ct) {
-                                await withTimeout(bot.pathfinder.goto(new goals.GoalGetToBlock(ct.position.x, ct.position.y, ct.position.z)), timeoutMs, 'goto crafting table', () => bot.pathfinder.setGoal(null));
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(ct.position.x, ct.position.y, ct.position.z, 1)), timeoutMs, 'goto crafting table', () => bot.pathfinder.setGoal(null));
                                 try {
                                     await withTimeout(bot.craft(recipe, quantity, ct), timeoutMs, 'craft at table');
                                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully crafted ${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
@@ -670,7 +713,7 @@ async function processActionQueue() {
                             const ctId = bot.registry.blocksByName['crafting_table']?.id;
                             const ct = ctId !== undefined ? bot.findBlock({ matching: ctId, maxDistance: 32 }) : null;
                             if (cbR && ct) {
-                                await withTimeout(bot.pathfinder.goto(new goals.GoalGetToBlock(ct.position.x, ct.position.y, ct.position.z)), timeoutMs, 'goto table for furnace', () => bot.pathfinder.setGoal(null));
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(ct.position.x, ct.position.y, ct.position.z, 1)), timeoutMs, 'goto table for furnace', () => bot.pathfinder.setGoal(null));
                                 try { await bot.craft(cbR, 1, ct); } catch (e) { console.log(`[Actuator] smelt craft furnace: ${e.message}`); }
                             }
                         }
@@ -691,7 +734,7 @@ async function processActionQueue() {
                         bot.chat('Cannot find or create a furnace.');
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: 'No furnace available.', environment: getEnvironmentContext() } });
                     } else {
-                        await withTimeout(bot.pathfinder.goto(new goals.GoalGetToBlock(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z)), timeoutMs, 'goto furnace', () => bot.pathfinder.setGoal(null));
+                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 1)), timeoutMs, 'goto furnace', () => bot.pathfinder.setGoal(null));
                         const furnace = await bot.openFurnace(furnaceBlock);
                         try {
                             if (!furnace.fuelItem()) {
@@ -821,7 +864,7 @@ async function processActionQueue() {
                         bot.chat('No brewing stand nearby.');
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: 'No brewing stand found.', environment: getEnvironmentContext() } });
                     } else {
-                        await withTimeout(bot.pathfinder.goto(new goals.GoalGetToBlock(stand.position.x, stand.position.y, stand.position.z)), timeoutMs, 'goto brewing stand', () => bot.pathfinder.setGoal(null));
+                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(stand.position.x, stand.position.y, stand.position.z, 1)), timeoutMs, 'goto brewing stand', () => bot.pathfinder.setGoal(null));
                         const brewingStand = await bot.openBrewingStand(stand);
                         try {
                             // Ensure blaze powder fuel
@@ -858,7 +901,7 @@ async function processActionQueue() {
                     bot.chat(`No ${action.target} to enchant.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `${action.target} not in inventory.`, environment: getEnvironmentContext() } });
                 } else {
-                    await withTimeout(bot.pathfinder.goto(new goals.GoalGetToBlock(tableBlock.position.x, tableBlock.position.y, tableBlock.position.z)), timeoutMs, 'goto enchanting table', () => bot.pathfinder.setGoal(null));
+                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(tableBlock.position.x, tableBlock.position.y, tableBlock.position.z, 1)), timeoutMs, 'goto enchanting table', () => bot.pathfinder.setGoal(null));
                     await bot.equip(targetItem, 'hand');
                     const table = await bot.openEnchantmentTable(tableBlock);
                     try {

@@ -9,6 +9,9 @@ class AgentManager {
         this.restartingBots = new Set();
         this.llm = new LLMClient(process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud');
         this.activeLlmRequests = new Map(); // Concurrency control
+        this.chatQueue = new Map(); // Map of botId to array of queued messages
+        this.llmCooldown = new Map(); // Map of botId to timestamp of next allowed LLM request
+        this.awaitingCancellationChoice = new Map(); // Map of botId to boolean waiting for user cancellation confirm
     }
 
     startBot(botId, options) {
@@ -53,39 +56,87 @@ class AgentManager {
             const data = message.data;
             const isSystem = data.username === 'System';
 
-            // 1. Priority interruption: If user speaks, abort any current LLM requests and cancel any bot actions.
             if (!isSystem) {
-                if (this.activeLlmRequests.has(botId)) {
-                    console.log(`[AgentManager] User command overrides existing thought process for ${botId}.`);
-                    // Note: fetch cancellation could be implemented here via AbortController, but logic-wise we just ignore it.
-                }
-                const botProcess = this.bots.get(botId);
-                if (botProcess) {
-                    botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: "stop" }] }); // Immediately halt current action queue
-                }
-                // Generate new thought ID to invalidate older ones
-                const thoughtId = Date.now();
-                this.activeLlmRequests.set(botId, thoughtId);
-                this.processChatWithLLM(botId, data, 0, thoughtId);
-            } else {
-                // 2. State Management: Only respond to system events if it implies a failure that needs a workaround or if the user explicitly asked for continuous reporting.
-                // For now, if the action was successful, transition to 'Idle' (do not ask LLM).
-                if (data.message.includes("Successfully")) {
-                    console.log(`[AgentManager] Task completed for ${botId}: ${data.message}. Entering Idle state.`);
-                    // Do not prompt LLM. Just wait for the next user command.
-                    return; 
-                } else if (data.message.includes("Failed") || data.message.includes("Cannot")) {
-                    // It's a failure. Allow LLM to reconsider, but only if we aren't already thinking about something else.
-                    if (!this.activeLlmRequests.has(botId)) {
-                        const thoughtId = Date.now();
-                        this.activeLlmRequests.set(botId, thoughtId);
-                        this.processChatWithLLM(botId, data, 0, thoughtId);
+                const isCancellationResponse = this.awaitingCancellationChoice.get(botId);
+                const queue = this.chatQueue.get(botId) || [];
+
+                if (isCancellationResponse) {
+                    this.awaitingCancellationChoice.set(botId, false);
+                    if (data.message.toLowerCase().startsWith('y')) {
+                        console.log(`[AgentManager] User confirmed cancellation for ${botId}.`);
+                        this.chatQueue.set(botId, []);
+                        const botProcess = this.bots.get(botId);
+                        if (botProcess) {
+                            botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: "stop" }] });
+                            botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: "chat", message: "Tasks cancelled. Waiting for instructions." }] });
+                        }
+                        return; // Done
                     } else {
-                        console.log(`[AgentManager] Ignoring system failure for ${botId} because another thought is active.`);
+                        console.log(`[AgentManager] User declined cancellation for ${botId}.`);
+                        // Keep the queue as is, just return.
+                        return;
                     }
+                }
+
+                if (this.activeLlmRequests.has(botId) || queue.length >= 2) {
+                    this.awaitingCancellationChoice.set(botId, true);
+                    const botProcess = this.bots.get(botId);
+                    if (botProcess) {
+                        botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: "chat", message: `I have ${queue.length + (this.activeLlmRequests.has(botId) ? 1 : 0)} pending requests. Cancel them to prioritize this? (y/n)` }] });
+                    }
+                    // Wait for the next message to process the choice
+                    queue.push(data); // Push it so if they say no, it gets processed
+                    this.chatQueue.set(botId, queue);
+                    return;
+                }
+
+                // Normal addition
+                queue.push(data);
+                this.chatQueue.set(botId, queue);
+                this.processNextQueueItem(botId);
+            } else {
+                // System messages
+                if (data.message.includes("Successfully") || data.message.includes("Explored") || data.message.includes("Entered portal")) {
+                    console.log(`[AgentManager] Task completed for ${botId}: ${data.message}.`);
+                    // We finished a task, process the next in queue if any
+                    this.processNextQueueItem(botId);
+                    return; 
+                } else if (data.message.includes("Failed") || data.message.includes("Cannot") || data.message.includes("No ")) {
+                    const queue = this.chatQueue.get(botId) || [];
+                    queue.unshift(data);
+                    this.chatQueue.set(botId, queue);
+                    this.processNextQueueItem(botId);
                 }
             }
         }
+    }
+
+    processNextQueueItem(botId) {
+        if (this.activeLlmRequests.has(botId) || this.awaitingCancellationChoice.get(botId)) {
+            return; // Busy
+        }
+
+        const now = Date.now();
+        const nextAllowedTime = this.llmCooldown.get(botId) || 0;
+
+        if (now < nextAllowedTime) {
+            setTimeout(() => this.processNextQueueItem(botId), nextAllowedTime - now + 100);
+            return;
+        }
+
+        const queue = this.chatQueue.get(botId) || [];
+        if (queue.length === 0) return;
+
+        const nextData = queue.shift();
+        this.chatQueue.set(botId, queue);
+
+        const thoughtId = Date.now();
+        this.activeLlmRequests.set(botId, thoughtId);
+
+        // 5 second cooldown between LLM requests to prevent spam
+        this.llmCooldown.set(botId, Date.now() + 5000);
+
+        this.processChatWithLLM(botId, nextData, 0, thoughtId);
     }
 
     sanitizeLLMAction(action) {
@@ -212,6 +263,7 @@ ELDER GUARDIAN: brew(water_breathing) + brew(night_vision) → explore for ocean
             if (this.activeLlmRequests.get(botId) === thoughtId) {
                 this.activeLlmRequests.delete(botId);
             }
+            this.processNextQueueItem(botId);
             return;
         }
 
@@ -240,12 +292,14 @@ ELDER GUARDIAN: brew(water_breathing) + brew(night_vision) → explore for ocean
 
         const botProcess = this.bots.get(botId);
         if (botProcess) {
-            // Remove the 'stop' action we might have injected if the LLM also happens to send one
             const filteredActions = sanitizedActions.filter(a => a.action !== "stop");
             if (filteredActions.length > 0) {
                  botProcess.send({ type: 'EXECUTE_ACTION', action: filteredActions });
             }
         }
+
+        // Check for more items in the queue
+        this.processNextQueueItem(botId);
     }
 
     triggerRecoveryPipeline(botId, message) {
