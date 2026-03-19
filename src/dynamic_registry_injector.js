@@ -1,7 +1,27 @@
 // src/dynamic_registry_injector.js
+const fs = require('fs');
+const path = require('path');
+
 class DynamicRegistryInjector {
     constructor(registry) {
         this.registry = registry;
+        this.modBlocksDictionary = {};
+        this.loadDictionary();
+    }
+
+    loadDictionary() {
+        try {
+            const dictPath = path.resolve(__dirname, '../data/sample/configs/mod_blocks_dictionary.json');
+            if (fs.existsSync(dictPath)) {
+                const data = fs.readFileSync(dictPath, 'utf8');
+                this.modBlocksDictionary = JSON.parse(data);
+                console.log(`[DynamicRegistry] Loaded ${Object.keys(this.modBlocksDictionary).length} modded block definitions.`);
+            } else {
+                console.warn(`[DynamicRegistry] mod_blocks_dictionary.json not found at ${dictPath}. Using fallbacks.`);
+            }
+        } catch (e) {
+            console.error(`[DynamicRegistry] Failed to load mod_blocks_dictionary.json: ${e.message}`);
+        }
     }
 
     readVarInt(buffer, offset) {
@@ -53,12 +73,13 @@ class DynamicRegistryInjector {
     }
 
     injectBlockToRegistry(parsedEntries) {
-        console.log(`[DynamicRegistry] Mod-Compatible Mode: Cloning Vanilla properties for MOD blocks.`);
+        console.log(`[DynamicRegistry] Mod-Compatible Mode: Injecting Mod properties from Dictionary.`);
         let mappedCount = 0;
         let dummyCount = 0;
 
         // Retrieve the complete physical properties of already loaded "stone" as the ultimate safety template
         const stoneTemplate = this.registry.blocksByName['stone'];
+        const airTemplate = this.registry.blocksByName['air'];
 
         for (const entry of parsedEntries) {
             const shortName = entry.name.replace(/^[^:]+:/, '');
@@ -74,9 +95,12 @@ class DynamicRegistryInjector {
                     }
                     mappedCount++;
                 } else {
-                    // Modded blocks: Deep copy stone properties and overwrite only the ID and names
+                    const dictEntry = this.modBlocksDictionary[entry.name];
+                    const baseTemplate = dictEntry && dictEntry.boundingBox === 'empty' ? airTemplate : stoneTemplate;
+
+                    // Modded blocks: Deep copy base properties and overwrite ID, names, and specific properties
                     const modBlock = {
-                        ...stoneTemplate,
+                        ...baseTemplate,
                         id: entry.id,
                         name: entry.name,
                         displayName: shortName,
@@ -85,6 +109,13 @@ class DynamicRegistryInjector {
                         maxStateId: entry.id
                     };
 
+                    if (dictEntry) {
+                        if (dictEntry.hardness !== undefined) modBlock.hardness = dictEntry.hardness;
+                        if (dictEntry.transparent !== undefined) modBlock.transparent = dictEntry.transparent;
+                        // For boundingBox, Mineflayer calculates physical shapes based on blockCollisionShapes
+                        // The 'solid' property is implicitly managed by boundingBox and collision shapes in Prismarine-physics.
+                    }
+
                     this.registry.blocks[entry.id] = modBlock;
                     if (this.registry.blocksByStateId) {
                         this.registry.blocksByStateId[entry.id] = modBlock;
@@ -92,7 +123,8 @@ class DynamicRegistryInjector {
 
                     // [CRITICAL] Explicitly signal to the physics engine (prismarine-physics) that this is a solid full block
                     if (this.registry.blockCollisionShapes && this.registry.blockCollisionShapes.blocks) {
-                        this.registry.blockCollisionShapes.blocks[entry.name] = 1; // 1 = Full cube collision shape
+                        const isBlock = !dictEntry || dictEntry.boundingBox !== 'empty';
+                        this.registry.blockCollisionShapes.blocks[entry.name] = isBlock ? 1 : 0; // 1 = Full cube collision shape, 0 = Air
                     }
 
                     dummyCount++;
@@ -109,7 +141,49 @@ class DynamicRegistryInjector {
                 dummyCount++;
             }
         }
-        console.log(`[DynamicRegistry] Mapped ${mappedCount} vanilla blocks. Injected ${dummyCount} MOD blocks as Stone.`);
+
+        // Apply a JS Proxy on blocksByStateId to resolve unknown state IDs correctly based on base block ID
+        if (this.registry.blocksByStateId) {
+            // Precompute keys for faster lookup
+            let sortedKeys = Object.keys(this.registry.blocksByStateId)
+                                   .map(k => parseInt(k, 10))
+                                   .filter(k => !isNaN(k))
+                                   .sort((a, b) => a - b);
+
+            this.registry.blocksByStateId = new Proxy(this.registry.blocksByStateId, {
+                get(target, prop) {
+                    if (prop in target) {
+                        return Reflect.get(target, prop);
+                    }
+
+                    const stateId = parseInt(prop, 10);
+                    if (isNaN(stateId)) {
+                        return Reflect.get(target, prop);
+                    }
+
+                    // Fallback to finding the block that owns this state ID based on block IDs
+                    let bestKey = undefined;
+                    for (let i = 0; i < sortedKeys.length; i++) {
+                        if (sortedKeys[i] <= stateId) {
+                            bestKey = sortedKeys[i];
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if (bestKey !== undefined) {
+                        // Cache the result for future O(1) lookups
+                        target[prop] = target[bestKey];
+                        return target[bestKey];
+                    }
+
+                    return Reflect.get(target, prop); // fallback
+                }
+            });
+            console.log(`[DynamicRegistry] State ID Proxy applied to blocksByStateId.`);
+        }
+
+        console.log(`[DynamicRegistry] Mapped ${mappedCount} vanilla blocks. Injected ${dummyCount} MOD blocks.`);
     }
 }
 
