@@ -77,9 +77,11 @@ bot.on('spawn', async () => {
     movements.canDig = true;
     movements.allowSprinting = true;
     movements.allow1by1towers = true;
+    movements.maxDropDown = 4; // Add max drop down to prevent insane search trees
 
     bot.pathfinder.setMovements(movements);
-    bot.pathfinder.thinkTimeout = 3000;
+    bot.pathfinder.thinkTimeout = 1000; // Reduce from 3000ms to 1000ms to prevent memory explosion during pathfinding
+    bot.pathfinder.tickTimeout = 10; // Yield to event loop more frequently
 
     console.log('[Actuator] Pathfinder and Physics initialized.');
     bot.chat('Forge AI Player Ready.');
@@ -191,7 +193,8 @@ async function processActionQueue() {
             } else if (action.action === 'collect') {
                 const blockId = bot.registry.blocksByName[action.target]?.id;
                 if (blockId !== undefined) {
-                    const blocks = bot.findBlocks({ matching: blockId, maxDistance: 64, count: action.quantity || 1 });
+                    const quantity = parseInt(action.quantity, 10) || 1;
+                    const blocks = bot.findBlocks({ matching: blockId, maxDistance: 32, count: quantity });
                     if (blocks.length > 0) {
                         bot.chat(`Collecting ${blocks.length} ${action.target}...`);
                         let collected = 0;

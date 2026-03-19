@@ -64,7 +64,15 @@ class AgentManager {
                 return action.value;
             }
             if (action.action) {
-                return [action];
+                if (typeof action.action === 'string') {
+                    return [action];
+                } else if (typeof action.action === 'object' && !Array.isArray(action.action)) {
+                    const keys = Object.keys(action.action);
+                    if (keys.length > 0) {
+                        const actName = keys[0];
+                        return [{ action: actName, ...action.action[actName] }];
+                    }
+                }
             }
             const keys = Object.keys(action);
             for (const key of keys) {
@@ -79,7 +87,14 @@ class AgentManager {
                 }
 
                 if (action[key] && action[key].action) {
-                    return [action[key]];
+                    if (typeof action[key].action === 'string') {
+                        return [action[key]];
+                    } else if (typeof action[key].action === 'object' && !Array.isArray(action[key].action)) {
+                        const subKeys = Object.keys(action[key].action);
+                        if (subKeys.length > 0) {
+                            return [{ action: subKeys[0], ...action[key].action[subKeys[0]] }];
+                        }
+                    }
                 }
                 if (Array.isArray(action[key])) {
                     return action[key];
