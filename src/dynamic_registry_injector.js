@@ -53,29 +53,63 @@ class DynamicRegistryInjector {
     }
 
     injectBlockToRegistry(parsedEntries) {
-        console.log(`[DynamicRegistry] Vanilla-First Mode: Mapping existing vanilla blocks only.`);
+        console.log(`[DynamicRegistry] Mod-Compatible Mode: Cloning Vanilla properties for MOD blocks.`);
         let mappedCount = 0;
+        let dummyCount = 0;
+
+        // Retrieve the complete physical properties of already loaded "stone" as the ultimate safety template
+        const stoneTemplate = this.registry.blocksByName['stone'];
 
         for (const entry of parsedEntries) {
+            const shortName = entry.name.replace(/^[^:]+:/, '');
+
             if (entry.type === 'block') {
-                // Remove the namespace (e.g., minecraft:) to get the pure block name
-                const shortName = entry.name.replace(/^[^:]+:/, '');
-                
-                // Retrieve the vanilla block definition already held by Mineflayer
                 const vanillaBlock = this.registry.blocksByName[shortName];
 
                 if (vanillaBlock) {
-                    // Do not touch the array (blocksArray); only rewire the reference from the ID to the vanilla definition
-                    // This corrects Forge-specific ID shifts while preventing Pathfinder crashes
+                    // Re-mapping vanilla blocks
                     this.registry.blocks[entry.id] = vanillaBlock;
                     if (this.registry.blocksByStateId) {
                         this.registry.blocksByStateId[entry.id] = vanillaBlock;
                     }
                     mappedCount++;
+                } else {
+                    // Modded blocks: Deep copy stone properties and overwrite only the ID and names
+                    const modBlock = {
+                        ...stoneTemplate,
+                        id: entry.id,
+                        name: entry.name,
+                        displayName: shortName,
+                        defaultState: entry.id,
+                        minStateId: entry.id,
+                        maxStateId: entry.id
+                    };
+
+                    this.registry.blocks[entry.id] = modBlock;
+                    if (this.registry.blocksByStateId) {
+                        this.registry.blocksByStateId[entry.id] = modBlock;
+                    }
+
+                    // [CRITICAL] Explicitly signal to the physics engine (prismarine-physics) that this is a solid full block
+                    if (this.registry.blockCollisionShapes && this.registry.blockCollisionShapes.blocks) {
+                        this.registry.blockCollisionShapes.blocks[entry.name] = 1; // 1 = Full cube collision shape
+                    }
+
+                    dummyCount++;
                 }
+            } else if (entry.type === 'item') {
+                const dummyItem = {
+                    id: entry.id,
+                    name: entry.name,
+                    displayName: shortName,
+                    stackSize: 64
+                };
+                if (!this.registry.items) this.registry.items = {};
+                this.registry.items[entry.id] = dummyItem;
+                dummyCount++;
             }
         }
-        console.log(`[DynamicRegistry] Mapped ${mappedCount} vanilla blocks. Ignored MOD blocks.`);
+        console.log(`[DynamicRegistry] Mapped ${mappedCount} vanilla blocks. Injected ${dummyCount} MOD blocks as Stone.`);
     }
 }
 
