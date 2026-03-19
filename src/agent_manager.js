@@ -7,7 +7,7 @@ class AgentManager {
     constructor() {
         this.bots = new Map(); // Map of botId to ChildProcess
         this.restartingBots = new Set();
-        this.llm = new LLMClient(process.env.OLLAMA_MODEL || 'llama3');
+        this.llm = new LLMClient(process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud');
         this.activeLlmRequests = new Map(); // Concurrency control
     }
 

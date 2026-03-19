@@ -22,6 +22,7 @@
   },
   "homepage": "https://github.com/sigure-0424/ProjectBase#readme",
   "dependencies": {
+    "dotenv": "^17.3.1",
     "mineflayer": "^4.35.0",
     "mineflayer-collectblock": "^1.6.0",
     "mineflayer-pathfinder": "^2.4.5",

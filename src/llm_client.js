@@ -1,15 +1,22 @@
 // src/llm_client.js
+require('dotenv').config();
+
 class LLMClient {
-    constructor(model = 'llama3', url = 'http://localhost:11434/api/generate') {
+    constructor(model = process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud', url = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate') {
         this.model = model;
         this.url = url;
     }
 
     async generateAction(prompt) {
         try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (process.env.OLLAMA_API_KEY) {
+                headers['Authorization'] = `Bearer ${process.env.OLLAMA_API_KEY}`;
+            }
+
             const response = await fetch(this.url, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: headers,
                 body: JSON.stringify({
                     model: this.model,
                     prompt: prompt,
