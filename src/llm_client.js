@@ -52,9 +52,19 @@ class LLMClient {
     async generateAction(prompt) {
         try {
             const headers = { 'Content-Type': 'application/json' };
-            const apiKey = (process.env.OLLAMA_API_KEY || '').trim();
+            // Strip BOM, control chars, and surrounding whitespace — invisible
+            // characters can survive dotenv parsing and silently break auth.
+            const apiKey = (process.env.OLLAMA_API_KEY || '')
+                .replace(/[\u0000-\u001F\u007F-\u00A0\uFEFF]/g, '').trim();
+            // OLLAMA_AUTH_SCHEME controls the Authorization header prefix.
+            // Default: "Bearer".  Set to "" to send the raw key with no prefix.
+            // Examples: Bearer, ApiKey, Token, ""
+            const authScheme = Object.prototype.hasOwnProperty.call(process.env, 'OLLAMA_AUTH_SCHEME')
+                ? process.env.OLLAMA_AUTH_SCHEME.trim()
+                : 'Bearer';
             if (apiKey) {
-                headers['Authorization'] = `Bearer ${apiKey}`;
+                headers['Authorization'] = authScheme ? `${authScheme} ${apiKey}` : apiKey;
+                console.log(`[LLMClient] Auth: ${authScheme || '<no prefix>'} ${apiKey.substring(0, 8)}...`);
             }
 
             let response;
@@ -77,7 +87,8 @@ class LLMClient {
                 const body = await response.text().catch(() => '');
                 if (response.status === 401) {
                     const hint = apiKey
-                        ? `Key sent (first 8 chars): "${apiKey.substring(0, 8)}...". Verify OLLAMA_API_KEY in .env matches the server's OLLAMA_API_KEY.`
+                        ? `Sent: "${authScheme || '<no prefix>'} ${apiKey.substring(0, 8)}...". ` +
+                          `If the scheme is wrong, set OLLAMA_AUTH_SCHEME in .env (e.g. ApiKey, Token, or "" for no prefix).`
                         : `No key found — set OLLAMA_API_KEY in .env.`;
                     throw new Error(`LLM HTTP 401 Unauthorized. ${hint}`);
                 }
