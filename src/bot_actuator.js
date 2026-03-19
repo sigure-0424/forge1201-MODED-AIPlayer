@@ -78,27 +78,154 @@ bot.on('spawn', () => {
     bot.chat('Forge AI Player Ready.');
 });
 
-// Command Handler
-bot.on('chat', (username, message) => {
-    if (username === bot.username) return;
-    const cmd = message.toLowerCase();
-
+async function handleCommand(username, payload) {
+    const action = payload.action;
     try {
-        if (cmd === 'come') {
-            const player = bot.players[username];
+        if (action === 'come') {
+            const targetName = payload.target || username;
+            const player = bot.players[targetName];
             if (!player || !player.entity) {
                 bot.chat('I cannot see you!');
                 return;
             }
-            bot.chat(`Coming to you, ${username}!`);
+            bot.chat(`Coming to you, ${targetName}!`);
             bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 1), true);
-        } else if (cmd === 'status') {
+        } else if (action === 'status') {
             const pos = bot.entity.position;
             const block = bot.blockAt(pos.offset(0, -0.5, 0));
             bot.chat(`Pos: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)} | Ground: ${bot.entity.onGround} | Block: ${block ? block.name : '?'}`);
-        } else if (cmd === 'stop') {
+        } else if (action === 'stop') {
             bot.pathfinder.setGoal(null);
             bot.chat('Stopped.');
+        } else if (action === 'goto') {
+            const { x, y, z } = payload;
+            if (x === undefined || y === undefined || z === undefined) {
+                bot.chat('Missing coordinates for goto.');
+                return;
+            }
+            bot.chat(`Going to ${x}, ${y}, ${z}...`);
+            await bot.pathfinder.goto(new goals.GoalNear(x, y, z, 1));
+            bot.chat(`Arrived at ${x}, ${y}, ${z}.`);
+        } else if (action === 'search') {
+            const targetBlockName = payload.target;
+            const targetBlockData = bot.registry.blocksByName[targetBlockName];
+            if (!targetBlockData) {
+                bot.chat(`I don't know what ${targetBlockName} is.`);
+                return;
+            }
+            bot.chat(`Searching for ${targetBlockName}...`);
+            const blocks = bot.findBlocks({ matching: targetBlockData.id, maxDistance: 32, count: 10 });
+            if (blocks.length === 0) {
+                bot.chat(`Could not find any ${targetBlockName} nearby.`);
+            } else {
+                bot.chat(`Found ${blocks.length} ${targetBlockName}(s). Closest is at: ${blocks[0].x}, ${blocks[0].y}, ${blocks[0].z}`);
+            }
+        } else if (action === 'collect') {
+            const targetBlockName = payload.target;
+            const targetBlockData = bot.registry.blocksByName[targetBlockName];
+            if (!targetBlockData) {
+                bot.chat(`I don't know what ${targetBlockName} is.`);
+                return;
+            }
+            let quantity = payload.quantity || 1;
+            const bounds = payload.bounds;
+
+            bot.chat(`Starting collection of ${quantity} ${targetBlockName}(s).`);
+
+            let collected = 0;
+            while (collected < quantity) {
+                const searchCount = bounds ? Math.max(quantity * 2, 256) : quantity * 2;
+                let blocks = bot.findBlocks({ matching: targetBlockData.id, maxDistance: 64, count: searchCount });
+
+                if (bounds) {
+                    blocks = blocks.filter(p =>
+                        p.x >= bounds.min.x && p.x <= bounds.max.x &&
+                        p.y >= bounds.min.y && p.y <= bounds.max.y &&
+                        p.z >= bounds.min.z && p.z <= bounds.max.z
+                    );
+                }
+
+                if (blocks.length === 0) {
+                    bot.chat(`No more ${targetBlockName} found in range.`);
+                    break;
+                }
+
+                const targetPos = blocks[0];
+                try {
+                    await bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 1));
+                    const targetBlock = bot.blockAt(targetPos);
+                    if (targetBlock && targetBlock.name === targetBlockName) {
+                        await bot.dig(targetBlock);
+                        collected++;
+                    }
+                } catch (digErr) {
+                    console.error(`[Actuator] Collect step failed: ${digErr.message}`);
+                    bot.chat(`Failed to collect block at ${targetPos.x}, ${targetPos.y}, ${targetPos.z}`);
+                    break; // Prevent infinite loop on inaccessible block
+                }
+            }
+            bot.chat(`Collection finished. Got ${collected}/${quantity} ${targetBlockName}(s).`);
+        } else if (action === 'give') {
+            const targetPlayerName = payload.target;
+            const itemName = payload.item;
+            const quantity = payload.quantity || 1;
+
+            const targetPlayer = bot.players[targetPlayerName];
+            if (!targetPlayer || !targetPlayer.entity) {
+                bot.chat(`I cannot see ${targetPlayerName} to give them items!`);
+                return;
+            }
+
+            const itemData = bot.registry.itemsByName[itemName];
+            if (!itemData) {
+                bot.chat(`I don't know what item ${itemName} is.`);
+                return;
+            }
+
+            bot.chat(`Going to ${targetPlayerName} to give ${quantity} ${itemName}(s).`);
+
+            try {
+                await bot.pathfinder.goto(new goals.GoalNear(targetPlayer.entity.position.x, targetPlayer.entity.position.y, targetPlayer.entity.position.z, 2));
+                bot.chat(`Here is your ${itemName}.`);
+                await bot.toss(itemData.id, null, quantity);
+            } catch (err) {
+                console.error(`[Actuator] Give step failed: ${err.message}`);
+                bot.chat(`Failed to give item to ${targetPlayerName}.`);
+            }
+        } else {
+            bot.chat(`Unknown action: ${action}`);
+        }
+    } catch (e) {
+        console.error(`[Actuator] Error handling command: ${e.message}`);
+        bot.chat(`Error executing action ${action}.`);
+    }
+}
+
+// Command Handler
+bot.on('chat', (username, message) => {
+    if (username === bot.username) return;
+
+    // Try parsing as JSON first (from AI)
+    const jsonMatch = message.match(/\{[\s\S]*?\}/);
+    if (jsonMatch) {
+        try {
+            const payload = JSON.parse(jsonMatch[0]);
+            handleCommand(username, payload);
+            return;
+        } catch (e) {
+            console.error(`[Actuator] Failed to parse JSON payload: ${e.message}`);
+        }
+    }
+
+    // Fallback to basic text commands
+    const cmd = message.toLowerCase();
+    try {
+        if (cmd === 'come') {
+            handleCommand(username, { action: 'come' });
+        } else if (cmd === 'status') {
+            handleCommand(username, { action: 'status' });
+        } else if (cmd === 'stop') {
+            handleCommand(username, { action: 'stop' });
         }
     } catch (e) {
         console.error(`[Actuator] Chat Command Error: ${e.message}`);
