@@ -88,10 +88,18 @@ class DynamicRegistryInjector {
                 const vanillaBlock = this.registry.blocksByName[shortName];
 
                 if (vanillaBlock) {
-                    // Re-mapping vanilla blocks
-                    this.registry.blocks[entry.id] = vanillaBlock;
-                    if (this.registry.blocksByStateId) {
-                        this.registry.blocksByStateId[entry.id] = vanillaBlock;
+                    // Re-mapping vanilla blocks: map ALL state variants so the Proxy binary-search
+                    // fallback cannot resolve an intermediate state ID to the wrong (mod) block.
+                    // Without this, beds (16 states), logs (4 states), etc. would appear as stone/air
+                    // whenever a mod block was mapped to an ID between the base and its variants.
+                    const numStates = (vanillaBlock.maxStateId !== undefined && vanillaBlock.minStateId !== undefined)
+                        ? (vanillaBlock.maxStateId - vanillaBlock.minStateId + 1)
+                        : 1;
+                    for (let s = 0; s < numStates; s++) {
+                        this.registry.blocks[entry.id + s] = vanillaBlock;
+                        if (this.registry.blocksByStateId) {
+                            this.registry.blocksByStateId[entry.id + s] = vanillaBlock;
+                        }
                     }
                     mappedCount++;
                 } else {

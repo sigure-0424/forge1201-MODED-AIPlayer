@@ -3,6 +3,7 @@ const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const ForgeHandshakeStateMachine = require('./forge_handshake_state_machine');
 const DynamicRegistryInjector = require('./dynamic_registry_injector');
+const EventDebouncer = require('./event_debouncer');
 const nbt = require('prismarine-nbt');
 const Vec3 = require('vec3');
 
@@ -141,11 +142,25 @@ bot.on('spawn', async () => {
         if (!isExecuting) equipBestWeapon().catch(() => {});
     }, 600);
 
+    debouncer = new EventDebouncer(bot, 500);
+
     console.log('[Actuator] Pathfinder and Physics initialized.');
     bot.chat('Forge AI Player Ready.');
 });
 
 function getEnvironmentContext() {
+    const nearbyBlocks = [];
+    if (bot.entity) {
+        // Beds (by name suffix — works once the registry is correctly mapped)
+        const bedBlock = bot.findBlock({ matching: b => b && b.name.endsWith('_bed'), maxDistance: 16 });
+        if (bedBlock) nearbyBlocks.push(bedBlock.name);
+        // Other interactive blocks
+        for (const name of ['crafting_table', 'furnace', 'blast_furnace', 'smoker', 'chest', 'barrel',
+                             'anvil', 'enchanting_table', 'brewing_stand']) {
+            const id = bot.registry.blocksByName[name]?.id;
+            if (id !== undefined && bot.findBlock({ matching: id, maxDistance: 16 })) nearbyBlocks.push(name);
+        }
+    }
     return {
         position: bot.entity ? {
             x: Math.round(bot.entity.position.x),
@@ -155,7 +170,8 @@ function getEnvironmentContext() {
         health: bot.health ? Math.round(bot.health) : null,
         food: bot.food ? Math.round(bot.food) : null,
         players_nearby: Object.keys(bot.players).filter(p => p !== bot.username && bot.players[p].entity),
-        inventory: bot.inventory ? bot.inventory.items().map(item => ({ name: item.name, count: item.count })) : []
+        inventory: bot.inventory ? bot.inventory.items().map(item => ({ name: item.name, count: item.count })) : [],
+        nearby_blocks: nearbyBlocks
     };
 }
 
@@ -244,12 +260,19 @@ function withTimeout(promise, ms, actionName, cancelFn) {
     return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
 }
 
+let debouncer = null; // initialized in 'spawn' — used for VeinMiner cascade detection
+
 // ─── Module-level helpers ─────────────────────────────────────────────────────
 
+const TOOL_SUFFIXES = ['_pickaxe', '_axe', '_shovel', '_hoe', '_sword', '_shears'];
 async function equipBestTool(block) {
-    let bestTool = null, bestTime = Infinity;
-    for (const tool of bot.inventory.items()) {
-        const t = block.digTime(tool ? tool.type : null, false, false, false, [], bot.entity.effects);
+    // Only compare genuine tools — never equip decorative items (beds, lecterns, slabs) as a
+    // "tool" just because they tie with bare-hands on the dig-time comparison.
+    const toolItems = bot.inventory.items().filter(i => TOOL_SUFFIXES.some(s => i.name.endsWith(s)));
+    // Baseline: bare-hand dig time; only equip a tool if it beats that.
+    let bestTool = null, bestTime = block.digTime(null, false, false, false, [], bot.entity.effects);
+    for (const tool of toolItems) {
+        const t = block.digTime(tool.type, false, false, false, [], bot.entity.effects);
         if (t < bestTime) { bestTime = t; bestTool = tool; }
     }
     if (bestTool) {
@@ -598,6 +621,7 @@ async function processActionQueue() {
                         { maxDistance: 64, count: Math.min((quantity + 4) * 2, 64) }
                     ];
                     const triedSet = new Set(); // keyed by 'x,z' — one attempt per XZ column
+                    let toolCheckDone = false;
 
                     for (const pass of SEARCH_PASSES) {
                         if (collected >= quantity || currentCancelToken.cancelled) break;
@@ -619,10 +643,23 @@ async function processActionQueue() {
                         const fresh = [...xzLowest.values()].filter(p => !triedSet.has(`${p.x},${p.z}`));
                         if (fresh.length === 0) continue;
 
-                        if (collected === 0 && pass.maxDistance === 32) {
+                        if (!toolCheckDone) {
+                            toolCheckDone = true;
                             const firstBlock = bot.blockAt(fresh[0]);
                             if (firstBlock && searchIds.includes(firstBlock.type)) {
                                 await ensureToolFor(firstBlock);
+                                // If this block requires a specific tool, confirm we now have one.
+                                // If ensureToolFor failed (e.g. no logs nearby to auto-craft),
+                                // abort early rather than silently skipping every block.
+                                if (firstBlock.harvestTools && Object.keys(firstBlock.harvestTools).length > 0) {
+                                    const heldItem = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+                                    if (!heldItem || !firstBlock.harvestTools[heldItem.type]) {
+                                        const toolCat = inferToolCategory(firstBlock);
+                                        bot.chat(`I need a ${toolCat} to collect ${action.target}.`);
+                                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `No ${toolCat} available to collect ${action.target}. Please craft or provide one.`, environment: getEnvironmentContext() } });
+                                        break; // abort — outer pass loop
+                                    }
+                                }
                             }
                             bot.chat(`Collecting ${action.target}...`);
                         } else if (pass.maxDistance === 64) {
@@ -661,6 +698,15 @@ async function processActionQueue() {
                                 const maxDigMs = Math.max(8000, digTimeMs + 3000);
 
                                 await withTimeout(bot.dig(targetBlock, true), maxDigMs, `dig ${action.target}`, () => {});
+                                // VeinMiner may chain-break many more blocks. Wait for the cascade to settle
+                                // (EventDebouncer fires cascading_wait_end after 500 ms of no new breaks).
+                                if (debouncer && debouncer.isCascadingWait) {
+                                    await new Promise(resolve => {
+                                        const onEnd = () => resolve();
+                                        debouncer.once('cascading_wait_end', onEnd);
+                                        setTimeout(() => { debouncer.removeListener('cascading_wait_end', onEnd); resolve(); }, 5000);
+                                    });
+                                }
                                 await new Promise(r => setTimeout(r, 600)); // pause for item drop + auto-collect
 
                                 // Issue 4: count via inventory delta, not dig calls.
