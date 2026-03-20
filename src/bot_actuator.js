@@ -619,8 +619,10 @@ async function processActionQueue() {
                     if (collected >= quantity) {
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully collected ${collected} ${action.target}.`, environment: getEnvironmentContext() } });
                     } else if (collected > 0) {
+                        actionQueue = []; // Clear queue on partial success to re-evaluate
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially collected ${collected}/${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
                     } else {
+                        actionQueue = []; // Clear queue on failure
                         bot.chat(`Could not find any ${action.target} nearby.`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not find ${action.target}.`, environment: getEnvironmentContext() } });
                     }
@@ -638,9 +640,11 @@ async function processActionQueue() {
                     await bot.toss(itemId, null, action.quantity || 1);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully gave item to ${action.target}.`, environment: getEnvironmentContext() } });
                 } else if (!targetPlayer) {
+                    actionQueue = []; // Clear queue on failure
                     bot.chat(`I cannot see ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot see ${action.target}.`, environment: getEnvironmentContext() } });
                 } else {
+                    actionQueue = []; // Clear queue on failure
                     bot.chat(`I don't know what item ${itemTargetName} is.`);
                 }
 
@@ -665,6 +669,7 @@ async function processActionQueue() {
                                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to craft: ${err.message}`, environment: getEnvironmentContext() } });
                                 }
                             } else {
+                                actionQueue = []; // Clear queue on failure
                                 bot.chat(`Need a crafting table but none nearby.`);
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `No crafting table for ${action.target}.`, environment: getEnvironmentContext() } });
                             }
@@ -673,15 +678,18 @@ async function processActionQueue() {
                                 await withTimeout(bot.craft(recipe, quantity, null), timeoutMs, 'craft in inventory');
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully crafted ${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
                             } catch (err) {
+                                actionQueue = []; // Clear queue on failure
                                 bot.chat(`Failed to craft ${action.target}.`);
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to craft: ${err.message}`, environment: getEnvironmentContext() } });
                             }
                         }
                     } else {
+                        actionQueue = []; // Clear queue on failure
                         bot.chat(`Missing materials for ${action.target}.`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: missing materials or recipe.`, environment: getEnvironmentContext() } });
                     }
                 } else {
+                    actionQueue = []; // Clear queue on failure
                     bot.chat(`I don't know what ${action.target} is.`);
                 }
 
@@ -698,18 +706,22 @@ async function processActionQueue() {
                                 await withTimeout(bot.placeBlock(ref, new Vec3(0, 1, 0)), timeoutMs, 'place block');
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully placed ${action.target}.`, environment: getEnvironmentContext() } });
                             } else {
+                                actionQueue = []; // Clear queue on failure
                                 bot.chat(`No surface nearby to place ${action.target}.`);
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `No reference block found.`, environment: getEnvironmentContext() } });
                             }
                         } catch (err) {
+                            actionQueue = []; // Clear queue on failure
                             bot.chat(`Failed to place ${action.target}.`);
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Place failed: ${err.message}`, environment: getEnvironmentContext() } });
                         }
                     } else {
+                        actionQueue = []; // Clear queue on failure
                         bot.chat(`No ${action.target} in inventory.`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `No ${action.target} in inventory.`, environment: getEnvironmentContext() } });
                     }
                 } else {
+                    actionQueue = []; // Clear queue on failure
                     bot.chat(`I don't know what ${action.target} is.`);
                 }
 
@@ -724,13 +736,16 @@ async function processActionQueue() {
                             bot.chat(`Equipped ${action.target}.`);
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Equipped ${action.target}.`, environment: getEnvironmentContext() } });
                         } catch (err) {
+                            actionQueue = []; // Clear queue on failure
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Equip failed: ${err.message}`, environment: getEnvironmentContext() } });
                         }
                     } else {
+                        actionQueue = []; // Clear queue on failure
                         bot.chat(`No ${action.target} to equip.`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `No ${action.target} in inventory.`, environment: getEnvironmentContext() } });
                     }
                 } else {
+                    actionQueue = []; // Clear queue on failure
                     bot.chat(`I don't know what ${action.target} is.`);
                 }
 
@@ -750,9 +765,11 @@ async function processActionQueue() {
                         await withTimeout(bot.consume(), timeoutMs, 'eat');
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Ate ${foodItem.name}.`, environment: getEnvironmentContext() } });
                     } catch (err) {
+                        actionQueue = []; // Clear queue on failure
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to eat: ${err.message}`, environment: getEnvironmentContext() } });
                     }
                 } else {
+                    actionQueue = []; // Clear queue on failure
                     bot.chat('No food in inventory.');
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: 'No food available.', environment: getEnvironmentContext() } });
                 }
@@ -827,6 +844,7 @@ async function processActionQueue() {
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully smelted ${inputName}.`, environment: getEnvironmentContext() } });
                         } catch (err) {
                             furnace.close();
+                            actionQueue = []; // Clear queue on failure
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Smelt failed: ${err.message}`, environment: getEnvironmentContext() } });
                         }
                     }
@@ -895,8 +913,10 @@ async function processActionQueue() {
                 if (killed >= killQty) {
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully killed ${killed} ${action.target}.`, environment: getEnvironmentContext() } });
                 } else if (killed > 0) {
+                    actionQueue = []; // Clear queue on partial success to re-evaluate
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially killed ${killed}/${killQty} ${action.target}.`, environment: getEnvironmentContext() } });
                 } else {
+                    actionQueue = []; // Clear queue on failure
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to kill ${action.target}.`, environment: getEnvironmentContext() } });
                 }
 
