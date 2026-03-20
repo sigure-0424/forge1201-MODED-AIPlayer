@@ -69,7 +69,7 @@ bot.on('spawn', async () => {
 
     bot.physics.enabled = true;
 
-    const movements = new Movements(bot, mcData);
+    movements = new Movements(bot, mcData);
     movements.canDig = true;
     movements.allowSprinting = true;
     movements.allow1by1towers = true;
@@ -166,6 +166,7 @@ bot.on('chat', (username, message) => {
 let actionQueue = [];
 let currentCancelToken = { cancelled: false };
 let isExecuting = false;
+let movements = null; // initialized in 'spawn', referenced by collect action for leaf-allow logic
 
 function withTimeout(promise, ms, actionName, cancelFn) {
     let timeoutId;
@@ -511,6 +512,21 @@ async function processActionQueue() {
                     const quantity = parseInt(action.quantity, 10) || 1;
                     let collected = 0;
 
+                    // For wood-type targets (logs, stems, etc.), temporarily allow the pathfinder to
+                    // break leaves so it can navigate through tree canopies to reach the log.
+                    // Without this, blocksCantBreak for leaves causes every tree-interior log to
+                    // time out at the goto step (15 s) because no leaf-free path exists.
+                    const isWoodTarget = ['log', '_wood', 'stem', 'hyphae'].some(s => action.target.includes(s));
+                    const _savedLeafIds = [];
+                    if (isWoodTarget && movements) {
+                        for (const [name, block] of Object.entries(bot.registry.blocksByName)) {
+                            if (name.includes('leaves')) {
+                                _savedLeafIds.push(block.id);
+                                movements.blocksCantBreak.delete(block.id);
+                            }
+                        }
+                    }
+
                     // Search passes: 32 blocks (3× candidates) then expand to 64
                     const SEARCH_PASSES = [
                         { maxDistance: 32, count: Math.min(quantity * 3, 64) },
@@ -575,11 +591,18 @@ async function processActionQueue() {
 
                                 collected++;
                             } catch (err) {
-                                console.error(`[Actuator] Skipping block at ${blockPos}: ${err.message}`);
-                                process.send({ type: 'USER_CHAT', data: { username: "System", message: `Skipped block at ${blockPos}: ${err.message}`, environment: getEnvironmentContext() } });
+                                // Log locally only — sending this as USER_CHAT triggers the LLM, which issues
+                                // a new EXECUTE_ACTION that calls setGoal(null) mid-collect, causing
+                                // "Path was stopped" and breaking the entire collection loop.
+                                console.log(`[Actuator] Skipping block at ${blockPos}: ${err.message}`);
                                 // continue to next block
                             }
                         }
+                    }
+
+                    // Restore leaf protection for non-collect navigation (goto, come, explore, etc.)
+                    for (const id of _savedLeafIds) {
+                        movements.blocksCantBreak.add(id);
                     }
 
                     if (collected >= quantity) {
