@@ -83,11 +83,9 @@ bot.on('spawn', async () => {
         bot.registry.blocksByName.sand?.id
     ].filter(id => id !== undefined);
 
-    for (const [name, block] of Object.entries(bot.registry.blocksByName)) {
-        if (name.includes('leaves')) {
-            movements.blocksCantBreak.add(block.id);
-        }
-    }
+    // Leaves are soft (instant break) and are expected obstacles in forested terrain.
+    // Adding them to blocksCantBreak caused goto timeouts whenever the only path to a
+    // log went through tree canopy — the pathfinder found no valid route and gave up.
 
     bot.pathfinder.setMovements(movements);
     // thinkTimeout: max ms A* may search before giving up on a path.
@@ -99,6 +97,15 @@ bot.on('spawn', async () => {
     let lastHealth = bot.health || 20;
     bot.on('health', () => {
         if (bot.health < lastHealth && bot.health > 0) {
+            // Self-defense: when hurt, equip a weapon (if idle) and attack the nearest hostile.
+            const attacker = findNearestHostile(6);
+            if (attacker) {
+                if (!isExecuting) equipBestWeapon().catch(() => {});
+                if (bot.entity.position.distanceTo(attacker.position) <= 3.5) {
+                    bot.attack(attacker);
+                }
+            }
+            // Strafe to dodge follow-up hits
             bot.pathfinder.setGoal(null);
             if (typeof bot.clearControlStates === 'function') {
                 bot.clearControlStates();
@@ -122,6 +129,17 @@ bot.on('spawn', async () => {
         }
         lastHealth = bot.health;
     });
+
+    // Passive defense: swing at any hostile within melee range every attack-cooldown tick.
+    // bot.attack() is non-blocking and does not interfere with the action queue.
+    // Pursuit (setGoal) only happens when the bot is idle between actions.
+    setInterval(() => {
+        if (!bot.entity || bot.health <= 0) return;
+        const hostile = findNearestHostile(3.5);
+        if (!hostile) return;
+        bot.attack(hostile);
+        if (!isExecuting) equipBestWeapon().catch(() => {});
+    }, 600);
 
     console.log('[Actuator] Pathfinder and Physics initialized.');
     bot.chat('Forge AI Player Ready.');
@@ -166,7 +184,54 @@ bot.on('chat', (username, message) => {
 let actionQueue = [];
 let currentCancelToken = { cancelled: false };
 let isExecuting = false;
-let movements = null; // initialized in 'spawn', referenced by collect action for leaf-allow logic
+let movements = null; // initialized in 'spawn'
+
+// ─── Self-defense ─────────────────────────────────────────────────────────────
+const HOSTILE_MOBS = new Set([
+    'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider',
+    'enderman', 'endermite', 'silverfish', 'witch',
+    'pillager', 'vindicator', 'evoker', 'vex', 'ravager',
+    'phantom', 'drowned', 'husk', 'stray', 'zombie_villager',
+    'blaze', 'ghast', 'slime', 'magma_cube',
+    'wither_skeleton', 'wither', 'ender_dragon',
+    'elder_guardian', 'guardian', 'shulker',
+    'hoglin', 'zoglin', 'piglin_brute', 'zombified_piglin',
+]);
+function findNearestHostile(maxDist = 6) {
+    if (!bot.entity) return null;
+    let nearest = null, minDist = maxDist;
+    for (const ent of Object.values(bot.entities)) {
+        if (ent === bot.entity || !ent.isValid) continue;
+        if (ent.type === 'player') continue;
+        const name = (ent.name || '').toLowerCase();
+        if (!HOSTILE_MOBS.has(name)) continue;
+        const d = bot.entity.position.distanceTo(ent.position);
+        if (d < minDist) { minDist = d; nearest = ent; }
+    }
+    return nearest;
+}
+
+// ─── Drop-to-source block mapping ─────────────────────────────────────────────
+// Maps the requested item name to block(s) that yield it when mined.
+// Without this, collect('cobblestone') searches for cobblestone blocks, which
+// don't exist in natural terrain — you must mine stone to obtain cobblestone.
+const DROP_TO_SOURCE = {
+    cobblestone:    ['stone', 'cobblestone'],
+    gravel:         ['gravel'],
+    sand:           ['sand', 'red_sand'],
+    flint:          ['gravel'],
+    clay_ball:      ['clay'],
+    snowball:       ['snow', 'snow_block'],
+    coal:           ['coal_ore', 'deepslate_coal_ore'],
+    raw_iron:       ['iron_ore', 'deepslate_iron_ore'],
+    raw_gold:       ['gold_ore', 'deepslate_gold_ore', 'nether_gold_ore'],
+    diamond:        ['diamond_ore', 'deepslate_diamond_ore'],
+    emerald:        ['emerald_ore', 'deepslate_emerald_ore'],
+    lapis_lazuli:   ['lapis_ore', 'deepslate_lapis_ore'],
+    redstone:       ['redstone_ore', 'deepslate_redstone_ore'],
+    quartz:         ['nether_quartz_ore'],
+    glowstone_dust: ['glowstone'],
+};
 
 function withTimeout(promise, ms, actionName, cancelFn) {
     let timeoutId;
@@ -506,43 +571,46 @@ async function processActionQueue() {
 
             // ── collect (3× candidate pool + progressive radius fallback) ─────
             } else if (action.action === 'collect') {
-                const blockId = bot.registry.blocksByName[action.target]?.id;
-                if (blockId === undefined) { bot.chat(`I don't know what ${action.target} is.`); }
+                // Resolve which blocks to search for.
+                // Some items only exist as drops, not as placed blocks (e.g. cobblestone comes
+                // from mining stone; flint comes from gravel). DROP_TO_SOURCE maps the requested
+                // item to the actual block(s) to find with findBlocks().
+                const sourceSNames = DROP_TO_SOURCE[action.target];
+                const directBlockId = bot.registry.blocksByName[action.target]?.id;
+                const searchIds = sourceSNames
+                    ? sourceSNames.map(n => bot.registry.blocksByName[n]?.id).filter(id => id !== undefined)
+                    : (directBlockId !== undefined ? [directBlockId] : []);
+
+                if (searchIds.length === 0) { bot.chat(`I don't know what ${action.target} is.`); }
                 else {
                     const quantity = parseInt(action.quantity, 10) || 1;
                     let collected = 0;
 
-                    // For wood-type targets (logs, stems, etc.), temporarily allow the pathfinder to
-                    // break leaves so it can navigate through tree canopies to reach the log.
-                    // Without this, blocksCantBreak for leaves causes every tree-interior log to
-                    // time out at the goto step (15 s) because no leaf-free path exists.
-                    const isWoodTarget = ['log', '_wood', 'stem', 'hyphae'].some(s => action.target.includes(s));
-                    const _savedLeafIds = [];
-                    if (isWoodTarget && movements) {
-                        for (const [name, block] of Object.entries(bot.registry.blocksByName)) {
-                            if (name.includes('leaves')) {
-                                _savedLeafIds.push(block.id);
-                                movements.blocksCantBreak.delete(block.id);
-                            }
-                        }
-                    }
+                    // Count actual drops via inventory delta (accurate even for stone→cobblestone,
+                    // gravel→flint, ore→raw_iron, etc. where the block ID ≠ drop item ID).
+                    const countInInventory = () => bot.inventory.items()
+                        .filter(i => i.name === action.target)
+                        .reduce((s, i) => s + i.count, 0);
 
                     // Search passes: 32 blocks (3× candidates) then expand to 64
                     const SEARCH_PASSES = [
                         { maxDistance: 32, count: Math.min(quantity * 3, 64) },
                         { maxDistance: 64, count: Math.min((quantity + 4) * 2, 64) }
                     ];
-                    const triedSet = new Set(); // keyed by 'x,z' — one attempt per tree column
+                    const triedSet = new Set(); // keyed by 'x,z' — one attempt per XZ column
 
                     for (const pass of SEARCH_PASSES) {
                         if (collected >= quantity || currentCancelToken.cancelled) break;
 
-                        const candidates = bot.findBlocks({ matching: blockId, maxDistance: pass.maxDistance, count: pass.count });
+                        const candidates = bot.findBlocks({
+                            matching: b => b && searchIds.includes(b.type),
+                            maxDistance: pass.maxDistance,
+                            count: pass.count
+                        });
 
                         // Group by XZ column and keep only the lowest Y per column.
                         // A tree trunk has logs at Y=63,64,65,66,67. Only the base (Y=63) is
-                        // accessible from the ground. Trying all Y values wastes 15 s per level
-                        // (5 × 15 s = 75 s) before finally reaching the accessible base block.
+                        // accessible from the ground. Trying all Y values wastes 15 s per level.
                         const xzLowest = new Map();
                         for (const pos of candidates) {
                             const key = `${pos.x},${pos.z}`;
@@ -552,9 +620,8 @@ async function processActionQueue() {
                         if (fresh.length === 0) continue;
 
                         if (collected === 0 && pass.maxDistance === 32) {
-                            // Pre-check tool once before the first pass.
                             const firstBlock = bot.blockAt(fresh[0]);
-                            if (firstBlock && firstBlock.type === blockId) {
+                            if (firstBlock && searchIds.includes(firstBlock.type)) {
                                 await ensureToolFor(firstBlock);
                             }
                             bot.chat(`Collecting ${action.target}...`);
@@ -564,25 +631,20 @@ async function processActionQueue() {
 
                         for (const blockPos of fresh) {
                             if (currentCancelToken.cancelled || collected >= quantity) break;
-                            triedSet.add(`${blockPos.x},${blockPos.z}`); // mark entire XZ column as tried
+                            triedSet.add(`${blockPos.x},${blockPos.z}`);
 
                             try {
                                 bot.pathfinder.setGoal(null);
-
-                                // Step 1: Navigate to the block
                                 try {
                                     await withTimeout(bot.pathfinder.goto(new goals.GoalNear(blockPos.x, blockPos.y, blockPos.z, 2)), 15000, `goto ${action.target}`, () => bot.pathfinder.setGoal(null));
                                 } catch (gotoErr) {
                                     throw new Error(`Failed to reach block: ${gotoErr.message}`);
                                 }
 
-                                // Refresh block reference after navigation (chunk may have updated)
                                 const targetBlock = bot.blockAt(blockPos);
-                                if (!targetBlock || targetBlock.type !== blockId) continue;
+                                if (!targetBlock || !searchIds.includes(targetBlock.type)) continue;
 
                                 await equipBestTool(targetBlock);
-
-                                // Check mandatory tool requirement
                                 if (targetBlock.harvestTools && Object.keys(targetBlock.harvestTools).length > 0) {
                                     const heldItem = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
                                     if (!heldItem || !targetBlock.harvestTools[heldItem.type]) {
@@ -590,30 +652,34 @@ async function processActionQueue() {
                                     }
                                 }
 
-                                // Step 2: Dig the block directly.
-                                // bot.dig() skips collectBlock's internal re-pathfinding and the separate
-                                // item-pickup navigation phase, which together caused the 13 s dig timeout.
-                                // Dropped items auto-collect because the bot is already adjacent (within 2 blocks).
+                                // Dig directly — bot.dig() avoids collectBlock's internal re-pathfinding
+                                // and item-pickup navigation, which together caused the 13 s dig timeout.
+                                const countBefore = countInInventory();
                                 await bot.lookAt(targetBlock.position.offset(0.5, 0.5, 0.5));
                                 const heldForDig = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
                                 const digTimeMs = targetBlock.digTime(heldForDig?.type ?? null, false, false, false, [], bot.entity.effects);
                                 const maxDigMs = Math.max(8000, digTimeMs + 3000);
 
                                 await withTimeout(bot.dig(targetBlock, true), maxDigMs, `dig ${action.target}`, () => {});
-                                await new Promise(r => setTimeout(r, 400)); // brief pause for item drop + auto-collect
-                                collected++;
+                                await new Promise(r => setTimeout(r, 600)); // pause for item drop + auto-collect
+
+                                // Issue 4: count via inventory delta, not dig calls.
+                                // This correctly handles stone→cobblestone, gravel→flint, etc.
+                                const gained = countInInventory() - countBefore;
+                                if (gained > 0) {
+                                    collected += gained;
+                                } else {
+                                    // Item didn't auto-collect (fell into gap or entity lag).
+                                    // Navigate to the drop position to pick it up.
+                                    try {
+                                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(blockPos.x, blockPos.y, blockPos.z, 1)), 3000, 'pickup drop', () => bot.pathfinder.setGoal(null));
+                                        collected += Math.max(0, countInInventory() - countBefore);
+                                    } catch (e) { /* item unreachable — skip */ }
+                                }
                             } catch (err) {
-                                // Log locally only — intermediate USER_CHAT messages trigger a new LLM query
-                                // which issues EXECUTE_ACTION and calls setGoal(null) mid-collect.
                                 console.log(`[Actuator] Skipping block at ${blockPos}: ${err.message}`);
-                                // continue to next block
                             }
                         }
-                    }
-
-                    // Restore leaf protection for non-collect navigation (goto, come, explore, etc.)
-                    for (const id of _savedLeafIds) {
-                        movements.blocksCantBreak.add(id);
                     }
 
                     if (collected >= quantity) {
@@ -727,7 +793,9 @@ async function processActionQueue() {
 
             // ── equip ─────────────────────────────────────────────────────────
             } else if (action.action === 'equip') {
-                const itemId = bot.registry.itemsByName[action.target]?.id;
+                // Strip namespace prefix — LLM sometimes sends "minecraft:wooden_pickaxe"
+                const itemName = (action.target || '').replace(/^[a-z_]+:/, '');
+                const itemId = bot.registry.itemsByName[itemName]?.id;
                 if (itemId !== undefined) {
                     const item = bot.inventory.items().find(i => i.type === itemId);
                     if (item) {
