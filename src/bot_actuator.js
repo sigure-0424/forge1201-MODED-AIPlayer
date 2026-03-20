@@ -532,19 +532,27 @@ async function processActionQueue() {
                         { maxDistance: 32, count: Math.min(quantity * 3, 64) },
                         { maxDistance: 64, count: Math.min((quantity + 4) * 2, 64) }
                     ];
-                    const triedSet = new Set();
+                    const triedSet = new Set(); // keyed by 'x,z' — one attempt per tree column
 
                     for (const pass of SEARCH_PASSES) {
                         if (collected >= quantity || currentCancelToken.cancelled) break;
 
                         const candidates = bot.findBlocks({ matching: blockId, maxDistance: pass.maxDistance, count: pass.count });
-                        const fresh = candidates.filter(p => !triedSet.has(`${p.x},${p.y},${p.z}`));
+
+                        // Group by XZ column and keep only the lowest Y per column.
+                        // A tree trunk has logs at Y=63,64,65,66,67. Only the base (Y=63) is
+                        // accessible from the ground. Trying all Y values wastes 15 s per level
+                        // (5 × 15 s = 75 s) before finally reaching the accessible base block.
+                        const xzLowest = new Map();
+                        for (const pos of candidates) {
+                            const key = `${pos.x},${pos.z}`;
+                            if (!xzLowest.has(key) || pos.y < xzLowest.get(key).y) xzLowest.set(key, pos);
+                        }
+                        const fresh = [...xzLowest.values()].filter(p => !triedSet.has(`${p.x},${p.z}`));
                         if (fresh.length === 0) continue;
 
                         if (collected === 0 && pass.maxDistance === 32) {
                             // Pre-check tool once before the first pass.
-                            // Verify the block type still matches — the position may have changed
-                            // (water flowed in, chunk unloaded) since findBlocks ran.
                             const firstBlock = bot.blockAt(fresh[0]);
                             if (firstBlock && firstBlock.type === blockId) {
                                 await ensureToolFor(firstBlock);
@@ -556,22 +564,25 @@ async function processActionQueue() {
 
                         for (const blockPos of fresh) {
                             if (currentCancelToken.cancelled || collected >= quantity) break;
-                            triedSet.add(`${blockPos.x},${blockPos.y},${blockPos.z}`);
+                            triedSet.add(`${blockPos.x},${blockPos.z}`); // mark entire XZ column as tried
 
                             try {
                                 bot.pathfinder.setGoal(null);
-                                const targetBlock = bot.blockAt(blockPos);
 
-                                // Step 1: Navigate to the block with a strict timeout
+                                // Step 1: Navigate to the block
                                 try {
                                     await withTimeout(bot.pathfinder.goto(new goals.GoalNear(blockPos.x, blockPos.y, blockPos.z, 2)), 15000, `goto ${action.target}`, () => bot.pathfinder.setGoal(null));
                                 } catch (gotoErr) {
                                     throw new Error(`Failed to reach block: ${gotoErr.message}`);
                                 }
 
+                                // Refresh block reference after navigation (chunk may have updated)
+                                const targetBlock = bot.blockAt(blockPos);
+                                if (!targetBlock || targetBlock.type !== blockId) continue;
+
                                 await equipBestTool(targetBlock);
 
-                                // Check if the block has a mandatory tool requirement and we don't hold it
+                                // Check mandatory tool requirement
                                 if (targetBlock.harvestTools && Object.keys(targetBlock.harvestTools).length > 0) {
                                     const heldItem = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
                                     if (!heldItem || !targetBlock.harvestTools[heldItem.type]) {
@@ -579,21 +590,21 @@ async function processActionQueue() {
                                     }
                                 }
 
-                                // Step 2: Dig the block with a separate timeout based on hardness
-                                // Give it 10s base + extra time if it's a hard block
-                                const digTimeMs = targetBlock.digTime(bot.inventory.slots[bot.getEquipmentDestSlot('hand')]?.type || null, false, false, false, [], bot.entity.effects);
-                                const maxDigTime = 10000 + (digTimeMs > 0 ? digTimeMs : 0);
+                                // Step 2: Dig the block directly.
+                                // bot.dig() skips collectBlock's internal re-pathfinding and the separate
+                                // item-pickup navigation phase, which together caused the 13 s dig timeout.
+                                // Dropped items auto-collect because the bot is already adjacent (within 2 blocks).
+                                await bot.lookAt(targetBlock.position.offset(0.5, 0.5, 0.5));
+                                const heldForDig = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+                                const digTimeMs = targetBlock.digTime(heldForDig?.type ?? null, false, false, false, [], bot.entity.effects);
+                                const maxDigMs = Math.max(8000, digTimeMs + 3000);
 
-                                await withTimeout(bot.collectBlock.collect(targetBlock), maxDigTime, `dig ${action.target}`, () => {
-                                    bot.pathfinder.setGoal(null);
-                                    if (bot.collectBlock.cancelTask) bot.collectBlock.cancelTask();
-                                });
-
+                                await withTimeout(bot.dig(targetBlock, true), maxDigMs, `dig ${action.target}`, () => {});
+                                await new Promise(r => setTimeout(r, 400)); // brief pause for item drop + auto-collect
                                 collected++;
                             } catch (err) {
-                                // Log locally only — sending this as USER_CHAT triggers the LLM, which issues
-                                // a new EXECUTE_ACTION that calls setGoal(null) mid-collect, causing
-                                // "Path was stopped" and breaking the entire collection loop.
+                                // Log locally only — intermediate USER_CHAT messages trigger a new LLM query
+                                // which issues EXECUTE_ACTION and calls setGoal(null) mid-collect.
                                 console.log(`[Actuator] Skipping block at ${blockPos}: ${err.message}`);
                                 // continue to next block
                             }
