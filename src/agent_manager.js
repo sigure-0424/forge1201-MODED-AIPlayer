@@ -208,7 +208,7 @@ Current Environment: ${JSON.stringify(data.environment)}
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
 *CRITICAL*: Chain multiple actions in one array. If the user says "give me 10 oak logs", respond with BOTH collect AND give: [{"action":"collect","target":"oak_log","quantity":10},{"action":"give","target":"${data.username}","item":"oak_log","quantity":10}]
 *CRITICAL*: For complex tasks like "gather 10 wood and make a sword", chain all steps: [{"action":"collect","target":"oak_log","quantity":10},{"action":"craft","target":"wooden_sword","quantity":1}]
-*CRITICAL*: The bot auto-crafts the required tool before any collect action — do NOT pre-craft tools manually.
+*CRITICAL*: Think about the dependency tree of items. For example, to make a stone pickaxe, you need: wood -> planks -> sticks -> crafting table -> wooden pickaxe -> stone -> stone pickaxe. You must explicitly break this down into multiple chained actions (collecting logs, crafting planks, etc.).
 *CRITICAL*: Always use the longest timeout that makes sense. Collection of many blocks needs timeout:120 or more.
 *CRITICAL*: If the user provides only two numbers for coordinates, assign them to X and Z, omit Y.
 
