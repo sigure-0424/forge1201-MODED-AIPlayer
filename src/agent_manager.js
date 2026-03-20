@@ -207,6 +207,7 @@ Current Environment: ${JSON.stringify(data.environment)}
 ━━━ CORE RULES ━━━
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
 *CRITICAL*: Chain multiple actions in one array. If the user says "give me 10 oak logs", respond with BOTH collect AND give: [{"action":"collect","target":"oak_log","quantity":10},{"action":"give","target":"${data.username}","item":"oak_log","quantity":10}]
+*CRITICAL*: For complex tasks like "gather 10 wood and make a sword", chain all steps: [{"action":"collect","target":"oak_log","quantity":10},{"action":"craft","target":"wooden_sword","quantity":1}]
 *CRITICAL*: The bot auto-crafts the required tool before any collect action — do NOT pre-craft tools manually.
 *CRITICAL*: Always use the longest timeout that makes sense. Collection of many blocks needs timeout:120 or more.
 *CRITICAL*: If the user provides only two numbers for coordinates, assign them to X and Z, omit Y.
@@ -292,9 +293,10 @@ ELDER GUARDIAN: brew(water_breathing) + brew(night_vision) → explore for ocean
 
         const botProcess = this.bots.get(botId);
         if (botProcess) {
-            const filteredActions = sanitizedActions.filter(a => a.action !== "stop");
-            if (filteredActions.length > 0) {
-                 botProcess.send({ type: 'EXECUTE_ACTION', action: filteredActions });
+            // Send the full sanitized array, including 'stop', to the bot actuator
+            // so it can clear its current goals if 'stop' is part of a chained command.
+            if (sanitizedActions.length > 0) {
+                 botProcess.send({ type: 'EXECUTE_ACTION', action: sanitizedActions });
             }
         }
 

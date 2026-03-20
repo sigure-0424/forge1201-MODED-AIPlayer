@@ -83,6 +83,11 @@ bot.on('spawn', async () => {
         bot.registry.blocksByName.sand?.id
     ].filter(id => id !== undefined);
 
+    for (const [name, block] of Object.entries(bot.registry.blocksByName)) {
+        if (name.includes('leaves')) {
+            movements.blocksCantBreak.add(block.id);
+        }
+    }
 
     bot.pathfinder.setMovements(movements);
     // thinkTimeout: max ms A* may search before giving up on a path.
@@ -90,6 +95,33 @@ bot.on('spawn', async () => {
     bot.pathfinder.thinkTimeout = 5000;
     // tickTimeout: ms of A* work per game tick. Smaller → more GC opportunities.
     bot.pathfinder.tickTimeout = 5;
+
+    let lastHealth = bot.health || 20;
+    bot.on('health', () => {
+        if (bot.health < lastHealth && bot.health > 0) {
+            bot.pathfinder.setGoal(null);
+            if (typeof bot.clearControlStates === 'function') {
+                bot.clearControlStates();
+            } else {
+                bot.setControlState('forward', false);
+                bot.setControlState('sprint', false);
+                bot.setControlState('jump', false);
+            }
+            bot.setControlState('forward', true);
+            bot.setControlState('sprint', true);
+            bot.setControlState('jump', true);
+            setTimeout(() => {
+                if (typeof bot.clearControlStates === 'function') {
+                    bot.clearControlStates();
+                } else {
+                    bot.setControlState('forward', false);
+                    bot.setControlState('sprint', false);
+                    bot.setControlState('jump', false);
+                }
+            }, 1000);
+        }
+        lastHealth = bot.health;
+    });
 
     console.log('[Actuator] Pathfinder and Physics initialized.');
     bot.chat('Forge AI Player Ready.');
@@ -550,8 +582,10 @@ async function processActionQueue() {
                         }
                     }
 
-                    if (collected > 0) {
+                    if (collected >= quantity) {
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully collected ${collected} ${action.target}.`, environment: getEnvironmentContext() } });
+                    } else if (collected > 0) {
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially collected ${collected}/${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
                     } else {
                         bot.chat(`Could not find any ${action.target} nearby.`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not find ${action.target}.`, environment: getEnvironmentContext() } });
@@ -824,8 +858,10 @@ async function processActionQueue() {
                     }
                 }
 
-                if (killed > 0) {
+                if (killed >= killQty) {
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully killed ${killed} ${action.target}.`, environment: getEnvironmentContext() } });
+                } else if (killed > 0) {
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially killed ${killed}/${killQty} ${action.target}.`, environment: getEnvironmentContext() } });
                 } else {
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to kill ${action.target}.`, environment: getEnvironmentContext() } });
                 }
@@ -1079,15 +1115,19 @@ process.on('message', async (msg) => {
         let actions = msg.action;
         if (!Array.isArray(actions)) actions = [actions];
 
+        // Always cancel current actions and wipe the queue to let the new
+        // command override previous goals (essential for stopping loops).
+        actionQueue = [];
+        currentCancelToken.cancelled = true;
+        bot.pathfinder.setGoal(null);
+        if (bot.collectBlock.cancelTask) bot.collectBlock.cancelTask();
+
+        // If it was just a stop command, we are done
         if (actions.length === 1 && actions[0].action === 'stop') {
-            actionQueue = [];
-            currentCancelToken.cancelled = true;
-            bot.pathfinder.setGoal(null);
-            if (bot.collectBlock.cancelTask) bot.collectBlock.cancelTask();
-            // Suppressed bot.chat("Stopped.") — would spam on every user message
             return;
         }
 
+        // Initialize a new token and enqueue the new instructions
         currentCancelToken = { cancelled: false };
         actionQueue.push(...actions);
         processActionQueue();
