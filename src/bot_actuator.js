@@ -6,6 +6,28 @@ const DynamicRegistryInjector = require('./dynamic_registry_injector');
 const EventDebouncer = require('./event_debouncer');
 const nbt = require('prismarine-nbt');
 const Vec3 = require('vec3');
+const fs = require('fs');
+const path = require('path');
+const util = require('util');
+
+// --- Overwrite Console Logging for External AI Monitor ---
+const originalLog = console.log;
+const originalError = console.error;
+const LOG_FILE = path.join(process.cwd(), 'bot_system.log');
+
+console.log = function(...args) {
+    originalLog.apply(console, args);
+    try {
+        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ` + util.format(...args) + '\n');
+    } catch(e) {}
+};
+
+console.error = function(...args) {
+    originalError.apply(console, args);
+    try {
+        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ERROR: ` + util.format(...args) + '\n');
+    } catch(e) {}
+};
 
 // Robust Crash Protection
 process.on('uncaughtException', (err) => {
@@ -23,7 +45,8 @@ console.log(`[Actuator] Initializing ${botId}...`);
 try {
     const mcDataGlobal = require('minecraft-data')('1.20.1');
     const types = mcDataGlobal.protocol.play.toClient.types;
-    const bypass = ['declare_recipes', 'tags', 'advancements', 'declare_commands', 'unlock_recipes', 'craft_recipe_response', 'nbt_query_response'];
+    // Suppress partial packet read exceptions by ignoring packets known to desync (like world_particles with custom Forge particle types).
+    const bypass = ['declare_recipes', 'tags', 'advancements', 'declare_commands', 'unlock_recipes', 'craft_recipe_response', 'nbt_query_response', 'world_particles'];
     bypass.forEach(p => {
         types[p] = 'restBuffer';
         if (types['packet_' + p]) types['packet_' + p] = 'restBuffer';
@@ -155,6 +178,34 @@ bot.on('spawn', async () => {
 
     console.log('[Actuator] Pathfinder and Physics initialized.');
     bot.chat('Forge AI Player Ready.');
+
+    // --- File Logging for External AI Monitor ---
+    setInterval(() => {
+        if (!bot.entity) return;
+
+        try {
+            const debugState = {
+                timestamp: new Date().toISOString(),
+                position: {
+                    x: Math.round(bot.entity.position.x * 10) / 10,
+                    y: Math.round(bot.entity.position.y * 10) / 10,
+                    z: Math.round(bot.entity.position.z * 10) / 10
+                },
+                health: Math.round(bot.health),
+                food: Math.round(bot.food),
+                isExecuting,
+                actionQueue: [...actionQueue]
+            };
+
+            // Overwrite file so AI can just read current state without parsing gigabytes
+            fs.writeFileSync(path.join(process.cwd(), 'ai_debug.json'), JSON.stringify(debugState, null, 2));
+
+            // Append to history log
+            fs.appendFileSync(path.join(process.cwd(), 'ai_history.log'), JSON.stringify(debugState) + '\n');
+        } catch (e) {
+            console.error(`[Actuator] Failed to write ai_debug: ${e.message}`);
+        }
+    }, 5000);
 });
 
 function getEnvironmentContext() {
@@ -170,6 +221,7 @@ function getEnvironmentContext() {
             if (id !== undefined && bot.findBlock({ matching: id, maxDistance: 16 })) nearbyBlocks.push(name);
         }
     }
+    const inventoryItems = bot.inventory ? bot.inventory.items() : [];
     return {
         position: bot.entity ? {
             x: Math.round(bot.entity.position.x),
@@ -179,7 +231,10 @@ function getEnvironmentContext() {
         health: bot.health ? Math.round(bot.health) : null,
         food: bot.food ? Math.round(bot.food) : null,
         players_nearby: Object.keys(bot.players).filter(p => p !== bot.username && bot.players[p].entity),
-        inventory: bot.inventory ? bot.inventory.items().map(item => ({ name: item.name, count: item.count })) : [],
+        inventory: inventoryItems.map(item => ({ name: item.name, count: item.count })),
+        has_pickaxe: inventoryItems.some(i => i.name.endsWith('_pickaxe')),
+        has_axe: inventoryItems.some(i => i.name.endsWith('_axe')),
+        has_sword: inventoryItems.some(i => i.name.endsWith('_sword')),
         nearby_blocks: nearbyBlocks
     };
 }
@@ -553,6 +608,50 @@ async function processActionQueue() {
             // ── chat ──────────────────────────────────────────────────────────
             if (action.action === 'chat') {
                 bot.chat(action.message);
+
+            // ── dump_chunks ───────────────────────────────────────────────────
+            } else if (action.action === 'dump_chunks') {
+                bot.chat("Dumping loaded chunks to chunk_dump.json...");
+                try {
+                    const blocks = bot.findBlocks({
+                        matching: (b) => b && b.name !== 'air' && b.name !== 'water' && b.name !== 'lava' && b.name !== 'cave_air',
+                        maxDistance: 32,
+                        count: 50000
+                    });
+
+                    const blockDump = {};
+                    for (const pos of blocks) {
+                        const b = bot.blockAt(pos);
+                        if (b) {
+                            if (!blockDump[b.name]) blockDump[b.name] = [];
+                            blockDump[b.name].push({ x: pos.x, y: pos.y, z: pos.z });
+                        }
+                    }
+                    fs.writeFileSync(path.join(process.cwd(), 'chunk_dump.json'), JSON.stringify(blockDump, null, 2));
+
+                    const message = `Dumped ${blocks.length} blocks to chunk_dump.json.`;
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: message, environment: getEnvironmentContext() } });
+                } catch (e) {
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Dump failed: ${e.message}`, environment: getEnvironmentContext() } });
+                }
+
+            // ── status ────────────────────────────────────────────────────────
+            } else if (action.action === 'status') {
+                const env = getEnvironmentContext();
+                const posStr = env.position ? `X:${env.position.x} Y:${env.position.y} Z:${env.position.z}` : 'Unknown';
+                const healthStr = env.health !== null ? `${env.health}/20` : 'Unknown';
+                const foodStr = env.food !== null ? `${env.food}/20` : 'Unknown';
+
+                const groundState = bot.entity && bot.entity.onGround ? "on ground" : "mid-air";
+                const blockBelow = bot.entity ? bot.blockAt(bot.entity.position.offset(0, -0.5, 0)) : null;
+                const belowName = blockBelow ? blockBelow.name : 'Unknown';
+
+                let message = `Status: ${healthStr} HP, ${foodStr} Food. Position: ${posStr} (${groundState}, above ${belowName}).`;
+                if (env.players_nearby && env.players_nearby.length > 0) message += ` Nearby: ${env.players_nearby.join(', ')}.`;
+                if (env.nearby_blocks && env.nearby_blocks.length > 0) message += ` Blocks: ${env.nearby_blocks.join(', ')}.`;
+
+                bot.chat(message);
+                process.send({ type: 'USER_CHAT', data: { username: "System", message: message, environment: env } });
 
             // ── come (continuous follow via GoalNear loop) ───────────────────────
             } else if (action.action === 'come') {
