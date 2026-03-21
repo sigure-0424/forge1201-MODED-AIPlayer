@@ -236,6 +236,19 @@ function findNearestHostile(maxDist = 6) {
     return nearest;
 }
 
+// ─── Underground resource set ──────────────────────────────────────────────────
+// These blocks generate underground. When a surface search fails, the system
+// should tell the LLM to plan a dig-down step first.
+const UNDERGROUND_BLOCKS = new Set([
+    'stone', 'andesite', 'granite', 'diorite', 'deepslate', 'tuff', 'calcite',
+    'coal_ore', 'iron_ore', 'gold_ore', 'diamond_ore', 'emerald_ore',
+    'lapis_ore', 'redstone_ore', 'copper_ore',
+    'deepslate_coal_ore', 'deepslate_iron_ore', 'deepslate_gold_ore',
+    'deepslate_diamond_ore', 'deepslate_copper_ore', 'deepslate_lapis_ore',
+    'deepslate_redstone_ore', 'deepslate_emerald_ore',
+    'nether_quartz_ore', 'ancient_debris',
+]);
+
 // ─── Drop-to-source block mapping ─────────────────────────────────────────────
 // Maps the requested item name to block(s) that yield it when mined.
 // Without this, collect('cobblestone') searches for cobblestone blocks, which
@@ -394,6 +407,9 @@ async function ensureToolFor(block) {
                 const logBlockId = bot.registry.blocksByName[logName]?.id;
                 if (!logBlockId) continue;
                 const logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 32, count: logsNeeded });
+                // Try wider radii if not found close by
+                if (logBlocks.length === 0) logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 64, count: logsNeeded });
+                if (logBlocks.length === 0) logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 128, count: logsNeeded });
                 if (logBlocks.length === 0) continue;
                 for (const logPos of logBlocks) {
                     if (countBy(LOG_NAMES) >= logsNeeded) break;
@@ -545,6 +561,7 @@ async function processActionQueue() {
                     bot.chat(`Following ${action.target}!`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Now following ${action.target}.`, environment: getEnvironmentContext() } });
 
+                    let followStuck = 0;
                     while (!currentCancelToken.cancelled) {
                         const currentTarget = bot.players[action.target]?.entity;
                         if (!currentTarget) {
@@ -556,13 +573,26 @@ async function processActionQueue() {
                         const dist = bot.entity.position.distanceTo(currentTarget.position);
                         if (dist > 3) {
                             try {
-                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(currentTarget.position.x, currentTarget.position.y, currentTarget.position.z, 2)), 10000, 'follow target', () => bot.pathfinder.setGoal(null));
+                                // Use a short per-step timeout so the position re-evaluates frequently.
+                                // pathfinder.thinkTimeout is already 5 s so this matches it.
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(currentTarget.position.x, currentTarget.position.y, currentTarget.position.z, 2)), 5000, 'follow target', () => bot.pathfinder.setGoal(null));
+                                followStuck = 0;
                             } catch (e) {
-                                // Ignore timeout/pathing errors during follow loop to prevent crash, just keep trying
+                                followStuck++;
+                                if (followStuck >= 3) {
+                                    // Stuck escape: jump to dislodge from ledge/block
+                                    bot.setControlState('jump', true);
+                                    await new Promise(r => setTimeout(r, 400));
+                                    bot.setControlState('jump', false);
+                                    followStuck = 0;
+                                }
+                                // Brief pause before retrying to avoid busy-spinning
+                                await new Promise(r => setTimeout(r, 500));
                             }
                         } else {
-                            // Close enough, just wait a bit
-                            await new Promise(r => setTimeout(r, 1000));
+                            followStuck = 0;
+                            // Close enough — poll at half-second intervals
+                            await new Promise(r => setTimeout(r, 500));
                         }
                     }
                 } else {
@@ -628,10 +658,13 @@ async function processActionQueue() {
                         .filter(i => i.name === action.target)
                         .reduce((s, i) => s + i.count, 0);
 
-                    // Search passes: 32 blocks (3× candidates) then expand to 64
+                    // Search passes: 32 → 64 → 128 blocks.
+                    // Underground resources (stone, ores) rarely appear within 64 blocks
+                    // of the surface spawn point, so the wider passes matter a lot for them.
                     const SEARCH_PASSES = [
-                        { maxDistance: 32, count: Math.min(quantity * 3, 64) },
-                        { maxDistance: 64, count: Math.min((quantity + 4) * 2, 64) }
+                        { maxDistance: 32,  count: Math.min(quantity * 3, 64) },
+                        { maxDistance: 64,  count: Math.min((quantity + 4) * 2, 64) },
+                        { maxDistance: 128, count: Math.min(quantity + 8, 32) },
                     ];
                     const triedSet = new Set(); // keyed by 'x,z' — one attempt per XZ column
                     let toolCheckDone = false;
@@ -670,7 +703,8 @@ async function processActionQueue() {
                                     if (!heldItem || !firstBlock.harvestTools[heldItem.type]) {
                                         const toolCat = inferToolCategory(firstBlock);
                                         bot.chat(`I need a ${toolCat} to collect ${action.target}.`);
-                                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `No ${toolCat} available to collect ${action.target}. Please craft or provide one.`, environment: getEnvironmentContext() } });
+                                        // Give the LLM the full dependency chain so it can plan recovery.
+                                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `No ${toolCat} available to collect ${action.target}. Craft one: collect oak_log(2) → craft oak_planks → craft sticks → place crafting_table → craft wooden_${toolCat} → then retry collect ${action.target}.`, environment: getEnvironmentContext() } });
                                         break; // abort — outer pass loop
                                     }
                                 }
@@ -762,7 +796,10 @@ async function processActionQueue() {
                     } else {
                         actionQueue = []; // Clear queue on failure
                         bot.chat(`Could not find any ${action.target} nearby.`);
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not find ${action.target}.`, environment: getEnvironmentContext() } });
+                        const undergroundHint = UNDERGROUND_BLOCKS.has(action.target)
+                            ? ` This is an underground resource. You must mine down through stone layers to find it — issue a collect for "stone" first to dig a shaft, then retry.`
+                            : '';
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not find ${action.target} within 128 blocks.${undergroundHint}`, environment: getEnvironmentContext() } });
                     }
                 }
 

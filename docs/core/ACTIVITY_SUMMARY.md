@@ -4,6 +4,7 @@ Format:
 - [summary] | [paths] --[agent-id] --[task-id]
 
 Entries:
+- Fixed follow stuck (per-attempt 5s cap, 500ms retry delay, jump escape after 3 failures), collect search radius expanded to 128 blocks (3rd pass), ensureToolFor log search widened to 128 blocks, added UNDERGROUND_BLOCKS set with underground hint on "not found", improved tool-missing error message with full crafting chain, upgraded LLM prompt with inventory-check instruction and underground resource guidance | src/bot_actuator.js, src/agent_manager.js --claude --BUGFIX-20260321-001
 - Initialized generic bootstrap repo layout and core docs | README.md, GOAL.md, MASTER_GUIDANCE.md, docs/, docker/, scripts/, .vscode/ --openai --TASK-20260303-001-bootstrap-template
 - Removed legacy helper scripts from the base template | scripts/ --openai --TASK-20260303-001-bootstrap-template
 - Added selector-based agent startup, a reusable gemini-orchestrator skill package, orchestration policies, and generic runtime helpers | .vscode/sessions.json, .claude/skills/, docs/core/, docs/proposed/, docs/implemented/, scripts/, tmp/orchestrator/ --openai --TASK-20260311-001-agent-orchestrator-bootstrap

@@ -200,15 +200,19 @@ class AgentManager {
 
         console.log(`[AgentManager] Thinking about what ${data.username} said: "${data.message}"...`);
 
+        const isSystemFailure = data.username === 'System' || data.username === 'system';
         let prompt = `You are a Minecraft AI bot named ${botId}.
-User '${data.username}' said: "${data.message}"
+${isSystemFailure ? `SYSTEM FEEDBACK (previous action result): "${data.message}"` : `User '${data.username}' said: "${data.message}"`}
 Current Environment: ${JSON.stringify(data.environment)}
 
 ━━━ CORE RULES ━━━
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
 *CRITICAL*: Chain multiple actions in one array. If the user says "give me 10 oak logs", respond with BOTH collect AND give: [{"action":"collect","target":"oak_log","quantity":10},{"action":"give","target":"${data.username}","item":"oak_log","quantity":10}]
 *CRITICAL*: For complex tasks like "gather 10 wood and make a sword", chain all steps: [{"action":"collect","target":"oak_log","quantity":10},{"action":"craft","target":"wooden_sword","quantity":1}]
-*CRITICAL*: Think about the dependency tree of items. For example, to make a stone pickaxe, you need: wood -> planks -> sticks -> crafting table -> wooden pickaxe -> stone -> stone pickaxe. You must explicitly break this down into multiple chained actions (collecting logs, crafting planks, etc.).
+*CRITICAL*: ALWAYS check inventory before deciding what to collect or craft. If something is already there, skip that step.
+*CRITICAL*: Think through the FULL dependency tree. To collect any stone-type block or ore you NEED a pickaxe first. If no pickaxe in inventory, chain BEFORE the collect: [{"action":"collect","target":"oak_log","quantity":2,"timeout":60},{"action":"craft","target":"oak_planks","quantity":1},{"action":"craft","target":"stick","quantity":1},{"action":"place","target":"crafting_table"},{"action":"craft","target":"wooden_pickaxe","quantity":1}] — THEN add the original collect.
+*CRITICAL*: Stone-type blocks (stone, andesite, granite, diorite) and ores are UNDERGROUND. If the system reports "not found within 128 blocks", you must dig down first: [{"action":"collect","target":"stone","quantity":16,"timeout":60}] will open a shaft. Then retry the original target.
+*CRITICAL*: If a SYSTEM FEEDBACK message describes a failure, respond with the corrective action chain — do NOT just repeat the failed action.
 *CRITICAL*: If you lack materials for crafting, explicitly plan actions to gather them first.
 *CRITICAL*: Always use the longest timeout that makes sense. Collection of many blocks needs timeout:120 or more.
 *CRITICAL*: If the user provides only two numbers for coordinates, assign them to X and Z, omit Y.
