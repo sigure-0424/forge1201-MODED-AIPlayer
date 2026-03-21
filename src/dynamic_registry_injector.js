@@ -81,11 +81,36 @@ class DynamicRegistryInjector {
         const stoneTemplate = this.registry.blocksByName['stone'];
         const airTemplate = this.registry.blocksByName['air'];
 
+        // Forge 1.20.1 sends legacy block names that were removed in vanilla 1.13+.
+        // Map them to their modern equivalents so they get vanilla properties instead
+        // of being treated as unknown mod blocks (which default to stone template).
+        // Without this, flowing_water becomes a solid block and the bot floats on water.
+        const LEGACY_TO_MODERN = {
+            'flowing_water': 'water',
+            'flowing_lava': 'lava',
+            'lit_furnace': 'furnace',
+            'lit_redstone_lamp': 'redstone_lamp',
+            'unlit_redstone_torch': 'redstone_torch',
+            'standing_sign': 'oak_sign',
+            'wall_sign': 'oak_wall_sign',
+            'standing_banner': 'white_banner',
+            'wall_banner': 'white_wall_banner',
+            'double_stone_slab': 'stone_slab',
+            'double_wooden_slab': 'oak_slab',
+            'daylight_detector_inverted': 'daylight_detector',
+            'unpowered_comparator': 'comparator',
+            'powered_comparator': 'comparator',
+            'unpowered_repeater': 'repeater',
+            'powered_repeater': 'repeater',
+            'piston_extension': 'piston_head',
+        };
+
         for (const entry of parsedEntries) {
             const shortName = entry.name.replace(/^[^:]+:/, '');
 
             if (entry.type === 'block') {
-                const vanillaBlock = this.registry.blocksByName[shortName];
+                const modernName = LEGACY_TO_MODERN[shortName];
+                const vanillaBlock = this.registry.blocksByName[modernName || shortName];
 
                 if (vanillaBlock) {
                     // Re-mapping vanilla blocks: map ALL state variants so the Proxy binary-search
@@ -120,9 +145,22 @@ class DynamicRegistryInjector {
                     if (dictEntry) {
                         if (dictEntry.hardness !== undefined) modBlock.hardness = dictEntry.hardness;
                         if (dictEntry.transparent !== undefined) modBlock.transparent = dictEntry.transparent;
-                        // For boundingBox, Mineflayer calculates physical shapes based on blockCollisionShapes
-                        // The 'solid' property is implicitly managed by boundingBox and collision shapes in Prismarine-physics.
+                        if (dictEntry.boundingBox !== undefined) modBlock.boundingBox = dictEntry.boundingBox;
                     }
+
+                    // Unknown mod blocks keep boundingBox='block' from the stone template.
+                    // This ensures the pathfinder and physics engine AGREE: both see these
+                    // blocks as solid.  The pathfinder will walk ON them (as ground) and
+                    // around them (as walls at body height), while physics correctly
+                    // collides with them.
+                    //
+                    // Setting boundingBox='empty' while keeping solid collision shapes
+                    // BREAKS movement: the pathfinder plans paths through the block
+                    // (safe=true), but the physics simulator blocks it (solid shapes).
+                    // The bot then sets forward=false every tick and never moves.
+                    //
+                    // The tradeoff: mod blocks at body height ARE treated as diggable
+                    // walls.  This adds cost to A* but produces correct, walkable paths.
 
                     this.registry.blocks[entry.id] = modBlock;
                     if (this.registry.blocksByStateId) {

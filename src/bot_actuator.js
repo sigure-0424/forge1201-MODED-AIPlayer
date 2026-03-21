@@ -15,17 +15,19 @@ const originalLog = console.log;
 const originalError = console.error;
 const LOG_FILE = path.join(process.cwd(), 'bot_system.log');
 
+// Use non-blocking appendFile to avoid stalling the event loop (physics ticks).
+// appendFileSync was blocking 1-10ms per call on WSL2, starving the pathfinder.
 console.log = function(...args) {
     originalLog.apply(console, args);
     try {
-        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ` + util.format(...args) + '\n');
+        fs.appendFile(LOG_FILE, `[${new Date().toISOString()}] ` + util.format(...args) + '\n', () => {});
     } catch(e) {}
 };
 
 console.error = function(...args) {
     originalError.apply(console, args);
     try {
-        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ERROR: ` + util.format(...args) + '\n');
+        fs.appendFile(LOG_FILE, `[${new Date().toISOString()}] ERROR: ` + util.format(...args) + '\n', () => {});
     } catch(e) {}
 };
 
@@ -85,6 +87,62 @@ bot.on('inject_allowed', () => {
 bot.loadPlugin(pathfinder);
 bot.loadPlugin(require('mineflayer-collectblock').plugin);
 
+// Track server position corrections for diagnostics + frozen-bot watchdog
+let _serverPosCount = 0;
+let _lastServerPosCheck = Date.now();
+let _frozenPosKey = null;
+let _frozenPeriods = 0;
+bot._client.on('position', (packet) => {
+    _serverPosCount++;
+    const now = Date.now();
+    if (now - _lastServerPosCheck > 10000) {
+        if (_serverPosCount > 0) {
+            console.log(`[ServerPos] ${_serverPosCount} corrections in 10s. Pos=(${packet.x?.toFixed(1)}, ${packet.y?.toFixed(1)}, ${packet.z?.toFixed(1)})`);
+        }
+
+        // Watchdog: if 100+ corrections AND same position for 2 consecutive 10s windows,
+        // the bot is frozen (server and client physics disagree). Auto-recover via /tp.
+        if (_serverPosCount > 100 && bot.entity && _botReady) {
+            const pos = bot.entity.position;
+            const key = `${Math.round(pos.x)},${Math.round(pos.y)},${Math.round(pos.z)}`;
+            if (key === _frozenPosKey) {
+                _frozenPeriods++;
+                if (_frozenPeriods >= 2) {
+                    console.log(`[Actuator] Frozen watchdog triggered at ${key} (${_frozenPeriods} periods). Teleporting to player...`);
+                    bot.pathfinder.setGoal(null);
+                    const nearestPlayer = Object.values(bot.players)
+                        .filter(p => p.username !== bot.username && p.entity)
+                        .sort((a, b) => pos.distanceTo(a.entity.position) - pos.distanceTo(b.entity.position))[0];
+                    if (nearestPlayer) {
+                        bot.chat(`/tp ${bot.username} ${nearestPlayer.username}`);
+                    }
+                    _frozenPeriods = 0;
+                    _frozenPosKey = null;
+                }
+            } else {
+                _frozenPosKey = key;
+                _frozenPeriods = 1;
+            }
+        } else {
+            _frozenPosKey = null;
+            _frozenPeriods = 0;
+        }
+
+        _serverPosCount = 0;
+        _lastServerPosCheck = now;
+    }
+});
+
+// Guard: only initialize once (spawn fires on every respawn / dimension change)
+let _spawnInitDone = false;
+let _passiveDefenseInterval = null;
+let _lastHealth = 20;
+
+// IPC readiness gate — prevents processing actions before login/spawn complete.
+// Actions arriving before bot is ready are buffered and flushed after spawn.
+let _botReady = false;
+let _pendingIpcActions = [];
+
 bot.on('spawn', async () => {
     console.log(`[Actuator] Bot spawned. Initializing physics and pathfinder...`);
     try { await bot.waitForChunksToLoad(); } catch (e) {
@@ -92,7 +150,9 @@ bot.on('spawn', async () => {
     }
 
     bot.physics.enabled = true;
-    bot.physics.stepHeight = 1;
+    // stepHeight: 0.6 is vanilla default. Setting to 1 can cause physics simulation
+    // disagreements with the pathfinder's A* (which uses 0.6 internally).
+    // Keep at vanilla default for consistent behavior.
 
     movements = new Movements(bot, mcData);
     movements.canDig = true;
@@ -109,83 +169,163 @@ bot.on('spawn', async () => {
         bot.registry.blocksByName.sand?.id
     ].filter(id => id !== undefined);
 
-    // Leaves are soft (instant break) and are expected obstacles in forested terrain.
-    // Adding them to blocksCantBreak caused goto timeouts whenever the only path to a
-    // log went through tree canopy — the pathfinder found no valid route and gave up.
-
     bot.pathfinder.setMovements(movements);
-    // thinkTimeout: max ms A* may search before giving up on a path.
-    // 5 000 ms caps peak heap at ~300 MB per failed attempt (10 000 ms OOM'd at ~600 MB).
     bot.pathfinder.thinkTimeout = 5000;
-    // tickTimeout: ms of A* work per game tick. Smaller → more GC opportunities.
-    bot.pathfinder.tickTimeout = 5;
+    // tickTimeout: ms of A* work per game tick.
+    // 10 ms matches the original working configuration (commit 00fe7ea).
+    bot.pathfinder.tickTimeout = 10;
 
-    let lastHealth = bot.health || 20;
-    bot.on('health', () => {
-        if (bot.food < 15) {
-            const food = getBestFoodItem();
-            if (food && !isExecuting) {
-                bot.equip(food, 'hand').then(() => bot.consume().catch(() => {}));
-            }
-        }
+    // Only register event handlers ONCE to prevent accumulation on respawn
+    if (!_spawnInitDone) {
+        _spawnInitDone = true;
 
-        if (bot.health < lastHealth && bot.health > 0) {
-            // Self-defense: when hurt, equip a weapon (if idle) and attack the nearest hostile.
-            const attacker = findNearestHostile(6);
-            if (attacker) {
-                if (!isExecuting) equipBestWeapon().catch(() => {});
-                if (bot.entity.position.distanceTo(attacker.position) <= 3.5) {
-                    bot.attack(attacker);
+        _lastHealth = bot.health || 20;
+        bot.on('health', () => {
+            if (bot.food < 15) {
+                const food = getBestFoodItem();
+                if (food && !isExecuting) {
+                    bot.equip(food, 'hand').then(() => bot.consume().catch(() => {}));
                 }
             }
-            // Strafe to dodge follow-up hits
-            bot.pathfinder.setGoal(null);
-            if (typeof bot.clearControlStates === 'function') {
-                bot.clearControlStates();
-            } else {
-                bot.setControlState('forward', false);
-                bot.setControlState('sprint', false);
-                bot.setControlState('jump', false);
-            }
-            bot.setControlState('forward', true);
-            bot.setControlState('sprint', true);
-            bot.setControlState('jump', true);
-            setTimeout(() => {
-                if (typeof bot.clearControlStates === 'function') {
-                    bot.clearControlStates();
-                } else {
-                    bot.setControlState('forward', false);
-                    bot.setControlState('sprint', false);
-                    bot.setControlState('jump', false);
+
+            if (bot.health < _lastHealth && bot.health > 0) {
+                const attacker = findNearestHostile(6);
+                if (attacker) {
+                    if (!isExecuting) equipBestWeapon().catch(() => {});
+                    if (bot.entity.position.distanceTo(attacker.position) <= 3.5) {
+                        bot.attack(attacker);
+                    }
                 }
-            }, 1000);
-        }
-        lastHealth = bot.health;
-    });
+                // Self-defense: attack the attacker but do NOT destroy the active
+                // pathfinder goal.  The old code called bot.pathfinder.setGoal(null)
+                // here, which permanently killed GoalFollow during a "come" action.
+                // The bot would then sit idle forever because the come action only
+                // checked the cancel token, not whether the goal still existed.
+            }
+            _lastHealth = bot.health;
+        });
 
-    // Passive defense: swing at any hostile within melee range every attack-cooldown tick.
-    // bot.attack() is non-blocking and does not interfere with the action queue.
-    // Pursuit (setGoal) only happens when the bot is idle between actions.
-    setInterval(() => {
-        if (!bot.entity || bot.health <= 0) return;
-        const hostile = findNearestHostile(3.5);
-        if (!hostile) return;
-        bot.attack(hostile);
-        if (!isExecuting) equipBestWeapon().catch(() => {});
-    }, 600);
+        // Passive defense: attack nearby hostiles.
+        // Only attack when the bot is IDLE — during active pathfinding the
+        // bot.attack() call changes the look direction, conflicting with the
+        // pathfinder's bot.look() and causing erratic movement.
+        _passiveDefenseInterval = setInterval(() => {
+            if (!bot.entity || bot.health <= 0) return;
+            if (isExecuting) return;  // Don't interfere with active pathfinding
+            const hostile = findNearestHostile(3.5);
+            if (!hostile) return;
+            bot.attack(hostile);
+            equipBestWeapon().catch(() => {});
+        }, 600);
 
-    debouncer = new EventDebouncer(bot, 500);
+        debouncer = new EventDebouncer(bot, 500);
+
+        // Movement override for modded terrain + sprint-jumping.
+        //
+        // Runs AFTER the pathfinder's monitorMovement (same physicsTick event) because
+        // Node.js EventEmitter fires listeners in registration order — the pathfinder
+        // plugin is loaded first (line 87), so its listener runs first.
+        //
+        // Problem: monitorMovement simulates physics forward (canStraightLine /
+        // canSprintJump / canWalkJump) every tick.  On modded terrain the simulation
+        // hits unknown block collision shapes and fails for ALL three checks.  The
+        // else branch then sets forward=false, STOPPING the bot entirely.  This
+        // caused 0.21 b/s measured speed.
+        //
+        // Fix: when the pathfinder has an active path but decided to stop (forward
+        // is false), override to keep walking.  The pathfinder's own 3.5 s stuck
+        // detector (resetPath('stuck')) handles truly blocked situations.
+        //
+        // Sprint-jumping: Minecraft sprint-jumping (~7.1 b/s) is ~27% faster than
+        // sprinting alone (~5.6 b/s).  We add continuous jumping whenever the bot
+        // is sprinting on flat ground.
+        let _moveDiagTick = 0;
+        let _lastDiagPos = null;
+        bot.on('physicsTick', () => {
+            _moveDiagTick++;
+
+            // Water surface detection is now handled inside prismarine-physics
+            // (simulatePlayer patch) so isInWater is correct BEFORE this handler fires.
+
+            const fwd = bot.getControlState('forward');
+            const spr = bot.getControlState('sprint');
+            const jmp = bot.getControlState('jump');
+            const moving = bot.pathfinder.isMoving();
+            const mining = bot.pathfinder.isMining();
+            const building = bot.pathfinder.isBuilding();
+            const inWater = bot.entity.isInWater;
+            const onGround = bot.entity.onGround;
+
+            // Override: if pathfinder has a path but stopped us, keep walking
+            if (moving && !fwd && !mining && !building) {
+                bot.setControlState('forward', true);
+                if (!inWater) bot.setControlState('sprint', true);
+            }
+
+            // On land, ensure sprint is enabled when path exists
+            if (moving && fwd && !spr && !inWater && !mining && !building) {
+                bot.setControlState('sprint', true);
+            }
+
+            // Sprint-jumping on flat ground (not in water)
+            if (bot.getControlState('sprint') && bot.getControlState('forward') && onGround && !inWater) {
+                bot.setControlState('jump', true);
+            }
+
+            // Diagnostic: log movement state every 100 ticks (~5 seconds)
+            if (_moveDiagTick % 100 === 0 && bot.entity) {
+                const pos = bot.entity.position;
+                let speed = 0;
+                if (_lastDiagPos) {
+                    const dx = pos.x - _lastDiagPos.x;
+                    const dz = pos.z - _lastDiagPos.z;
+                    speed = Math.sqrt(dx * dx + dz * dz) / 5; // blocks per second over 5s
+                }
+                _lastDiagPos = pos.clone();
+                // Block inspection for physics debugging
+                const blockBelow = bot.blockAt(pos.offset(0, -1, 0));
+                const blockAt = bot.blockAt(pos);
+                const blockAbove = bot.blockAt(pos.offset(0, 1, 0));
+                const belowInfo = blockBelow ? `${blockBelow.name}(id=${blockBelow.id},type=${blockBelow.type},bb=${blockBelow.boundingBox})` : 'null';
+                const atInfo = blockAt ? `${blockAt.name}(id=${blockAt.id},type=${blockAt.type},bb=${blockAt.boundingBox})` : 'null';
+                // Log vanilla water id for comparison
+                const vanillaWaterId = bot.registry.blocksByName['water']?.id;
+                console.log(`[MoveDiag] tick=${_moveDiagTick} pos=(${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}) speed=${speed.toFixed(2)}b/s fwd=${bot.getControlState('forward')} spr=${bot.getControlState('sprint')} jmp=${bot.getControlState('jump')} moving=${moving} mining=${mining} water=${inWater} ground=${onGround} goal=${!!bot.pathfinder.goal} below=${belowInfo} at=${atInfo} vanillaWater=${vanillaWaterId}`);
+            }
+        });
+    }
 
     console.log('[Actuator] Pathfinder and Physics initialized.');
+
+    // Wait for physics to settle before checking ground state
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    // Diagnostic: log raw block info around spawn point
+    try {
+        const sp = bot.entity.position.floored();
+        for (let dy = -3; dy <= 2; dy++) {
+            const b = bot.blockAt(sp.offset(0, dy, 0));
+            console.log(`[SpawnDiag] Y=${sp.y + dy}: name=${b?.name} type=${b?.type} stateId=${b?.stateId} bb=${b?.boundingBox}`);
+        }
+    } catch (e) {}
+
+    // ── Mark bot ready EARLY so test harness can start, then escape water in background ──
     bot.chat('Forge AI Player Ready.');
+    _botReady = true;
+    console.log('[Actuator] Bot ready. Flushing pending IPC actions:', _pendingIpcActions.length);
+    for (const pending of _pendingIpcActions) {
+        actionQueue.push(...pending);
+    }
+    _pendingIpcActions = [];
+    if (actionQueue.length > 0) processActionQueue();
 
     // --- File Logging for External AI Monitor ---
     setInterval(() => {
         if (!bot.entity) return;
-
         try {
             const debugState = {
                 timestamp: new Date().toISOString(),
+                ready: _botReady,
                 position: {
                     x: Math.round(bot.entity.position.x * 10) / 10,
                     y: Math.round(bot.entity.position.y * 10) / 10,
@@ -196,16 +336,255 @@ bot.on('spawn', async () => {
                 isExecuting,
                 actionQueue: [...actionQueue]
             };
-
-            // Overwrite file so AI can just read current state without parsing gigabytes
-            fs.writeFileSync(path.join(process.cwd(), 'ai_debug.json'), JSON.stringify(debugState, null, 2));
-
-            // Append to history log
-            fs.appendFileSync(path.join(process.cwd(), 'ai_history.log'), JSON.stringify(debugState) + '\n');
+            fs.writeFile(path.join(process.cwd(), 'ai_debug.json'), JSON.stringify(debugState, null, 2), () => {});
+            fs.appendFile(path.join(process.cwd(), 'ai_history.log'), JSON.stringify(debugState) + '\n', () => {});
         } catch (e) {
             console.error(`[Actuator] Failed to write ai_debug: ${e.message}`);
         }
     }, 5000);
+
+    // Run water/ground escape asynchronously so it doesn't block IPC actions.
+    // If an IPC action cancels the pathfinder, the escape may abort — that's fine.
+    (async () => {
+    // If bot is not on recognizable solid ground, try to find and tp to solid vanilla terrain.
+    // This handles: (1) ocean spawn, (2) spawn above modded blocks that appear as air to our registry.
+    if (!bot.entity.onGround) {
+        // First: try to find any solid (boundingBox='block') non-water block within 128 blocks
+        const solidBlocks = bot.findBlocks({
+            matching: b => b && b.boundingBox === 'block' && b.name !== 'air' && !b.name.includes('water') && !b.name.includes('lava'),
+            maxDistance: 128,
+            count: 20
+        });
+        console.log(`[Actuator] Not on ground. Found ${solidBlocks.length} solid blocks within 128 blocks.`);
+
+        if (solidBlocks.length > 0) {
+            // Sort by distance and find one with air above (safe to stand on)
+            solidBlocks.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b));
+            let landTarget = null;
+            // Prefer blocks with dry air (not water) above them — avoids underwater blocks
+            for (const pos of solidBlocks) {
+                const above1 = bot.blockAt(pos.offset(0, 1, 0));
+                const above2 = bot.blockAt(pos.offset(0, 2, 0));
+                const dryAbove1 = above1 && above1.boundingBox === 'empty' && above1.name !== 'water' && above1.name !== 'flowing_water';
+                const dryAbove2 = above2 && above2.boundingBox === 'empty' && above2.name !== 'water' && above2.name !== 'flowing_water';
+                if (dryAbove1 && dryAbove2) {
+                    landTarget = pos;
+                    break;
+                }
+            }
+            // Fallback: standable block with any air above (but still exclude water above)
+            if (!landTarget) {
+                for (const pos of solidBlocks) {
+                    const above1 = bot.blockAt(pos.offset(0, 1, 0));
+                    const above2 = bot.blockAt(pos.offset(0, 2, 0));
+                    const isWaterAbove = (above1?.name?.includes('water') || above2?.name?.includes('water'));
+                    if (!isWaterAbove && above1 && above1.boundingBox === 'empty' && above2 && above2.boundingBox === 'empty') {
+                        landTarget = pos;
+                        break;
+                    }
+                }
+            }
+            if (landTarget) {
+                console.log(`[Actuator] Solid ground at (${landTarget.x}, ${landTarget.y}, ${landTarget.z}) name=${bot.blockAt(landTarget)?.name}. Teleporting...`);
+                bot.chat(`/tp ${bot.username} ${landTarget.x + 0.5} ${landTarget.y + 1} ${landTarget.z + 0.5}`);
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                console.log(`[Actuator] Now at (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
+            } else {
+                console.log('[Actuator] No standable solid block found nearby. Will try /tp to player then proceed.');
+            }
+        }
+
+        // If still not on ground and tp failed/no blocks found, try tp to player
+        if (!bot.entity.onGround) {
+            const nearbyPlayers = Object.values(bot.players).filter(p => p.username !== bot.username);
+            if (nearbyPlayers.length > 0 && !solidBlocks.length) {
+                // No solid blocks at all — likely in ocean. Try tp to player or ask for help
+                bot.chat(`/tp ${bot.username} ${nearbyPlayers[0].username}`);
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                console.log(`[Actuator] After /tp: pos=(${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
+            }
+        }
+    }
+
+    // Always try to tp to the nearest player to get to proper dry land.
+    // The fallback copper-stairs position is water-logged; the player is on land.
+    {
+        const nearbyPlayers = Object.values(bot.players)
+            .filter(p => p.username !== bot.username && p.entity);
+        if (nearbyPlayers.length > 0) {
+            const tpTarget = nearbyPlayers[0].username;
+            const curPos = bot.entity.position;
+            const playerEntity = nearbyPlayers[0].entity;
+            // Only tp if player is significantly above us (on higher ground / land)
+            // OR we are currently in a water-logged area
+            const isInWaterArea = (bot.blockAt(curPos)?.name?.includes('water') ||
+                bot.blockAt(curPos.offset(0, -1, 0))?.name?.includes('water') ||
+                bot.blockAt(curPos.offset(1, 0, 0))?.name?.includes('water') ||
+                bot.blockAt(curPos.offset(-1, 0, 0))?.name?.includes('water'));
+            const playerHigher = playerEntity && (playerEntity.position.y > curPos.y + 5);
+            if (isInWaterArea || playerHigher) {
+                console.log(`[Actuator] Area is water-logged or player is higher. Teleporting to ${tpTarget}...`);
+                bot.chat(`/tp ${bot.username} ${tpTarget}`);
+                await new Promise(resolve => setTimeout(resolve, 3000));
+
+                // Wait a tick for chunks to load, then check if we're in water
+                await new Promise(resolve => setTimeout(resolve, 500));
+                // Emerge from water: tp up in steps until above water surface (max 30 blocks)
+                for (let attempt = 0; attempt < 6; attempt++) {
+                    const checkPos = bot.entity.position;
+                    const atWater = bot.blockAt(checkPos)?.name?.includes('water');
+                    const belowWater = bot.blockAt(checkPos.offset(0, -1, 0))?.name?.includes('water');
+                    if (!atWater && !belowWater && bot.entity.onGround) break;
+                    if (!atWater && !belowWater) break;  // Above water surface, let gravity handle it
+                    console.log(`[Actuator] In water after player tp (attempt ${attempt+1}). Teleporting up 5 blocks...`);
+                    const emergPos = bot.entity.position;
+                    bot.chat(`/tp ${bot.username} ${emergPos.x.toFixed(2)} ${(emergPos.y + 5).toFixed(2)} ${emergPos.z.toFixed(2)}`);
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                }
+
+                console.log(`[Actuator] Final position: (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
+            }
+        }
+    }
+
+    // Legacy water escape (kept for backward compat — handles the case where bot is in actual water after above failed)
+    if (!bot.entity.onGround) {
+        const waterBelow = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+        const blockAtFeet = bot.blockAt(bot.entity.position);
+        const inWaterZone = bot.entity.isInWater ||
+            (blockAtFeet && (blockAtFeet.name === 'water' || blockAtFeet.name === 'flowing_water')) ||
+            (waterBelow && (waterBelow.name === 'water' || waterBelow.name === 'flowing_water') &&
+             !(blockAtFeet && blockAtFeet.boundingBox === 'block'));
+        if (inWaterZone) {
+            console.log('[Actuator] Spawned in water. Attempting /tp to nearest player...');
+            // Try teleporting to nearest player via server command (requires op)
+            const nearbyPlayers = Object.values(bot.players).filter(p => p.username !== bot.username);
+            let tpTarget = nearbyPlayers.length > 0 ? nearbyPlayers[0].username : null;
+            let escaped = false;
+
+            if (tpTarget) {
+                const prePos = bot.entity.position.clone();
+                bot.chat(`/tp ${bot.username} ${tpTarget}`);
+                console.log(`[Actuator] Sent /tp ${bot.username} ${tpTarget}. Waiting for teleport...`);
+                // Wait up to 3 seconds for teleport to take effect
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                const dist = bot.entity.position.distanceTo(prePos);
+                if (dist > 5) {
+                    console.log(`[Actuator] Teleport successful! Moved ${dist.toFixed(1)} blocks to (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)})`);
+                    // Check if we're still in water at the new location — player may be standing near/above water
+                    const stillInWater = bot.entity.isInWater ||
+                        (bot.blockAt(bot.entity.position)?.name?.includes('water')) ||
+                        (bot.blockAt(bot.entity.position.offset(0, -1, 0))?.name?.includes('water'));
+                    if (!stillInWater) {
+                        escaped = true;
+                    } else {
+                        console.log(`[Actuator] Still in water near player. Scanning for dry ground...`);
+                        // Find nearest solid non-water surface block within 32 blocks
+                        const dryBlocks = bot.findBlocks({
+                            matching: b => b && b.boundingBox === 'block' &&
+                                !b.name.includes('water') && !b.name.includes('lava') &&
+                                b.name !== 'air',
+                            maxDistance: 32,
+                            count: 50
+                        });
+                        // Need block with air above (so we can stand on it)
+                        const standable = dryBlocks.find(pos => {
+                            const above = bot.blockAt(pos.offset(0, 1, 0));
+                            const above2 = bot.blockAt(pos.offset(0, 2, 0));
+                            return above && above.boundingBox === 'empty' &&
+                                   above2 && above2.boundingBox === 'empty';
+                        });
+                        if (standable) {
+                            bot.chat(`/tp ${bot.username} ${standable.x + 0.5} ${standable.y + 1} ${standable.z + 0.5}`);
+                            console.log(`[Actuator] Sending /tp to dry ground at (${standable.x}, ${standable.y + 1}, ${standable.z})...`);
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            // Log blocks at new position to confirm solid ground
+                            try {
+                                const np = bot.entity.position.floored();
+                                for (let dy = -2; dy <= 1; dy++) {
+                                    const b2 = bot.blockAt(np.offset(0, dy, 0));
+                                    console.log(`[GroundDiag] Y=${np.y + dy}: name=${b2?.name} type=${b2?.type} bb=${b2?.boundingBox}`);
+                                }
+                            } catch (e) {}
+                            console.log(`[Actuator] Now at (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
+                            escaped = true;
+                        } else {
+                            console.log(`[Actuator] No dry ground found within 32 blocks of player. Trying pathfinder...`);
+                            escaped = false;
+                        }
+                    }
+                } else {
+                    console.log(`[Actuator] /tp failed (moved ${dist.toFixed(1)} blocks). Bot may not have op. Trying pathfinder...`);
+                }
+            }
+
+            if (!escaped) {
+                // Pathfinder fallback: find shore blocks above seabed
+                const surfaceY = Math.floor(bot.entity.position.y) - 2;
+                let landTarget = null;
+                for (let r = 16; r <= 128 && !landTarget; r += 16) {
+                    const candidates = bot.findBlocks({
+                        matching: b => b && b.boundingBox === 'block' &&
+                            !b.name.includes('water') && !b.name.includes('lava') &&
+                            b.name !== 'air',
+                        maxDistance: r,
+                        count: 50
+                    });
+                    const shoreCandidates = candidates.filter(c => c.y >= surfaceY);
+                    if (shoreCandidates.length > 0) {
+                        shoreCandidates.sort((a, b) => {
+                            const da = (a.x - bot.entity.position.x) ** 2 + (a.z - bot.entity.position.z) ** 2;
+                            const db = (b.x - bot.entity.position.x) ** 2 + (b.z - bot.entity.position.z) ** 2;
+                            return da - db;
+                        });
+                        landTarget = shoreCandidates[0];
+                    }
+                }
+                if (landTarget) {
+                    console.log(`[Actuator] Land at (${landTarget.x}, ${landTarget.y}, ${landTarget.z}). Swimming...`);
+                    bot.chat('Swimming to land...');
+                    try {
+                        await withTimeout(
+                            bot.pathfinder.goto(new goals.GoalNear(landTarget.x, landTarget.y + 1, landTarget.z, 2)),
+                            60000, 'water escape',
+                            () => bot.pathfinder.setGoal(null)
+                        );
+                        console.log(`[Actuator] Reached land.`);
+                        escaped = true;
+                    } catch (e) {
+                        console.log(`[Actuator] Pathfinder swim failed: ${e.message}`);
+                    }
+                }
+            }
+
+            if (!escaped && nearbyPlayers.length > 0) {
+                // Ask player for help as last resort
+                bot.chat(`I'm stuck in water and can't move. Please use: /tp ${bot.username} ${tpTarget || 'YourName'}`);
+                console.log('[Actuator] Requested player teleport assistance.');
+                // Wait up to 60s for someone to tp us
+                const waitStart = Date.now();
+                const prePos2 = bot.entity.position.clone();
+                await new Promise(resolve => {
+                    const check = setInterval(() => {
+                        const dist = bot.entity.position.distanceTo(prePos2);
+                        if (dist > 5 || bot.entity.onGround || Date.now() - waitStart > 60000) {
+                            clearInterval(check);
+                            if (dist > 5 || bot.entity.onGround) {
+                                console.log(`[Actuator] Teleported by player! Now at (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)})`);
+                            } else {
+                                console.log('[Actuator] No teleport received. Bot remains in water.');
+                            }
+                            resolve();
+                        }
+                    }, 1000);
+                });
+            } else if (!escaped) {
+                console.log('[Actuator] No players nearby. Bot stuck in open water.');
+            }
+        }
+    }
+
+    })().catch(e => console.log('[Actuator] Background water escape error:', e.message));
 });
 
 function getEnvironmentContext() {
@@ -653,47 +1032,47 @@ async function processActionQueue() {
                 bot.chat(message);
                 process.send({ type: 'USER_CHAT', data: { username: "System", message: message, environment: env } });
 
-            // ── come (continuous follow via GoalNear loop) ───────────────────────
+            // ── come (continuous follow via GoalFollow) ─────────────────────
+            // GoalFollow with dynamic=true lets the pathfinder continuously
+            // recompute the path as the target moves.  This is what worked in
+            // the original implementation (commit 00fe7ea).  Previous regressions
+            // were caused by a supervision loop calling setGoal every 1 s (fixed
+            // in BUGFIX-20260321-003) and tickTimeout=5 starving A* (fixed to 40
+            // in BUGFIX-20260321-002).
             } else if (action.action === 'come') {
                 const targetEntity = bot.players[action.target]?.entity;
                 if (targetEntity) {
                     bot.chat(`Following ${action.target}!`);
+                    bot.pathfinder.setGoal(new goals.GoalFollow(targetEntity, 2), true);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Now following ${action.target}.`, environment: getEnvironmentContext() } });
 
-                    let followStuck = 0;
-                    while (!currentCancelToken.cancelled) {
-                        const currentTarget = bot.players[action.target]?.entity;
-                        if (!currentTarget) {
-                            bot.chat(`I lost sight of ${action.target}.`);
-                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Lost sight of ${action.target}.`, environment: getEnvironmentContext() } });
-                            break;
-                        }
-
-                        const dist = bot.entity.position.distanceTo(currentTarget.position);
-                        if (dist > 3) {
-                            try {
-                                // Use a short per-step timeout so the position re-evaluates frequently.
-                                // pathfinder.thinkTimeout is already 5 s so this matches it.
-                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(currentTarget.position.x, currentTarget.position.y, currentTarget.position.z, 2)), 5000, 'follow target', () => bot.pathfinder.setGoal(null));
-                                followStuck = 0;
-                            } catch (e) {
-                                followStuck++;
-                                if (followStuck >= 3) {
-                                    // Stuck escape: jump to dislodge from ledge/block
-                                    bot.setControlState('jump', true);
-                                    await new Promise(r => setTimeout(r, 400));
-                                    bot.setControlState('jump', false);
-                                    followStuck = 0;
-                                }
-                                // Brief pause before retrying to avoid busy-spinning
-                                await new Promise(r => setTimeout(r, 500));
+                    // Hold the queue slot until a 'stop' command cancels the token.
+                    // Also monitor the goal — if something external clears it (e.g. the
+                    // pathfinder's own stop(), or a bug), re-set it so following continues.
+                    await new Promise(resolve => {
+                        const check = setInterval(() => {
+                            if (currentCancelToken.cancelled) {
+                                clearInterval(check);
+                                bot.pathfinder.setGoal(null);
+                                resolve();
+                                return;
                             }
-                        } else {
-                            followStuck = 0;
-                            // Close enough — poll at half-second intervals
-                            await new Promise(r => setTimeout(r, 500));
-                        }
-                    }
+                            // Re-validate: target still visible?
+                            const t = bot.players[action.target]?.entity;
+                            if (!t || !t.isValid) {
+                                clearInterval(check);
+                                bot.pathfinder.setGoal(null);
+                                bot.chat(`Lost sight of ${action.target}.`);
+                                process.send({ type: 'USER_CHAT', data: { username: "System", message: `Lost sight of ${action.target}.`, environment: getEnvironmentContext() } });
+                                resolve();
+                                return;
+                            }
+                            // If the goal was cleared externally, restore it
+                            if (!bot.pathfinder.goal) {
+                                bot.pathfinder.setGoal(new goals.GoalFollow(t, 2), true);
+                            }
+                        }, 1000);
+                    });
                 } else {
                     bot.chat(`I cannot see ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to find ${action.target}.`, environment: getEnvironmentContext() } });
@@ -703,10 +1082,13 @@ async function processActionQueue() {
             } else if (action.action === 'goto') {
                 const WAYPOINT_STEP = 64;
                 const destX = action.x, destZ = action.z;
+                // Per-waypoint timeout: 60s gives sprint-jumping bot time for 64 blocks
+                // even on complex terrain.  The outer action timeout is separate.
+                const wpTimeout = Math.max(timeoutMs, 60000);
 
                 if (action.y !== undefined) {
                     bot.chat(`Moving to X:${Math.round(destX)}, Y:${action.y}, Z:${Math.round(destZ)}.`);
-                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, action.y, destZ, 2)), timeoutMs, 'goto XYZ', () => bot.pathfinder.setGoal(null));
+                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, action.y, destZ, 2)), wpTimeout, 'goto XYZ', () => bot.pathfinder.setGoal(null));
                 } else {
                     const dx0 = destX - bot.entity.position.x, dz0 = destZ - bot.entity.position.z;
                     const total = Math.sqrt(dx0 * dx0 + dz0 * dz0);
@@ -717,8 +1099,11 @@ async function processActionQueue() {
                         const cx = bot.entity.position.x, cz = bot.entity.position.z;
                         const rdx = destX - cx, rdz = destZ - cz;
                         const rem = Math.sqrt(rdx * rdx + rdz * rdz);
-                        if (rem <= 2) break;
-                        if (rem >= lastRem - 1) { if (++stuck >= 3) throw new Error(`Stuck: no progress toward X:${Math.round(destX)}, Z:${Math.round(destZ)}.`); }
+                        if (rem <= 4) break;  // close enough (was 2, too tight for XZ-only goals)
+                        // Stuck detection: require at least 3 blocks progress per waypoint.
+                        // The old threshold (1 block) triggered false positives on terrain
+                        // where the bot made partial progress each attempt.
+                        if (rem >= lastRem - 3) { if (++stuck >= 5) { bot.chat('Cannot make progress.'); break; } }
                         else stuck = 0;
                         lastRem = rem;
 
@@ -728,11 +1113,22 @@ async function processActionQueue() {
                             wpX = cx + WAYPOINT_STEP * Math.cos(a);
                             wpZ = cz + WAYPOINT_STEP * Math.sin(a);
                         }
-                        await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(wpX, wpZ)), timeoutMs, 'goto XZ waypoint', () => bot.pathfinder.setGoal(null));
+                        try {
+                            await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(wpX, wpZ)), wpTimeout, 'goto XZ waypoint', () => bot.pathfinder.setGoal(null));
+                        } catch (wpErr) {
+                            // Per-waypoint failure is NOT fatal — the bot might still make
+                            // progress.  Log it and let the stuck detector handle retries.
+                            console.log(`[Actuator] goto waypoint error: ${wpErr.message}`);
+                        }
                     }
                 }
-                if (!currentCancelToken.cancelled)
-                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully reached destination.`, environment: getEnvironmentContext() } });
+                if (!currentCancelToken.cancelled) {
+                    const finalDist = Math.sqrt(
+                        Math.pow(destX - bot.entity.position.x, 2) +
+                        Math.pow((action.z || 0) - bot.entity.position.z, 2)
+                    );
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Reached destination (${Math.round(finalDist)} blocks from target).`, environment: getEnvironmentContext() } });
+                }
 
             // ── collect (3× candidate pool + progressive radius fallback) ─────
             } else if (action.action === 'collect') {
@@ -1427,11 +1823,32 @@ async function processActionQueue() {
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: msg, environment: getEnvironmentContext() } });
                 }
 
+            // ── find_land (spreadplayers to random land, for test setup) ──────
+            } else if (action.action === 'find_land') {
+                const preLandPos = bot.entity.position.clone();
+                bot.chat(`/spreadplayers 0 0 0 2000 false ${bot.username}`);
+                // Wait for teleport to apply and chunks to load
+                await new Promise(resolve => setTimeout(resolve, 4000));
+                try { await bot.waitForChunksToLoad(); } catch (e) {}
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                const landPos = bot.entity.position;
+                const dist = landPos.distanceTo(preLandPos);
+                const blockBelow = bot.blockAt(landPos.offset(0, -1, 0));
+                const blockAt = bot.blockAt(landPos);
+                const onLand = bot.entity.onGround &&
+                    blockBelow && blockBelow.boundingBox === 'block' &&
+                    !blockBelow.name.includes('water') &&
+                    !(blockAt?.name?.includes('water'));
+                const msg = onLand
+                    ? `Found land at (${Math.round(landPos.x)}, ${Math.round(landPos.y)}, ${Math.round(landPos.z)}). Ready for testing.`
+                    : `find_land: pos=(${Math.round(landPos.x)},${Math.round(landPos.y)},${Math.round(landPos.z)}) onGround=${bot.entity.onGround} below=${blockBelow?.name}. Proceeding anyway.`;
+                process.send({ type: 'USER_CHAT', data: { username: "System", message: msg, environment: getEnvironmentContext() } });
+
             } // end action dispatch
 
         } catch (err) {
             console.error(`[Actuator] Action execution failed: ${err.message}`);
-            bot.chat("An error occurred.");
+            if (bot._client.chat) bot.chat("An error occurred.");
             bot.pathfinder.setGoal(null);
             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Action failed: ${err.message}`, environment: getEnvironmentContext() } });
         }
@@ -1444,6 +1861,13 @@ process.on('message', async (msg) => {
     if (msg.type === 'EXECUTE_ACTION') {
         let actions = msg.action;
         if (!Array.isArray(actions)) actions = [actions];
+
+        // If bot hasn't finished login/spawn yet, buffer the action
+        if (!_botReady) {
+            console.log(`[Actuator] Bot not ready yet — buffering ${actions.length} action(s).`);
+            _pendingIpcActions.push(actions);
+            return;
+        }
 
         // 1. Signal the running loop to stop
         const remaining = [...actionQueue];
