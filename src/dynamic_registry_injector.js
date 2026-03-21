@@ -146,6 +146,9 @@ class DynamicRegistryInjector {
                 };
                 if (!this.registry.items) this.registry.items = {};
                 this.registry.items[entry.id] = dummyItem;
+                if (!this.registry.itemsByName) this.registry.itemsByName = {};
+                this.registry.itemsByName[entry.name] = dummyItem;
+                this.registry.itemsByName[shortName] = dummyItem;
                 dummyCount++;
             }
         }
