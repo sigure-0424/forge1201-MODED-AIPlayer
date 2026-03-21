@@ -69,10 +69,12 @@ bot.on('spawn', async () => {
     }
 
     bot.physics.enabled = true;
+    bot.physics.stepHeight = 1;
 
     movements = new Movements(bot, mcData);
     movements.canDig = true;
     movements.allowSprinting = true;
+    movements.liquidCost = 3;
     movements.allow1by1towers = true;
     movements.maxDropDown = 4;
 
@@ -97,6 +99,13 @@ bot.on('spawn', async () => {
 
     let lastHealth = bot.health || 20;
     bot.on('health', () => {
+        if (bot.food < 15) {
+            const food = getBestFoodItem();
+            if (food && !isExecuting) {
+                bot.equip(food, 'hand').then(() => bot.consume().catch(() => {}));
+            }
+        }
+
         if (bot.health < lastHealth && bot.health > 0) {
             // Self-defense: when hurt, equip a weapon (if idle) and attack the nearest hostile.
             const attacker = findNearestHostile(6);
@@ -521,6 +530,10 @@ async function processActionQueue() {
             if (!action || !action.action) continue;
             if (currentCancelToken.cancelled) break;
 
+            if (action.target && typeof action.target === 'string') {
+                action.target = action.target.replace(/^[^:]+:/, '');
+            }
+
             // ── chat ──────────────────────────────────────────────────────────
             if (action.action === 'chat') {
                 bot.chat(action.message);
@@ -641,6 +654,7 @@ async function processActionQueue() {
                             if (!xzLowest.has(key) || pos.y < xzLowest.get(key).y) xzLowest.set(key, pos);
                         }
                         const fresh = [...xzLowest.values()].filter(p => !triedSet.has(`${p.x},${p.z}`));
+                        fresh.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b));
                         if (fresh.length === 0) continue;
 
                         if (!toolCheckDone) {
@@ -666,6 +680,8 @@ async function processActionQueue() {
                             bot.chat(`Expanding search for more ${action.target}...`);
                         }
 
+                        bot.chat(`I am mining ${action.quantity || 1} ${action.target}...`);
+
                         for (const blockPos of fresh) {
                             if (currentCancelToken.cancelled || collected >= quantity) break;
                             triedSet.add(`${blockPos.x},${blockPos.z}`);
@@ -686,6 +702,14 @@ async function processActionQueue() {
                                     const heldItem = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
                                     if (!heldItem || !targetBlock.harvestTools[heldItem.type]) {
                                         throw new Error(`Requires a specific tool to harvest (held: ${heldItem ? heldItem.name : 'nothing'})`);
+                                    }
+                                }
+
+                                const toolCat = inferToolCategory(targetBlock);
+                                if (toolCat === 'pickaxe') {
+                                    const heldForDig = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+                                    if (!heldForDig || !heldForDig.name.endsWith('_pickaxe')) {
+                                        throw new Error(`Requires a pickaxe to harvest (held: ${heldForDig ? heldForDig.name : 'nothing'})`);
                                     }
                                 }
 
@@ -729,9 +753,11 @@ async function processActionQueue() {
                     }
 
                     if (collected >= quantity) {
+                        bot.chat(`Completed mining ${action.target}. Processing next step...`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully collected ${collected} ${action.target}.`, environment: getEnvironmentContext() } });
                     } else if (collected > 0) {
                         actionQueue = []; // Clear queue on partial success to re-evaluate
+                        bot.chat(`Completed mining ${collected} ${action.target}. Processing next step...`);
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially collected ${collected}/${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
                     } else {
                         actionQueue = []; // Clear queue on failure
@@ -797,8 +823,8 @@ async function processActionQueue() {
                         }
                     } else {
                         actionQueue = []; // Clear queue on failure
-                        bot.chat(`Missing materials for ${action.target}.`);
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: missing materials or recipe.`, environment: getEnvironmentContext() } });
+                        bot.chat(`Cannot craft ${action.target}: missing materials or recipe.`);
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: missing materials or recipe. Check inventory and gather dependencies.`, environment: getEnvironmentContext() } });
                     }
                 } else {
                     actionQueue = []; // Clear queue on failure
@@ -1284,6 +1310,7 @@ process.on('message', async (msg) => {
         if (!Array.isArray(actions)) actions = [actions];
 
         // 1. Signal the running loop to stop
+        const remaining = [...actionQueue];
         actionQueue = [];
         currentCancelToken.cancelled = true;
         bot.pathfinder.setGoal(null);
@@ -1301,6 +1328,10 @@ process.on('message', async (msg) => {
         // 3. Exit if the command was only "stop"
         if (actions.length === 1 && actions[0].action === 'stop') {
             return;
+        }
+
+        if (remaining.length > 0) {
+            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Task interrupted. Remaining actions in queue: ${JSON.stringify(remaining)}`, environment: getEnvironmentContext() } });
         }
 
         // 4. Fresh token + queue for the new command
