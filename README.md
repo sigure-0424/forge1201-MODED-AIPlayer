@@ -34,7 +34,17 @@ The system achieves stability in modded environments through a **Vanilla-Mapping
 Once the bot is online, you can use the following in-game chat commands:
 - `come`: Calculates a path and moves to your position.
 - `status`: Reports current coordinates, health, and ground state.
+- `dump_chunks`: Dumps all currently loaded blocks around the bot to a file `chunk_dump.json`.
 - `stop`: Immediately cancels all current goals.
+
+## AI Debugging (WSL/Local CLI)
+
+If you are an AI agent (like geminiCLI) running in a WSL environment or interacting with the system locally, **do not** run testing commands or the bot directly in the shell as the high volume of stream output can crash your session.
+Instead:
+1. **Execution:** Execute all commands via Windows PowerShell.
+2. **Logs:** Read from `bot_system.log` instead of standard output.
+3. **State Tracking:** Read the `ai_debug.json` file. It updates every 5 seconds with the bot's current timestamp, health, coordinates, and action queue to detect if the bot is stuck or running in place.
+4. **Vision/Memory:** Use the `dump_chunks` command in-game, then read `chunk_dump.json` to see exactly what blocks the bot's internal memory has loaded.
 
 ---
 *Note: This framework is optimized for reliability on vanilla blocks within a Forge environment. Modded block entities are treated as non-solid by default to ensure safe gravity and movement.*
