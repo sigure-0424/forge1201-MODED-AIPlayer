@@ -175,9 +175,12 @@ class DynamicRegistryInjector {
                     }
 
                     // [CRITICAL] Explicitly signal to the physics engine (prismarine-physics) that this is a solid full block
+                    // by making sure prismarine-block can find the shape ID when it re-initializes.
+                    // prismarine-block uses shapes.blocks[block.name], so we must map the name, not the ID.
                     if (this.registry.blockCollisionShapes && this.registry.blockCollisionShapes.blocks) {
                         const isBlock = !dictEntry || dictEntry.boundingBox !== 'empty';
-                        this.registry.blockCollisionShapes.blocks[entry.id] = isBlock ? 1 : 0; // 1 = Full cube collision shape, 0 = Air
+                        this.registry.blockCollisionShapes.blocks[entry.name] = isBlock ? 1 : 0; // 1 = Full cube collision shape, 0 = Air
+                        this.registry.blockCollisionShapes.blocks[shortName] = isBlock ? 1 : 0;
                     }
 
                     dummyCount++;
