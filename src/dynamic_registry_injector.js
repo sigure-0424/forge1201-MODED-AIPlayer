@@ -76,10 +76,21 @@ class DynamicRegistryInjector {
         console.log(`[DynamicRegistry] Mod-Compatible Mode: Injecting Mod properties from Dictionary.`);
         let mappedCount = 0;
         let dummyCount = 0;
+        let skippedCount = 0;
 
         // Retrieve the complete physical properties of already loaded "stone" as the ultimate safety template
         const stoneTemplate = this.registry.blocksByName['stone'];
         const airTemplate = this.registry.blocksByName['air'];
+
+        // vanilla の stateId 上限を取得（安全マージンとして +1000）
+        // 1.20.1 vanilla の最大 stateId は約 25000
+        let vanillaMaxStateId = 0;
+        for (const block of Object.values(this.registry.blocksByName)) {
+            if (block.maxStateId !== undefined && block.maxStateId > vanillaMaxStateId) {
+                vanillaMaxStateId = block.maxStateId;
+            }
+        }
+        console.log(`[DynamicRegistry] Vanilla maxStateId detected: ${vanillaMaxStateId}`);
 
         // Forge 1.20.1 sends legacy block names that were removed in vanilla 1.13+.
         // Map them to their modern equivalents so they get vanilla properties instead
@@ -107,8 +118,26 @@ class DynamicRegistryInjector {
 
         for (const entry of parsedEntries) {
             const shortName = entry.name.replace(/^[^:]+:/, '');
+            const namespace = entry.name.split(':')[0];
 
             if (entry.type === 'block') {
+                // ── 重要: minecraft: namespace のブロックは vanilla レジストリが正しい ──
+                // ヒューリスティックスキャナが誤って stateId=0,1 等を割り当てる場合があるため
+                // minecraft: namespace の再マッピングは完全にスキップする
+                if (namespace === 'minecraft') {
+                    // blocksByName は正しい vanilla エントリを確認するだけ
+                    const vanillaBlock = this.registry.blocksByName[shortName];
+                    if (vanillaBlock) {
+                        skippedCount++;
+                        // 念のため LEGACY マッピングは適用
+                        const modernName = LEGACY_TO_MODERN[shortName];
+                        if (modernName && this.registry.blocksByName[modernName]) {
+                            this.registry.blocksByName[shortName] = this.registry.blocksByName[modernName];
+                        }
+                    }
+                    continue;  // ← これが核心。minecraft: は一切上書きしない
+                }
+
                 const modernName = LEGACY_TO_MODERN[shortName];
                 const vanillaBlock = this.registry.blocksByName[modernName || shortName];
 
