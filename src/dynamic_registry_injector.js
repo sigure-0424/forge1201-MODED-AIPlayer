@@ -127,6 +127,10 @@ class DynamicRegistryInjector {
                             this.registry.blocksByStateId[entry.id + s] = remappedBlock;
                         }
                     }
+                    this.registry.blocksByName[shortName] = remappedBlock;
+                    if (modernName) {
+                        this.registry.blocksByName[modernName] = remappedBlock;
+                    }
                     mappedCount++;
                 } else {
                     const dictEntry = this.modBlocksDictionary[entry.name];
@@ -173,6 +177,8 @@ class DynamicRegistryInjector {
                     if (this.registry.blocksByStateId) {
                         this.registry.blocksByStateId[entry.id] = modBlock;
                     }
+                    this.registry.blocksByName[shortName] = modBlock;
+                    this.registry.blocksByName[entry.name] = modBlock;
 
                     // [CRITICAL] Explicitly signal to the physics engine (prismarine-physics) that this is a solid full block
                     // by making sure prismarine-block can find the shape ID when it re-initializes.
@@ -251,6 +257,11 @@ class DynamicRegistryInjector {
                 }
             });
             console.log(`[DynamicRegistry] State ID Proxy applied to blocksByStateId.`);
+        }
+
+        // Rebuild blocksArray to reflect the new dynamic IDs so pathfinder doesn't use stale objects
+        if (this.registry.blocksArray) {
+            this.registry.blocksArray = Object.values(this.registry.blocksByName);
         }
 
         console.log(`[DynamicRegistry] Mapped ${mappedCount} vanilla blocks. Injected ${dummyCount} MOD blocks.`);
