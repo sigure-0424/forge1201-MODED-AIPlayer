@@ -157,7 +157,7 @@ bot.on('spawn', async () => {
     movements = new Movements(bot, mcData);
     movements.canDig = true;
     movements.allowSprinting = true;
-    movements.liquidCost = 100;
+    movements.liquidCost = 3;
     movements.allow1by1towers = true;
     movements.maxDropDown = 4;
 
@@ -253,23 +253,8 @@ bot.on('spawn', async () => {
         bot.on('physicsTick', () => {
             _moveDiagTick++;
 
-            // ── Forge レジストリ再マッピング対策: ブロック名で isInWater を補完 ──
-            // prismarine-physics は vanilla stateId 範囲で水を検出するため、
-            // Forge 再マッピング後の水ブロックを認識できない。
-            if (bot.entity) {
-                const _bFeet  = bot.blockAt(bot.entity.position);
-                const _bChest = bot.blockAt(bot.entity.position.offset(0, 0.5, 0));
-                const _isWaterByName = (b) =>
-                    b && (b.name === 'water' || b.name === 'flowing_water'
-                       || b.name === 'lava'  || b.name === 'flowing_lava');
-
-                if (_isWaterByName(_bFeet) || _isWaterByName(_bChest)) {
-                    // physics シミュレーション後に手動で上書き
-                    // 次 tick の prismarine-physics がリセットするが、
-                    // このハンドラが毎 tick 再設定するため制御状態は正しく保たれる
-                    bot.entity.isInWater = true;
-                }
-            }
+            // Water surface detection is now handled inside prismarine-physics
+            // (simulatePlayer patch) so isInWater is correct BEFORE this handler fires.
 
             const fwd = bot.getControlState('forward');
             const spr = bot.getControlState('sprint');
@@ -280,25 +265,25 @@ bot.on('spawn', async () => {
             const inWater = bot.entity.isInWater;
             const onGround = bot.entity.onGround;
 
-            // ── Modded地形対策: pathfinderがforward=falseにした場合は上書き ──
-            // monitorMovementはmod blockのcollision shapeが不明な場合に
-            // canStraightLine/canSprintJump/canWalkJumpをすべてfalseと判定し
-            // forward=falseをセットする。水中でない場合は強制的に維持する。
-            if (moving && !inWater && !mining && !building) {
-                if (!fwd) {
-                    bot.setControlState('forward', true);
-                }
-                if (!spr) {
-                    bot.setControlState('sprint', true);
-                }
+            // Override: if pathfinder has a path but stopped us, keep walking
+            if (moving && !fwd && !mining && !building) {
+                bot.setControlState('forward', true);
+                if (!inWater) bot.setControlState('sprint', true);
             }
 
-            // ── Sprint-jumping: 陸上でsprintしている場合はjumpを維持 ──
-            // sprint-jumping (~7.1 b/s) vs sprinting (~5.6 b/s)
-            if (moving && spr && onGround && !inWater && !mining && !building) {
+            // On land, ensure sprint is enabled when path exists
+            if (moving && fwd && !spr && !inWater && !mining && !building) {
+                bot.setControlState('sprint', true);
+            }
+
+            // Sprint-jumping on flat ground (not in water)
+            if (bot.getControlState('sprint') && bot.getControlState('forward') && onGround && !inWater) {
                 bot.setControlState('jump', true);
-            } else if (!moving || inWater) {
-                // 移動していない or 水中の場合はjumpをクリア (sticky jump防止)
+            } else if (inWater || (!bot.getControlState('forward') && bot.getControlState('jump'))) {
+                // In water, actively clear jump — otherwise jump=true persists from a
+                // prior land state, causing the bot to repeatedly swim upward ("bobbing")
+                // while barely moving forward.  The pathfinder handles water swimming.
+                // On land, clear jump if not moving forward to prevent sticky hopping in place.
                 bot.setControlState('jump', false);
             }
 
@@ -320,8 +305,7 @@ bot.on('spawn', async () => {
                 const atInfo = blockAt ? `${blockAt.name}(id=${blockAt.id},type=${blockAt.type},bb=${blockAt.boundingBox})` : 'null';
                 // Log vanilla water id for comparison
                 const vanillaWaterId = bot.registry.blocksByName['water']?.id;
-                const stateIdBelow = bot.blockAt(pos.offset(0, -1, 0))?.stateId;
-                console.log(`[MoveDiag] tick=${_moveDiagTick} pos=(${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}) speed=${speed.toFixed(2)}b/s fwd=${bot.getControlState('forward')} spr=${bot.getControlState('sprint')} jmp=${bot.getControlState('jump')} moving=${moving} mining=${mining} water=${inWater} ground=${onGround} goal=${!!bot.pathfinder.goal} below=${belowInfo} belowStateId=${stateIdBelow} at=${atInfo} vanillaWater=${vanillaWaterId}`);
+                console.log(`[MoveDiag] tick=${_moveDiagTick} pos=(${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}) speed=${speed.toFixed(2)}b/s fwd=${bot.getControlState('forward')} spr=${bot.getControlState('sprint')} jmp=${bot.getControlState('jump')} moving=${moving} mining=${mining} water=${inWater} ground=${onGround} goal=${!!bot.pathfinder.goal} below=${belowInfo} at=${atInfo} vanillaWater=${vanillaWaterId}`);
             }
         });
     }
