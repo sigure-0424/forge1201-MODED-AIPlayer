@@ -138,50 +138,29 @@ class DynamicRegistryInjector {
                     continue;  // ← これが核心。minecraft: は一切上書きしない
                 }
 
+                // ModブロックがバニラIDを上書きしないためのセーフガード
+                if (entry.id <= vanillaMaxStateId) {
+                    skippedCount++;
+                    continue;
+                }
+
                 const modernName = LEGACY_TO_MODERN[shortName];
                 const vanillaBlock = this.registry.blocksByName[modernName || shortName];
 
                 if (vanillaBlock) {
-                    // ── ヒューリスティック衝突チェック ────────────────────────────────────
-                    // heuristicスキャナが誤ってvanillaブロックのstateIdを別ブロックのIDとして
-                    // 読み取る場合がある（例: minecraft:water → id=1 = stone）。
-                    // entry.id が既存のvanillaブロックと衝突する場合はスキップする。
-                    const existingAtId = this.registry.blocks[entry.id];
-                    if (existingAtId && existingAtId.name !== shortName &&
-                        !existingAtId.isUnknownModBlock) {
-                        // 異なるvanillaブロックが既にこのIDに存在する → ヒューリスティック誤検出
-                        console.warn(`[DynamicRegistry] SKIP ${entry.name}@${entry.id}: ` +
-                            `would overwrite existing vanilla block '${existingAtId.name}'. ` +
-                            `Heuristic mismatch.`);
-                        // blocksByName は正しいvanillaブロックを指すよう確認
-                        this.registry.blocksByName[shortName] = vanillaBlock;
-                        if (modernName) this.registry.blocksByName[modernName] = vanillaBlock;
-                        mappedCount++;
-                        continue;
-                    }
-
                     // Re-mapping vanilla blocks: map ALL state variants so the Proxy binary-search
                     // fallback cannot resolve an intermediate state ID to the wrong (mod) block.
                     // Without this, beds (16 states), logs (4 states), etc. would appear as stone/air
                     // whenever a mod block was mapped to an ID between the base and its variants.
+                    const remappedBlock = { ...vanillaBlock, id: entry.id };
                     const numStates = (vanillaBlock.maxStateId !== undefined && vanillaBlock.minStateId !== undefined)
                         ? (vanillaBlock.maxStateId - vanillaBlock.minStateId + 1)
                         : 1;
-                    const remappedBlock = {
-                        ...vanillaBlock,
-                        id: entry.id,
-                        minStateId: entry.id,
-                        maxStateId: entry.id + numStates - 1
-                    };
                     for (let s = 0; s < numStates; s++) {
                         this.registry.blocks[entry.id + s] = remappedBlock;
                         if (this.registry.blocksByStateId) {
                             this.registry.blocksByStateId[entry.id + s] = remappedBlock;
                         }
-                    }
-                    this.registry.blocksByName[shortName] = remappedBlock;
-                    if (modernName) {
-                        this.registry.blocksByName[modernName] = remappedBlock;
                     }
                     mappedCount++;
                 } else {
@@ -229,8 +208,6 @@ class DynamicRegistryInjector {
                     if (this.registry.blocksByStateId) {
                         this.registry.blocksByStateId[entry.id] = modBlock;
                     }
-                    this.registry.blocksByName[shortName] = modBlock;
-                    this.registry.blocksByName[entry.name] = modBlock;
 
                     // [CRITICAL] Explicitly signal to the physics engine (prismarine-physics) that this is a solid full block
                     // by making sure prismarine-block can find the shape ID when it re-initializes.
