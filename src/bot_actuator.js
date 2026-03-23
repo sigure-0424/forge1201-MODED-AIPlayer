@@ -859,6 +859,72 @@ let debouncer = null; // initialized in 'spawn' — used for VeinMiner cascade d
 
 // ─── Module-level helpers ─────────────────────────────────────────────────────
 
+async function placeItemIntelligently(bot, itemToPlace, timeoutMs) {
+    const refs = bot.findBlocks({
+        matching: b => b && b.name !== 'air' && b.name !== 'water' && b.name !== 'lava' && b.boundingBox === 'block',
+        maxDistance: 4,
+        count: 50
+    });
+
+    refs.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b));
+
+    const botPos = bot.entity.position;
+
+    // 1. Try to find a block nearby that doesn't intersect the bot
+    for (const refPos of refs) {
+        const placePos = refPos.offset(0, 1, 0);
+        const blockAbove = bot.blockAt(placePos);
+
+        if (blockAbove && blockAbove.name === 'air') {
+            const dx = Math.abs(botPos.x - (placePos.x + 0.5));
+            const dz = Math.abs(botPos.z - (placePos.z + 0.5));
+            const dy = placePos.y - botPos.y;
+
+            const intersectsBot = dx < 0.8 && dz < 0.8 && dy > -1 && dy < 2;
+
+            if (!intersectsBot) {
+                const refBlock = bot.blockAt(refPos);
+                try {
+                    await bot.equip(itemToPlace, 'hand');
+                    const promise = bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                    if (timeoutMs) {
+                        await withTimeout(promise, timeoutMs, 'place block');
+                    } else {
+                        await promise;
+                    }
+                    return true;
+                } catch(e) {
+                    console.log(`[Actuator] Intelligent place failed at ${refPos}: ${e.message}`);
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Jump place directly under the bot
+    try {
+        const botFloored = bot.entity.position.floored();
+        const blockBelow = bot.blockAt(botFloored.offset(0, -1, 0));
+        if (blockBelow && blockBelow.boundingBox === 'block') {
+            await bot.equip(itemToPlace, 'hand');
+            bot.setControlState('jump', true);
+            await new Promise(r => setTimeout(r, 250)); // wait to reach peak jump
+            const promise = bot.placeBlock(blockBelow, new Vec3(0, 1, 0));
+            bot.setControlState('jump', false);
+            if (timeoutMs) {
+                await withTimeout(promise, timeoutMs, 'jump place block');
+            } else {
+                await promise;
+            }
+            return true;
+        }
+    } catch(e) {
+        bot.setControlState('jump', false);
+        console.log(`[Actuator] Jump place failed: ${e.message}`);
+    }
+
+    throw new Error('No valid location to place block');
+}
+
 const TOOL_SUFFIXES = ['_pickaxe', '_axe', '_shovel', '_hoe', '_sword', '_shears'];
 async function equipBestTool(block) {
     // Only compare genuine tools — never equip decorative items (beds, lecterns, slabs) as a
@@ -1038,12 +1104,8 @@ async function ensureToolFor(block) {
         const ctItem = bot.inventory.items().find(i => i.name === 'crafting_table');
         if (ctItem) {
             try {
-                await bot.equip(ctItem, 'hand');
-                const ref = bot.findBlock({ matching: b => b && b.name !== 'air' && b.name !== 'water' && b.name !== 'lava', maxDistance: 4 });
-                if (ref) {
-                    await bot.placeBlock(ref, new Vec3(0, 1, 0));
-                    craftingTable = ctBlockId !== undefined ? bot.findBlock({ matching: ctBlockId, maxDistance: 8 }) : null;
-                }
+                await placeItemIntelligently(bot, ctItem, null);
+                craftingTable = ctBlockId !== undefined ? bot.findBlock({ matching: ctBlockId, maxDistance: 8 }) : null;
             } catch (e) { console.log(`[Actuator] auto-tool place table: ${e.message}`); }
         }
     }
@@ -1575,16 +1637,8 @@ async function processActionQueue() {
                     const itemToPlace = bot.inventory.items().find(item => item.name === action.target || (itemId !== undefined && item.type === itemId));
                     if (itemToPlace) {
                         try {
-                            await bot.equip(itemToPlace, 'hand');
-                            const ref = bot.findBlock({ matching: b => b && b.name !== 'air' && b.name !== 'water' && b.name !== 'lava', maxDistance: 4 });
-                            if (ref) {
-                                await withTimeout(bot.placeBlock(ref, new Vec3(0, 1, 0)), timeoutMs, 'place block');
-                                process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully placed ${action.target}.`, environment: getEnvironmentContext() } });
-                            } else {
-                                actionQueue = []; // Clear queue on failure
-                                bot.chat(`No surface nearby to place ${action.target}.`);
-                                process.send({ type: 'USER_CHAT', data: { username: "System", message: `No reference block found.`, environment: getEnvironmentContext() } });
-                            }
+                            await placeItemIntelligently(bot, itemToPlace, timeoutMs);
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully placed ${action.target}.`, environment: getEnvironmentContext() } });
                         } catch (err) {
                             actionQueue = []; // Clear queue on failure
                             bot.chat(`Failed to place ${action.target}.`);
@@ -1682,12 +1736,8 @@ async function processActionQueue() {
                         const fi = bot.inventory.items().find(i => i.name === 'furnace');
                         if (fi) {
                             try {
-                                await bot.equip(fi, 'hand');
-                                const ref = bot.findBlock({ matching: b => b && b.name !== 'air' && b.name !== 'water' && b.name !== 'lava', maxDistance: 4 });
-                                if (ref) {
-                                    await bot.placeBlock(ref, new Vec3(0, 1, 0));
-                                    furnaceBlock = furnaceBlockId !== undefined ? bot.findBlock({ matching: furnaceBlockId, maxDistance: 8 }) : null;
-                                }
+                                await placeItemIntelligently(bot, fi, null);
+                                furnaceBlock = furnaceBlockId !== undefined ? bot.findBlock({ matching: furnaceBlockId, maxDistance: 8 }) : null;
                             } catch (e) { console.log(`[Actuator] smelt place furnace: ${e.message}`); }
                         }
                     }
