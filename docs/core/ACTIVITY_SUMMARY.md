@@ -38,3 +38,14 @@ Entries:
 - Fixed EXECUTE_ACTION race condition: await isExecuting before starting new action queue | src/bot_actuator.js --claude --BUGFIX-20260320-002
 
 - Added find_land action (/spreadplayers 0 0 0 2000 false <bot>) to scatter bot to dry land before live tests; test_live.js now calls find_land after waitForReady and uses land base coords for return test | src/bot_actuator.js, test_live.js --claude --BUGFIX-20260322-001
+
+## 2026-03-23 — TASK-20260323-001: Navigation & Waypoint Enhancements
+
+### Changes
+- **bot_actuator.js**: 6 improvements implemented, all tests passing (6/6).
+  1. **Stuck recovery fix**: Replaced the `blocksCantBreak`/`blocksToAvoid` pollution approach (which permanently blocked all terrain-type blocks session-wide) with a jump + perpendicular sidestep escape maneuver. No lasting side effects on the movements object.
+  2. **goto lower-Y prefers natural paths**: When destination Y is 10+ blocks below current, tries pathfinding with `canDig=false` first (up to 30s). Falls back to digging only if no natural passage found.
+  3. **Idle equipment chest auto-collect**: 30-second interval checks for chests on smooth_stone within 32 blocks when bot is idle. Deduped via `_lootedChests` Set. Fires in addition to existing spawn-time check.
+  4. **Structure /locate integration**: `goto {target: "fortress"}` etc. issues `/locate structure minecraft:<id>`, parses `[X:N, ~, Z:N]` from chat, navigates to result.
+  5. **Internal waypoint system**: `data/waypoints.json` stores `{name, x, y, z, dimension}`. New `add_waypoint` action saves current position. `goto` resolves internal waypoints first, then JourneyMap, then /locate. Cross-dimension waypoints auto-prepend `navigate_portal` action.
+  6. **README**: Added full action reference table, waypoint system docs, and screen recording guidance (OBS / ReplayMod).

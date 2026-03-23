@@ -353,14 +353,17 @@ bot.on('spawn', async () => {
             for (const cpos of chests) {
                 const below = bot.blockAt(cpos.offset(0, -1, 0));
                 if (below && below.name === 'smooth_stone') {
-                    console.log(`[Actuator] Found initial equipment chest at ${cpos}. Fetching gear...`);
-                    bot.chat(`I see an equipment chest! Gearing up...`);
-
-                    // Queue an immediate task to go open it and loot
-                    actionQueue.unshift({
-                        action: 'loot_chest_special',
-                        target: cpos
-                    });
+                    const ckey = `${cpos.x},${cpos.y},${cpos.z}`;
+                    if (!_lootedChests.has(ckey)) {
+                        console.log(`[Actuator] Found initial equipment chest at ${cpos}. Fetching gear...`);
+                        bot.chat(`I see an equipment chest! Gearing up...`);
+                        _lootedChests.add(ckey);
+                        // Queue an immediate task to go open it and loot
+                        actionQueue.unshift({
+                            action: 'loot_chest_special',
+                            target: cpos
+                        });
+                    }
                     break;
                 }
             }
@@ -376,6 +379,30 @@ bot.on('spawn', async () => {
     }
     _pendingIpcActions = [];
     if (actionQueue.length > 0) processActionQueue();
+
+    // ── Goal 3: Idle equipment-chest scanner (runs every 30s when bot is idle) ──
+    setInterval(() => {
+        if (!_botReady || isExecuting || actionQueue.length > 0) return;
+        try {
+            const chestId = bot.registry.blocksByName['chest']?.id;
+            if (chestId === undefined) return;
+            const chests = bot.findBlocks({ matching: chestId, maxDistance: 32, count: 20 });
+            for (const cpos of chests) {
+                const key = `${cpos.x},${cpos.y},${cpos.z}`;
+                if (_lootedChests.has(key)) continue;
+                const below = bot.blockAt(cpos.offset(0, -1, 0));
+                const isMarker = below && below.name === 'smooth_stone';
+                if (isMarker) {
+                    console.log(`[Actuator] Idle: found equipment chest at ${cpos}. Auto-looting.`);
+                    bot.chat('I see an equipment chest nearby. Gearing up...');
+                    _lootedChests.add(key);
+                    actionQueue.unshift({ action: 'loot_chest_special', target: cpos });
+                    processActionQueue();
+                    break;
+                }
+            }
+        } catch (e) {}
+    }, 30000);
 
     // --- File Logging for External AI Monitor ---
     setInterval(() => {
@@ -703,6 +730,58 @@ bot.on('chat', (username, message) => {
     }
     process.send({ type: 'USER_CHAT', data: { username, message, environment: getEnvironmentContext() } });
 });
+
+// ─── Internal Waypoint System ──────────────────────────────────────────────────
+const WAYPOINTS_FILE = path.join(process.cwd(), 'data', 'waypoints.json');
+
+function loadWaypoints() {
+    try {
+        if (fs.existsSync(WAYPOINTS_FILE)) {
+            return JSON.parse(fs.readFileSync(WAYPOINTS_FILE, 'utf8'));
+        }
+    } catch (e) {}
+    return [];
+}
+
+function saveWaypoints(waypoints) {
+    try {
+        const dir = path.dirname(WAYPOINTS_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(WAYPOINTS_FILE, JSON.stringify(waypoints, null, 2));
+    } catch (e) {
+        console.error(`[Actuator] Failed to save waypoints: ${e.message}`);
+    }
+}
+
+function findWaypoint(name) {
+    const waypoints = loadWaypoints();
+    return waypoints.find(w => w.name.toLowerCase() === name.toLowerCase()) || null;
+}
+
+// Structure name → minecraft:id mapping for /locate command
+const STRUCTURE_NAMES = {
+    'fortress': 'fortress', 'nether_fortress': 'fortress',
+    'stronghold': 'stronghold',
+    'mansion': 'mansion', 'woodland_mansion': 'mansion',
+    'village': 'village',
+    'monument': 'monument', 'ocean_monument': 'monument',
+    'desert_pyramid': 'desert_pyramid', 'desert_temple': 'desert_pyramid',
+    'jungle_pyramid': 'jungle_temple', 'jungle_temple': 'jungle_temple',
+    'ruined_portal': 'ruined_portal',
+    'shipwreck': 'shipwreck',
+    'pillager_outpost': 'pillager_outpost',
+    'bastion_remnant': 'bastion_remnant',
+    'end_city': 'end_city',
+    'igloo': 'igloo',
+    'swamp_hut': 'swamp_hut',
+    'ocean_ruin': 'ocean_ruin',
+    'buried_treasure': 'buried_treasure',
+    'ancient_city': 'ancient_city',
+    'trail_ruins': 'trail_ruins',
+};
+
+// ─── Looted chest tracking (prevents re-looting same chest) ────────────────────
+const _lootedChests = new Set();
 
 // Body (Action)
 let actionQueue = [];
@@ -1472,38 +1551,102 @@ async function processActionQueue() {
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to find ${action.target}.`, environment: getEnvironmentContext() } });
                 }
 
-            // ── goto (waypoints, no distance cap) ────────────────────────────
+            // ── goto (waypoints, internal, journeyMap, /locate, no distance cap) ─
             } else if (action.action === 'goto') {
                 const WAYPOINT_STEP = 64;
                 let destX = action.x;
                 let destY = action.y;
                 let destZ = action.z;
+                let destDimension = null;
 
-                // Goal 3: journeyMap waypoint support
                 if (action.target && typeof action.target === 'string') {
-                    const wpPath = path.join(process.cwd(), 'data', 'journeymap', 'waypoints');
-                    let foundWaypoint = false;
-                    if (fs.existsSync(wpPath)) {
-                        const files = fs.readdirSync(wpPath).filter(f => f.endsWith('.json'));
-                        for (const file of files) {
-                            try {
-                                const data = JSON.parse(fs.readFileSync(path.join(wpPath, file), 'utf8'));
-                                if (data.name && data.name.toLowerCase() === action.target.toLowerCase()) {
-                                    destX = data.x;
-                                    destY = data.y;
-                                    destZ = data.z;
-                                    foundWaypoint = true;
-                                    bot.chat(`Found waypoint ${data.name} at X:${destX}, Y:${destY}, Z:${destZ}`);
-                                    break;
+                    const targetName = action.target.toLowerCase();
+
+                    // 1. Check internal waypoints first
+                    const internalWP = findWaypoint(action.target);
+                    if (internalWP) {
+                        destX = internalWP.x;
+                        destY = internalWP.y;
+                        destZ = internalWP.z;
+                        destDimension = internalWP.dimension || null;
+                        bot.chat(`Going to waypoint "${internalWP.name}" at X:${destX}, Y:${destY}, Z:${destZ}${destDimension ? ` (${destDimension})` : ''}`);
+
+                    // 2. Check structure names → use /locate
+                    } else if (STRUCTURE_NAMES[targetName]) {
+                        const structureId = STRUCTURE_NAMES[targetName];
+                        bot.chat(`Locating ${action.target}...`);
+                        bot.chat(`/locate structure minecraft:${structureId}`);
+
+                        // Wait for the server response chat containing coordinates
+                        const locateResult = await new Promise((resolve) => {
+                            const timeout = setTimeout(() => resolve(null), 10000);
+                            const handler = (username, message) => {
+                                // 1.20.1 format: "The nearest X is at [X: N, Y: ~, Z: N] (N blocks away)"
+                                const m = message.match(/\[X:\s*(-?\d+)[^\]]*Z:\s*(-?\d+)\]/i);
+                                if (m) {
+                                    clearTimeout(timeout);
+                                    bot.removeListener('message', handler);
+                                    resolve({ x: parseInt(m[1], 10), z: parseInt(m[2], 10) });
                                 }
-                            } catch(e) {}
+                            };
+                            bot.on('message', handler);
+                        });
+
+                        if (!locateResult) {
+                            bot.chat(`Could not locate ${action.target}.`);
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not locate structure ${action.target}. Try /locate manually.`, environment: getEnvironmentContext() } });
+                            continue;
+                        }
+                        destX = locateResult.x;
+                        destZ = locateResult.z;
+                        destY = undefined;
+                        bot.chat(`${action.target} found at X:${destX}, Z:${destZ}. Navigating...`);
+
+                    // 3. Fall back to JourneyMap waypoints
+                    } else {
+                        const wpPath = path.join(process.cwd(), 'data', 'journeymap', 'waypoints');
+                        let foundWaypoint = false;
+                        if (fs.existsSync(wpPath)) {
+                            const files = fs.readdirSync(wpPath).filter(f => f.endsWith('.json'));
+                            for (const file of files) {
+                                try {
+                                    const data = JSON.parse(fs.readFileSync(path.join(wpPath, file), 'utf8'));
+                                    if (data.name && data.name.toLowerCase() === targetName) {
+                                        destX = data.x;
+                                        destY = data.y;
+                                        destZ = data.z;
+                                        foundWaypoint = true;
+                                        bot.chat(`Found JourneyMap waypoint ${data.name} at X:${destX}, Y:${destY}, Z:${destZ}`);
+                                        break;
+                                    }
+                                } catch(e) {}
+                            }
+                        }
+                        if (!foundWaypoint) {
+                            bot.chat(`Could not find waypoint or coordinates for ${action.target}.`);
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Waypoint ${action.target} not found.`, environment: getEnvironmentContext() } });
+                            continue;
                         }
                     }
-                    if (!foundWaypoint) {
-                        bot.chat(`Could not find waypoint or coordinates for ${action.target}.`);
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Waypoint ${action.target} not found.`, environment: getEnvironmentContext() } });
-                        continue;
+                }
+
+                // Goal 5: Cross-dimension travel — navigate to the right portal first
+                if (destDimension && bot.game && bot.game.dimension !== destDimension) {
+                    const currentDim = bot.game.dimension;
+                    let neededPortal;
+                    if (destDimension === 'the_nether' || destDimension === 'nether') {
+                        neededPortal = 'nether_portal';
+                    } else if (destDimension === 'the_end' || destDimension === 'end') {
+                        neededPortal = 'end_portal';
+                    } else {
+                        neededPortal = 'nether_portal'; // return from nether
                     }
+                    bot.chat(`Cross-dimension travel required. Searching for ${neededPortal}...`);
+                    actionQueue.unshift(
+                        { action: 'navigate_portal', target: neededPortal === 'nether_portal' ? 'nether' : 'end' },
+                        { action: 'goto', x: destX, y: destY, z: destZ }
+                    );
+                    continue;
                 }
 
                 // Per-waypoint timeout: 60s gives sprint-jumping bot time for 64 blocks
@@ -1512,7 +1655,28 @@ async function processActionQueue() {
 
                 if (destY !== undefined) {
                     bot.chat(`Moving to X:${Math.round(destX)}, Y:${destY}, Z:${Math.round(destZ)}.`);
-                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'goto XYZ', () => bot.pathfinder.setGoal(null));
+                    // Goal 2: If destination is significantly below current Y, try without
+                    // digging first to prefer natural paths (caves, stairs, cliff edges).
+                    const curY = bot.entity.position.y;
+                    if (destY < curY - 10 && movements) {
+                        const savedCanDig = movements.canDig;
+                        movements.canDig = false;
+                        bot.pathfinder.setMovements(movements);
+                        let noDigOk = false;
+                        try {
+                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), Math.min(wpTimeout, 30000), 'goto XYZ no-dig', () => bot.pathfinder.setGoal(null));
+                            noDigOk = true;
+                        } catch (e) {
+                            // No natural path found — restore digging and retry
+                        }
+                        movements.canDig = savedCanDig;
+                        bot.pathfinder.setMovements(movements);
+                        if (!noDigOk && !currentCancelToken.cancelled) {
+                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'goto XYZ', () => bot.pathfinder.setGoal(null));
+                        }
+                    } else {
+                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'goto XYZ', () => bot.pathfinder.setGoal(null));
+                    }
                 } else {
                     const dx0 = destX - bot.entity.position.x, dz0 = destZ - bot.entity.position.z;
                     const total = Math.sqrt(dx0 * dx0 + dz0 * dz0);
@@ -1525,28 +1689,25 @@ async function processActionQueue() {
                         const rem = Math.sqrt(rdx * rdx + rdz * rdz);
                         if (rem <= 4) break;  // close enough (was 2, too tight for XZ-only goals)
                         // Stuck detection: require at least 3 blocks progress per waypoint.
-                        // The old threshold (1 block) triggered false positives on terrain
-                        // where the bot made partial progress each attempt.
                         if (rem >= lastRem - 3) {
                             if (++stuck >= 5) {
-                                bot.chat('I am stuck. Recalculating an alternate route...');
-                                // Goal 1: If stuck, temporarily flag 5 block radius as unbreakable to force A* new route
-                                const stuckPos = bot.entity.position.floored();
-                                for (let dx = -5; dx <= 5; dx++) {
-                                    for (let dy = -5; dy <= 5; dy++) {
-                                        for (let dz = -5; dz <= 5; dz++) {
-                                            const b = bot.blockAt(stuckPos.offset(dx, dy, dz));
-                                            if (b && !movements.blocksCantBreak.has(b.type)) {
-                                                movements.blocksCantBreak.add(b.type);
-                                                // We also mark it as toAvoid to make A* heavily penalize paths near it
-                                                movements.blocksToAvoid.add(b.type);
-                                            }
-                                        }
-                                    }
-                                }
-                                bot.pathfinder.setMovements(movements);
+                                // Goal 1 fix: use a perpendicular escape instead of polluting
+                                // blocksCantBreak/blocksToAvoid (which causes permanent avoidance
+                                // of legitimate terrain types across the whole session).
+                                bot.chat('I am stuck. Trying escape maneuver...');
                                 stuck = 0;
-                                // We don't break out immediately, we let the loop try again with the new restrictions
+                                lastRem = rem;
+                                // Jump to break free from single-block lip catches
+                                bot.setControlState('jump', true);
+                                await new Promise(r => setTimeout(r, 400));
+                                bot.setControlState('jump', false);
+                                // Sidestep perpendicular to travel direction to get around the obstacle
+                                const a = Math.atan2(rdz, rdx);
+                                const perpX = cx + 5 * Math.cos(a + Math.PI / 2);
+                                const perpZ = cz + 5 * Math.sin(a + Math.PI / 2);
+                                try {
+                                    await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(perpX, perpZ)), 6000, 'escape sidestep', () => bot.pathfinder.setGoal(null));
+                                } catch(e) { /* try other side */ }
                                 continue;
                             }
                         } else {
@@ -2370,6 +2531,27 @@ async function processActionQueue() {
                         ? `Pattern ${patternName} placed successfully.`
                         : `Pattern ${patternName}: placed ${placed}, failed ${missing}.`;
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: msg, environment: getEnvironmentContext() } });
+                }
+
+            // ── add_waypoint ──────────────────────────────────────────────────────
+            } else if (action.action === 'add_waypoint') {
+                const wpName = action.name || action.target;
+                if (!wpName) {
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: 'add_waypoint requires a name.', environment: getEnvironmentContext() } });
+                } else {
+                    const pos = bot.entity.position;
+                    const dim = bot.game?.dimension || 'overworld';
+                    const waypoints = loadWaypoints();
+                    const existing = waypoints.findIndex(w => w.name.toLowerCase() === wpName.toLowerCase());
+                    const entry = { name: wpName, x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z), dimension: dim };
+                    if (existing >= 0) {
+                        waypoints[existing] = entry;
+                    } else {
+                        waypoints.push(entry);
+                    }
+                    saveWaypoints(waypoints);
+                    bot.chat(`Waypoint "${wpName}" saved at X:${entry.x}, Y:${entry.y}, Z:${entry.z} (${dim}).`);
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Waypoint "${wpName}" saved at X:${entry.x}, Y:${entry.y}, Z:${entry.z} (${dim}).`, environment: getEnvironmentContext() } });
                 }
 
             // ── find_land ─────────────────────────────────────────────────────────

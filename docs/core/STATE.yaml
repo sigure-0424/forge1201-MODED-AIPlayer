@@ -4,6 +4,7 @@ project_short_name: "Forge1201AIP"
 current_goal: "Implement autonomous AI player framework using Mineflayer for Minecraft 1.20.1 Forge environment, including FML3 handshakes and dynamic registry handling."
 active_tasks: []
 recent_changes:
+  - "2026-03-23: (1) Fixed stuck-recovery block pollution: replaced permanent blocksCantBreak/blocksToAvoid mutation with jump + perpendicular sidestep escape (no session-wide side effects); (2) goto to lower Y now tries no-dig first (prefers caves/stairs), falls back to digging only if no natural path found; (3) Idle equipment chest scanner: every 30s when idle, scans 32-block radius for chests on smooth_stone and auto-loots (deduped via _lootedChests Set); (4) Structure /locate integration: goto target matching STRUCTURE_NAMES map issues /locate command, parses [X:N, ~, Z:N] from server chat response; (5) Internal waypoint system: data/waypoints.json with name/x/y/z/dimension, add_waypoint action, goto resolves internal waypoints first with cross-dimension portal pre-navigation; (6) README updated with full action reference, waypoint docs, and screen recording guide (TASK-20260323-001)"
   - "2026-03-22: Fixed isInWater false positive on stone field: DynamicRegistryInjector Proxy fallback was returning the water block object (registry id=32) for unknown Forge stateIds that landed just above vanilla water stateId range 80-95; prismarine-physics then set isInWater=true causing sprint=false and bot spinning in circles. Fix: Proxy get handler now intercepts liquid-block fallbacks and returns stoneTemplate instead; LIQUID_NAMES set covers water/lava/flowing_water/flowing_lava (BUGFIX-20260322-003)"
   - "2026-03-22: Fixed find_land and movement bobbing: (1) find_land now TPs to Seia_Y/any online player instead of /fill (which always failed in all-ocean world — water immediately refilled any stone); (2) physicsTick handler now sets jump=false in water to prevent jump=true persisting from prior land state causing vertical bobbing at 0.28 b/s; (3) testKill filter narrowed to 'Failed to kill' (was 'Failed') to prevent come-action's 'Failed to find Seia_Y' message from being matched (BUGFIX-20260322-002)"
   - "2026-03-22: Added find_land action (uses /spreadplayers 0 0 0 2000 false <bot>) to scatter bot to random dry land before tests; modified test_live.js to call find_land after waitForReady, capture land base position, and use it for goto_return test instead of hardcoded ocean spawn (-10,-28) (BUGFIX-20260322-001)"
@@ -38,8 +39,8 @@ recent_changes:
 decisions_index:
 \
 smoke_status:
-  last_run: "2026-03-22"
+  last_run: "2026-03-23"
   command: "npm test"
-  result: "passed (6 test files) — after BUGFIX-20260322-003"
+  result: "passed (6 test files) — after TASK-20260323-001"
 hazards:
 \
