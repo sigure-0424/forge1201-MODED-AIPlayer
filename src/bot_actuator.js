@@ -661,6 +661,167 @@ const UNDERGROUND_BLOCKS = new Set([
     'nether_quartz_ore', 'ancient_debris',
 ]);
 
+function resolveRequiredMaterials(targetItemName, initialQuantity, inventoryMap = {}) {
+    const required = {};
+    const available = { ...inventoryMap };
+
+    function consume(name, amount) {
+        let remaining = amount;
+        if (available[name]) {
+            const used = Math.min(available[name], remaining);
+            available[name] -= used;
+            remaining -= used;
+        }
+
+        if (name === 'oak_log' && remaining > 0) {
+            for (const logName of Object.keys(available).filter(n => n.endsWith('_log') || n.endsWith('_wood'))) {
+                if (available[logName] > 0) {
+                    const used = Math.min(available[logName], remaining);
+                    available[logName] -= used;
+                    remaining -= used;
+                }
+                if (remaining <= 0) break;
+            }
+        } else if (name === 'oak_planks' && remaining > 0) {
+            for (const plankName of Object.keys(available).filter(n => n.endsWith('_planks'))) {
+                if (available[plankName] > 0) {
+                    const used = Math.min(available[plankName], remaining);
+                    available[plankName] -= used;
+                    remaining -= used;
+                }
+                if (remaining <= 0) break;
+            }
+        }
+        return remaining;
+    }
+
+    function recurse(itemName, qty, path = []) {
+        if (qty <= 0) return;
+
+        if (path.includes(itemName)) {
+            required[itemName] = (required[itemName] || 0) + qty;
+            return;
+        }
+
+        const remainingQty = consume(itemName, qty);
+        if (remainingQty <= 0) return;
+
+        const item = bot.registry.itemsByName[itemName] || bot.registry.blocksByName[itemName];
+        if (!item) {
+            required[itemName] = (required[itemName] || 0) + remainingQty;
+            return;
+        }
+
+        const recipes = bot.registry.recipes[item.id];
+        if (!recipes || recipes.length === 0) {
+            required[itemName] = (required[itemName] || 0) + remainingQty;
+            return;
+        }
+
+        const baseMaterials = [
+            'iron_ingot', 'gold_ingot', 'copper_ingot', 'netherite_ingot',
+            'coal', 'charcoal', 'diamond', 'emerald', 'lapis_lazuli', 'redstone',
+            'quartz', 'flint', 'clay_ball', 'glowstone_dust', 'string', 'feather',
+            'gunpowder', 'leather', 'rabbit_hide', 'blaze_rod', 'ender_pearl',
+            'ghast_tear', 'slime_ball', 'magma_cream', 'nether_wart', 'bone',
+            'spider_eye', 'rotten_flesh', 'phantom_membrane'
+        ];
+
+        if (baseMaterials.includes(itemName) || itemName.endsWith('_log') || itemName.endsWith('_wood')) {
+            required[itemName] = (required[itemName] || 0) + remainingQty;
+            return;
+        }
+
+        let bestRecipe = null;
+        for (const r of recipes) {
+            let createsCycle = false;
+            let isUncrafting = false;
+
+            const getIngs = (recipe) => {
+                const ings = [];
+                if (recipe.ingredients) {
+                    for (const ing of recipe.ingredients) ings.push(Array.isArray(ing) ? ing[0] : ing);
+                } else if (recipe.inShape) {
+                    for (const row of recipe.inShape) {
+                        for (const ing of row) ings.push(Array.isArray(ing) ? ing[0] : ing);
+                    }
+                }
+                return ings;
+            };
+
+            const ings = getIngs(r);
+            if (r.result && r.result.count === 9 && ings.length === 1) {
+                isUncrafting = true;
+            }
+
+            for (const ingId of ings) {
+                const ingItem = bot.registry.items[ingId] || bot.registry.blocks[ingId];
+                if (ingItem && path.includes(ingItem.name)) createsCycle = true;
+            }
+
+            if (!createsCycle && !isUncrafting) {
+                if (!bestRecipe) {
+                    bestRecipe = r;
+                } else {
+                    const getNames = (ingsList) => ingsList.map(id => (bot.registry.items[id] || bot.registry.blocks[id] || {}).name).filter(Boolean);
+                    const isOakPreferable = (names) => names.some(n => n.includes('oak')) && !names.some(n => n.includes('bamboo'));
+
+                    const currentNames = getNames(ings);
+                    const bestNames = getNames(getIngs(bestRecipe));
+
+                    if (isOakPreferable(currentNames) && !isOakPreferable(bestNames)) {
+                        bestRecipe = r;
+                    }
+                }
+            }
+        }
+
+        if (!bestRecipe) {
+            required[itemName] = (required[itemName] || 0) + remainingQty;
+            return;
+        }
+
+        const recipeYield = bestRecipe.result ? bestRecipe.result.count : 1;
+        const craftsNeeded = Math.ceil(remainingQty / recipeYield);
+        const surplus = (craftsNeeded * recipeYield) - remainingQty;
+        if (surplus > 0) {
+            available[itemName] = (available[itemName] || 0) + surplus;
+        }
+
+        const newPath = [...path, itemName];
+
+        let hasIngredients = false;
+        if (bestRecipe.ingredients) {
+            hasIngredients = true;
+            for (const ing of bestRecipe.ingredients) {
+                const ingId = Array.isArray(ing) ? ing[0] : ing;
+                const ingItem = bot.registry.items[ingId] || bot.registry.blocks[ingId];
+                if (ingItem) recurse(ingItem.name, craftsNeeded, newPath);
+            }
+        } else if (bestRecipe.inShape) {
+            hasIngredients = true;
+            const ingCounts = {};
+            for (const row of bestRecipe.inShape) {
+                for (const ing of row) {
+                    const ingId = Array.isArray(ing) ? ing[0] : ing;
+                    const ingItem = bot.registry.items[ingId] || bot.registry.blocks[ingId];
+                    if (ingItem) ingCounts[ingItem.name] = (ingCounts[ingItem.name] || 0) + 1;
+                }
+            }
+            for (const [ingName, ingQty] of Object.entries(ingCounts)) {
+                recurse(ingName, ingQty * craftsNeeded, newPath);
+            }
+        }
+
+        if (!hasIngredients) {
+            required[itemName] = (required[itemName] || 0) + remainingQty;
+        }
+    }
+
+    recurse(targetItemName, initialQuantity);
+    return required;
+}
+
 // ─── Drop-to-source block mapping ─────────────────────────────────────────────
 // Maps the requested item name to block(s) that yield it when mined.
 // Without this, collect('cobblestone') searches for cobblestone blocks, which
@@ -1310,12 +1471,53 @@ async function processActionQueue() {
                 const itemId = bot.registry.itemsByName[action.target]?.id || bot.registry.blocksByName[action.target]?.id;
                 if (itemId !== undefined) {
                     const quantity = parseInt(action.quantity, 10) || 1;
+
+                    const inventoryMap = {};
+                    if (bot.inventory) {
+                        for (const item of bot.inventory.items()) {
+                            inventoryMap[item.name] = (inventoryMap[item.name] || 0) + item.count;
+                        }
+                    }
+                    if (bot.chestMemory) {
+                        for (const [chestPosKey, chestItems] of Object.entries(bot.chestMemory)) {
+                            for (const item of chestItems) {
+                                inventoryMap[item.name] = (inventoryMap[item.name] || 0) + item.count;
+                            }
+                        }
+                    }
+
+                    // 1. Dependency Tree Check
+                    const requiredTree = resolveRequiredMaterials(action.target, quantity, inventoryMap);
+
+                    const missing = [];
+                    for (const [name, qty] of Object.entries(requiredTree)) {
+                        if (qty > 0) missing.push({ name, quantity: qty });
+                    }
+
+                    if (missing.length > 0) {
+                        actionQueue = []; // Clear queue on failure
+                        bot.chat(`Cannot craft ${action.target}: missing materials.`);
+                        const missingStr = missing.map(m => `${m.quantity}x ${m.name}`).join(', ');
+                        process.send({
+                            type: 'USER_CHAT',
+                            data: {
+                                username: "System",
+                                message: `Cannot craft ${action.target}: missing materials. You strictly need to collect: ${missingStr}. Generate actions to collect these specific materials before retrying.`,
+                                environment: getEnvironmentContext()
+                            }
+                        });
+                        continue;
+                    }
+
                     const recipe = bot.recipesFor(itemId, null, 1, true)[0];
                     if (recipe) {
                         bot.chat(`Crafting ${action.target}...`);
+
+                        // 2. Isolated Crafting Table Check
                         if (recipe.requiresTable) {
-                            const ctId = bot.registry.blocksByName['crafting_table']?.id;
-                            const ct = ctId !== undefined ? bot.findBlock({ matching: ctId, maxDistance: 32 }) : null;
+                            const ctId = bot.registry.blocksByName.crafting_table.id;
+                            const ct = bot.findBlock({ matching: ctId, maxDistance: 4 });
+
                             if (ct) {
                                 await withTimeout(bot.pathfinder.goto(new goals.GoalNear(ct.position.x, ct.position.y, ct.position.z, 1)), timeoutMs, 'goto crafting table', () => bot.pathfinder.setGoal(null));
                                 try {
@@ -1326,9 +1528,24 @@ async function processActionQueue() {
                                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to craft: ${err.message}`, environment: getEnvironmentContext() } });
                                 }
                             } else {
-                                actionQueue = []; // Clear queue on failure
-                                bot.chat(`Need a crafting table but none nearby.`);
-                                process.send({ type: 'USER_CHAT', data: { username: "System", message: `No crafting table for ${action.target}.`, environment: getEnvironmentContext() } });
+                                bot.chat(`Need a crafting table nearby for ${action.target}. Preparing one...`);
+                                // Determine the available log to craft with.
+                                const logs = bot.inventory.items().filter(i => i.name.endsWith('_log') || i.name.endsWith('_wood'));
+                                const bestLog = logs.length > 0 ? logs[0].name : "oak_log";
+                                const bestPlank = bestLog.replace(/_log$|_wood$/, '_planks');
+
+                                // Bypass LLM and prepend deterministic actions
+                                const deterministicActions = [
+                                    { action: "collect", target: bestLog, quantity: 1, timeout: 60 },
+                                    { action: "craft", target: bestPlank, quantity: 1 },
+                                    { action: "craft", target: "crafting_table", quantity: 1 },
+                                    { action: "place", target: "crafting_table" },
+                                    action // retry the original craft
+                                ];
+
+                                // Put remaining actions after deterministic recovery
+                                const remaining = [...actionQueue];
+                                actionQueue = [...deterministicActions, ...remaining];
                             }
                         } else {
                             try {
@@ -1342,8 +1559,8 @@ async function processActionQueue() {
                         }
                     } else {
                         actionQueue = []; // Clear queue on failure
-                        bot.chat(`Cannot craft ${action.target}: missing materials or recipe.`);
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: missing materials or recipe. Check inventory and gather dependencies.`, environment: getEnvironmentContext() } });
+                        bot.chat(`Cannot craft ${action.target}: recipe not found.`);
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: recipe not found.`, environment: getEnvironmentContext() } });
                     }
                 } else {
                     actionQueue = []; // Clear queue on failure

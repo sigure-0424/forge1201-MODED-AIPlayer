@@ -210,10 +210,10 @@ Current Environment: ${JSON.stringify(data.environment)}
 *CRITICAL*: Chain multiple actions in one array. If the user says "give me 10 oak logs", respond with BOTH collect AND give: [{"action":"collect","target":"oak_log","quantity":10},{"action":"give","target":"${data.username}","item":"oak_log","quantity":10}]
 *CRITICAL*: For complex tasks like "gather 10 wood and make a sword", chain all steps: [{"action":"collect","target":"oak_log","quantity":10},{"action":"craft","target":"wooden_sword","quantity":1}]
 *CRITICAL*: ALWAYS check inventory before deciding what to collect or craft. If something is already there, skip that step.
-*CRITICAL*: Think through the FULL dependency tree. To collect any stone-type block or ore you NEED a pickaxe first. ALWAYS check "has_pickaxe" in Current Environment. If "has_pickaxe" is false, chain BEFORE the collect: [{"action":"collect","target":"oak_log","quantity":2,"timeout":60},{"action":"craft","target":"oak_planks","quantity":1},{"action":"craft","target":"stick","quantity":1},{"action":"place","target":"crafting_table"},{"action":"craft","target":"wooden_pickaxe","quantity":1}] — THEN add the original collect.
+*CRITICAL*: To collect any stone-type block or ore you NEED a pickaxe first. ALWAYS check "has_pickaxe" in Current Environment. If "has_pickaxe" is false, craft one first.
 *CRITICAL*: Stone-type blocks (stone, andesite, granite, diorite) and ores are UNDERGROUND. If the system reports "not found within 128 blocks", you must dig down first: [{"action":"collect","target":"stone","quantity":16,"timeout":60}] will open a shaft. Then retry the original target.
 *CRITICAL*: If a SYSTEM FEEDBACK message describes a failure, respond with the corrective action chain — do NOT just repeat the failed action.
-*CRITICAL*: If you lack materials for crafting, explicitly plan actions to gather them first.
+*CRITICAL*: If a SYSTEM FEEDBACK message lists missing raw materials for a craft, you must generate actions to ONLY collect those specific raw materials.
 *CRITICAL*: Always use the longest timeout that makes sense. Collection of many blocks needs timeout:120 or more.
 *CRITICAL*: If the user provides only two numbers for coordinates, assign them to X and Z, omit Y.
 
