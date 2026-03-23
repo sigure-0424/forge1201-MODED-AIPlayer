@@ -16,6 +16,8 @@ class AgentManager {
         // Goals 4, 9, 10, 11: Task modes execution tracking
         this.botModes = new Map(); // Map of botId to 'normal' | 'full_auto' | 'auto_conditional' | 'task_mode'
         this.botActionCounts = new Map(); // Map of botId to number of actions executed (for full auto to task mode switch)
+        // Issue 1: task_mode processes tasks one at a time; currentTaskIdx tracks position in the list
+        this.currentTaskIdx = new Map(); // Map of botId to index of in-progress task
     }
 
     startBot(botId, options) {
@@ -133,13 +135,20 @@ class AgentManager {
                 this.chatQueue.set(botId, queue);
                 this.processNextQueueItem(botId);
             } else {
-                // System messages
-                if (data.message.includes("Successfully") || data.message.includes("Explored") || data.message.includes("Entered portal")) {
+                // System messages from the bot actuator
+                const isSuccess = data.message.includes('Successfully') || data.message.includes('Explored') || data.message.includes('Entered portal') || data.message.includes('Reached destination');
+                const isFailure = data.message.includes('Failed') || data.message.includes('Cannot') || data.message.includes('No ');
+
+                if (isSuccess) {
                     console.log(`[AgentManager] Task completed for ${botId}: ${data.message}.`);
-                    // We finished a task, process the next in queue if any
-                    this.processNextQueueItem(botId);
-                    return; 
-                } else if (data.message.includes("Failed") || data.message.includes("Cannot") || data.message.includes("No ")) {
+                    // Issue 1: in task_mode, mark current task done and start the next
+                    if (this.botModes.get(botId) === 'task_mode' && this.currentTaskIdx.has(botId)) {
+                        this.completeCurrentTask(botId);
+                    } else {
+                        this.processNextQueueItem(botId);
+                    }
+                    return;
+                } else if (isFailure) {
                     const queue = this.chatQueue.get(botId) || [];
                     queue.unshift(data);
                     this.chatQueue.set(botId, queue);
@@ -149,7 +158,12 @@ class AgentManager {
         }
     }
 
-    // Goal 10: Task mode execution logic
+    // Issue 1: Task mode — process tasks ONE AT A TIME.
+    // tasks.json supports two formats:
+    //   - Task-object array: [{"id":1,"status":"pending","description":"Collect 64 oak logs"}, ...]
+    //   - Legacy raw-action array: [{"action":"collect","target":"oak_log","quantity":64}, ...]
+    // For task-objects, each is fed to the LLM as a user message so the LLM can judge
+    // progress and decide when a task is truly complete.
     executeTaskModeTasks(botId) {
         const fs = require('fs');
         const path = require('path');
@@ -158,27 +172,82 @@ class AgentManager {
         if (!fs.existsSync(tasksPath)) {
             console.error(`[AgentManager] tasks.json not found at ${tasksPath}`);
             const botProcess = this.bots.get(botId);
-            if (botProcess) {
-                botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: "chat", message: "Task Mode error: tasks.json not found." }] });
-            }
+            if (botProcess) botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: 'chat', message: 'Task Mode error: tasks.json not found.' }] });
             return;
         }
 
+        let tasks;
         try {
-            const data = fs.readFileSync(tasksPath, 'utf8');
-            const tasks = JSON.parse(data);
-            if (Array.isArray(tasks) && tasks.length > 0) {
-                console.log(`[AgentManager] Dispatching ${tasks.length} tasks for Task Mode.`);
-                const botProcess = this.bots.get(botId);
-                if (botProcess) {
-                    botProcess.send({ type: 'EXECUTE_ACTION', action: tasks });
-                }
-            } else {
-                console.log(`[AgentManager] tasks.json is empty or not an array.`);
-            }
-        } catch(e) {
+            tasks = JSON.parse(fs.readFileSync(tasksPath, 'utf8'));
+        } catch (e) {
             console.error(`[AgentManager] Error parsing tasks.json: ${e.message}`);
+            return;
         }
+
+        if (!Array.isArray(tasks) || tasks.length === 0) {
+            console.log(`[AgentManager] tasks.json is empty. Returning to normal mode.`);
+            this.botModes.set(botId, 'normal');
+            return;
+        }
+
+        // Detect legacy format (raw action objects have an 'action' field, not a 'description')
+        const isLegacyFormat = tasks[0] && tasks[0].action && !tasks[0].description;
+        if (isLegacyFormat) {
+            console.log(`[AgentManager] Legacy tasks.json format: dispatching ${tasks.length} raw actions.`);
+            const botProcess = this.bots.get(botId);
+            if (botProcess) botProcess.send({ type: 'EXECUTE_ACTION', action: tasks });
+            return;
+        }
+
+        // Task-object format: find the first pending task
+        const pendingIdx = tasks.findIndex(t => !t.status || t.status === 'pending');
+        if (pendingIdx === -1) {
+            console.log(`[AgentManager] All tasks completed for ${botId}. Returning to normal mode.`);
+            this.botModes.set(botId, 'normal');
+            const botProcess = this.bots.get(botId);
+            if (botProcess) botProcess.send({ type: 'EXECUTE_ACTION', action: [{ action: 'chat', message: 'All tasks complete!' }] });
+            return;
+        }
+
+        // Mark this task as in_progress and save
+        tasks[pendingIdx].status = 'in_progress';
+        try { fs.writeFileSync(tasksPath, JSON.stringify(tasks, null, 2)); } catch(e) {}
+        this.currentTaskIdx.set(botId, pendingIdx);
+
+        const task = tasks[pendingIdx];
+        const taskDesc = task.description || JSON.stringify(task);
+        console.log(`[AgentManager] Task ${pendingIdx + 1}/${tasks.length}: "${taskDesc}"`);
+
+        // Feed task to LLM as if the user said it
+        const fakeData = { username: 'TaskSystem', message: `[Task ${pendingIdx + 1}/${tasks.length}] ${taskDesc}`, environment: {} };
+        const queue = this.chatQueue.get(botId) || [];
+        queue.push(fakeData);
+        this.chatQueue.set(botId, queue);
+        this.processNextQueueItem(botId);
+    }
+
+    // Issue 1: Mark the current in_progress task as completed and start the next one.
+    completeCurrentTask(botId) {
+        const fs = require('fs');
+        const path = require('path');
+        const tasksPath = path.join(process.cwd(), 'data', 'tasks.json');
+        const idx = this.currentTaskIdx.get(botId);
+        if (idx === undefined) return;
+
+        try {
+            const tasks = JSON.parse(fs.readFileSync(tasksPath, 'utf8'));
+            if (tasks[idx]) {
+                tasks[idx].status = 'completed';
+                fs.writeFileSync(tasksPath, JSON.stringify(tasks, null, 2));
+                console.log(`[AgentManager] Task ${idx + 1} marked completed.`);
+            }
+        } catch (e) {
+            console.error(`[AgentManager] Could not update tasks.json: ${e.message}`);
+        }
+        this.currentTaskIdx.delete(botId);
+
+        // Move to the next pending task after a short pause
+        setTimeout(() => this.executeTaskModeTasks(botId), 1500);
     }
 
     processNextQueueItem(botId) {
@@ -271,9 +340,21 @@ class AgentManager {
         console.log(`[AgentManager] Thinking about what ${data.username} said: "${data.message}"...`);
 
         const isSystemFailure = data.username === 'System' || data.username === 'system';
+        const isTaskMode = this.botModes.get(botId) === 'task_mode';
+        const taskContext = isTaskMode ? (() => {
+            const fs = require('fs'), path = require('path');
+            const tp = path.join(process.cwd(), 'data', 'tasks.json');
+            try {
+                const tasks = JSON.parse(fs.readFileSync(tp, 'utf8'));
+                const pending = tasks.filter(t => !t.status || t.status === 'pending').map(t => t.description || JSON.stringify(t));
+                const inProg = tasks.filter(t => t.status === 'in_progress').map(t => t.description || JSON.stringify(t));
+                return `\nTASK MODE — In-progress: ${JSON.stringify(inProg)} | Remaining: ${JSON.stringify(pending)}`;
+            } catch(e) { return ''; }
+        })() : '';
+
         let prompt = `You are a Minecraft AI bot named ${botId}.
-${isSystemFailure ? `SYSTEM FEEDBACK (previous action result): "${data.message}"` : `User '${data.username}' said: "${data.message}"`}
-Current Environment: ${JSON.stringify(data.environment)}
+${isSystemFailure ? `SYSTEM FEEDBACK (previous action result): "${data.message}"` : `${data.username === 'TaskSystem' ? `TASK INSTRUCTION` : `User '${data.username}' said`}: "${data.message}"`}
+Current Environment: ${JSON.stringify(data.environment)}${taskContext}
 
 ━━━ CORE RULES ━━━
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
@@ -315,15 +396,28 @@ Current Environment: ${JSON.stringify(data.environment)}
 
 ━━━ COMBAT ACTIONS ━━━
 [{"action": "kill", "target": "zombie", "quantity": 1, "timeout": 120}]          -- auto-equips armor+weapon, fights until dead
+[{"action": "kill", "target": "blaze", "timeout": 120}]                          -- uses bow if available, dodges fireballs with shield
 [{"action": "kill", "target": "wither", "timeout": 300}]
 [{"action": "kill", "target": "ender_dragon", "timeout": 600}]
 [{"action": "kill", "target": "elder_guardian", "quantity": 3, "timeout": 300}]
 [{"action": "kill", "target": "end_crystal", "quantity": 8, "timeout": 120}]     -- destroy End Crystals before fighting dragon
 
+━━━ NAVIGATION & WAYPOINTS ━━━
+[{"action": "goto", "target": "fortress"}]                                        -- uses /locate to find and navigate to structure
+[{"action": "goto", "target": "MyBase"}]                                          -- travels to named internal waypoint (cross-dim)
+[{"action": "add_waypoint", "name": "MyBase"}]                                    -- saves current position+dimension as waypoint
+
+━━━ TASK MANAGEMENT ━━━
+*CRITICAL*: When in TASK MODE, judge whether the current task is truly complete based on SYSTEM FEEDBACK and inventory.
+*CRITICAL*: A task is only complete when the outcome is confirmed (item in inventory, entity dead, structure reached).
+*CRITICAL*: Do NOT mark a task complete just because an action ran — verify the result matches the task description.
+*CRITICAL*: If a task is confirmed complete, the system advances automatically. Do NOT repeat completed tasks.
+
 ━━━ BOSS DEFEAT SEQUENCES (use multi-action arrays) ━━━
 WITHER: collect soul_sand(4) + kill wither_skeleton(many) for skulls → place_pattern(wither) → kill(wither,timeout:300)
 ENDER DRAGON: craft eye_of_ender → explore for stronghold → activate_end_portal → navigate_portal(end) → kill(end_crystal,qty:8) → kill(ender_dragon,timeout:600)
 ELDER GUARDIAN: brew(water_breathing) + brew(night_vision) → explore for ocean_monument → eat(milk) → kill(elder_guardian,qty:3,timeout:300)
+BLAZE (fire resistance): brew(fire_resistance) → navigate_portal(nether) → goto(fortress) → kill(blaze,qty:N,timeout:180)
 `;
 
 

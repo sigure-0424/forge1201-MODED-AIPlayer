@@ -41,6 +41,10 @@ process.on('uncaughtException', (err) => {
 const botId = process.env.BOT_ID || 'Bot';
 const botOptions = process.env.BOT_OPTIONS ? JSON.parse(process.env.BOT_OPTIONS) : {};
 
+// Issue 5: Only issue cheat/server commands (/tp, /spreadplayers) in debug mode.
+// In normal operation the bot must behave as a legit player.
+const DEBUG = process.env.DEBUG === 'true';
+
 console.log(`[Actuator] Initializing ${botId}...`);
 
 // Protocol & NBT Bypasses
@@ -108,13 +112,19 @@ bot._client.on('position', (packet) => {
             if (key === _frozenPosKey) {
                 _frozenPeriods++;
                 if (_frozenPeriods >= 2) {
-                    console.log(`[Actuator] Frozen watchdog triggered at ${key} (${_frozenPeriods} periods). Teleporting to player...`);
+                    console.log(`[Actuator] Frozen watchdog triggered at ${key} (${_frozenPeriods} periods).`);
                     bot.pathfinder.setGoal(null);
-                    const nearestPlayer = Object.values(bot.players)
-                        .filter(p => p.username !== bot.username && p.entity)
-                        .sort((a, b) => pos.distanceTo(a.entity.position) - pos.distanceTo(b.entity.position))[0];
-                    if (nearestPlayer) {
-                        bot.chat(`/tp ${bot.username} ${nearestPlayer.username}`);
+                    if (DEBUG) {
+                        const nearestPlayer = Object.values(bot.players)
+                            .filter(p => p.username !== bot.username && p.entity)
+                            .sort((a, b) => pos.distanceTo(a.entity.position) - pos.distanceTo(b.entity.position))[0];
+                        if (nearestPlayer) {
+                            bot.chat(`/tp ${bot.username} ${nearestPlayer.username}`);
+                        }
+                    } else {
+                        // Non-debug: jump to break free from physics lock
+                        bot.setControlState('jump', true);
+                        setTimeout(() => bot.setControlState('jump', false), 500);
                     }
                     _frozenPeriods = 0;
                     _frozenPosKey = null;
@@ -137,6 +147,13 @@ bot._client.on('position', (packet) => {
 let _spawnInitDone = false;
 let _passiveDefenseInterval = null;
 let _lastHealth = 20;
+
+// Issue 3: Reliable death-position tracking.
+// bot.entity.position inside the 'death' event is unreliable (may already be respawn pos).
+// Instead, track the last known safe position on a 2s interval.
+let _lastSafePos = null;
+let _lastSafeDim = 'overworld';
+const LAST_DEATH_FILE = path.join(process.cwd(), 'data', 'last_death.json');
 
 // IPC readiness gate — prevents processing actions before login/spawn complete.
 // Actions arriving before bot is ready are buffered and flushed after spawn.
@@ -249,16 +266,21 @@ bot.on('spawn', async () => {
             _lastHealth = bot.health;
         });
 
-        // Goal 8: GraveStone Mod Recovery (remember death position)
+        // Issue 3: GraveStone Mod Recovery — use _lastSafePos (tracked every 5s on ground)
+        // instead of bot.entity.position which may already be the respawn point when 'death' fires.
         bot.on('death', () => {
-            if (bot.entity && bot.entity.position && bot.entity.position.y > -60) {
+            const deathPos = _lastSafePos || (bot.entity?.position?.clone());
+            const deathDim = _lastSafeDim || bot.game?.dimension || 'overworld';
+            if (deathPos && deathPos.y > -60) {
                 bot.chat('I died! Attempting to retrieve my GraveStone...');
-                console.log(`[Actuator] Bot died. Memorizing death position for GraveStone recovery.`);
-                const deathPos = bot.entity.position.clone();
+                console.log(`[Actuator] Bot died. Last safe pos: ${JSON.stringify({x:Math.round(deathPos.x),y:Math.round(deathPos.y),z:Math.round(deathPos.z)}) } dim:${deathDim}`);
+                // Persist to file so recovery works even after process restart
+                const deathRecord = { x: deathPos.x, y: deathPos.y, z: deathPos.z, dimension: deathDim, time: new Date().toISOString() };
+                fs.writeFile(LAST_DEATH_FILE, JSON.stringify(deathRecord, null, 2), () => {});
                 // Queue recovery action on next spawn cycle
                 actionQueue.unshift({
                     action: 'recover_gravestone',
-                    target: deathPos
+                    target: deathRecord
                 });
             }
         });
@@ -326,6 +348,34 @@ bot.on('spawn', async () => {
                     console.log(`[MoveDiag] tick=${_moveDiagTick} pos=(${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}) speed=${speed.toFixed(2)}b/s fwd=${fwd} spr=${spr} jmp=${jmp} moving=${moving} mining=${mining} water=${inWater} ground=${onGround} goal=${!!bot.pathfinder.goal} below=${belowInfo} at=${atInfo} vanillaWater=${vanillaWaterId}`);
                 }
             }
+
+            // Issue 2: MLG water-bucket — place water when falling > 8 blocks.
+            // Reset tracking on ground or in water. Skip during pathfinder movement
+            // (pathfinder handles controlled descents itself).
+            if (bot.entity) {
+                const curY = bot.entity.position.y;
+                if (onGround || inWater) {
+                    _fallStartY = null;
+                    _mlgAttempted = false;
+                    // Pick up water bucket if we placed one (look for water below feet)
+                } else if (!moving) {
+                    // Track free-fall only when not pathfinder-guided
+                    if (_fallStartY === null) _fallStartY = curY;
+                    const fallDist = _fallStartY - curY;
+                    if (fallDist > 8 && !_mlgAttempted) {
+                        const wb = bot.inventory.items().find(i => i.name === 'water_bucket');
+                        if (wb) {
+                            _mlgAttempted = true;
+                            bot.equip(wb, 'hand')
+                                .then(() => bot.activateItem())
+                                .catch(() => {});
+                        }
+                    }
+                }
+
+                // Issue 2: shield raise on health drop (precise reaction, not just 600ms polling)
+                // This supplements the passive defense interval which only fires when idle.
+            }
         });
     }
 
@@ -380,6 +430,18 @@ bot.on('spawn', async () => {
     _pendingIpcActions = [];
     if (actionQueue.length > 0) processActionQueue();
 
+    // Issue 4: Auto-equip best gear when idle (runs every 15s).
+    // Ensures any armor/weapons acquired via crafting, looting, or trading get equipped.
+    setInterval(() => {
+        if (!_botReady || isExecuting || actionQueue.length > 0) return;
+        equipBestArmor().catch(() => {});
+        equipBestWeapon().catch(() => {});
+    }, 15000);
+
+    // Also equip immediately after spawn/respawn
+    equipBestArmor().catch(() => {});
+    equipBestWeapon().catch(() => {});
+
     // ── Goal 3: Idle equipment-chest scanner (runs every 30s when bot is idle) ──
     setInterval(() => {
         if (!_botReady || isExecuting || actionQueue.length > 0) return;
@@ -423,6 +485,13 @@ bot.on('spawn', async () => {
             };
             fs.writeFile(path.join(process.cwd(), 'ai_debug.json'), JSON.stringify(debugState, null, 2), () => {});
             fs.appendFile(path.join(process.cwd(), 'ai_history.log'), JSON.stringify(debugState) + '\n', () => {});
+
+            // Issue 3: Continuously track last safe position for accurate death recovery.
+            // Only update when on ground and healthy (not during a fall or combat death spiral).
+            if (bot.entity && bot.entity.onGround && bot.health > 4) {
+                _lastSafePos = bot.entity.position.clone();
+                _lastSafeDim = bot.game?.dimension || 'overworld';
+            }
         } catch (e) {
             console.error(`[Actuator] Failed to write ai_debug: ${e.message}`);
         }
@@ -475,57 +544,59 @@ bot.on('spawn', async () => {
                 }
             }
             if (landTarget) {
-                console.log(`[Actuator] Solid ground at (${landTarget.x}, ${landTarget.y}, ${landTarget.z}) name=${bot.blockAt(landTarget)?.name}. Teleporting...`);
-                bot.chat(`/tp ${bot.username} ${landTarget.x + 0.5} ${landTarget.y + 1} ${landTarget.z + 0.5}`);
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                console.log(`[Actuator] Solid ground at (${landTarget.x}, ${landTarget.y}, ${landTarget.z}) name=${bot.blockAt(landTarget)?.name}. Moving there...`);
+                if (DEBUG) {
+                    bot.chat(`/tp ${bot.username} ${landTarget.x + 0.5} ${landTarget.y + 1} ${landTarget.z + 0.5}`);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                } else {
+                    try {
+                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(landTarget.x, landTarget.y, landTarget.z, 2)), 30000, 'spawn ground escape', () => bot.pathfinder.setGoal(null));
+                    } catch (e) { console.log(`[Actuator] Pathfinder spawn escape: ${e.message}`); }
+                }
                 console.log(`[Actuator] Now at (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
             } else {
-                console.log('[Actuator] No standable solid block found nearby. Will try /tp to player then proceed.');
+                console.log('[Actuator] No standable solid block found nearby. Will try pathfinder or ask player.');
             }
         }
 
-        // If still not on ground and tp failed/no blocks found, try tp to player
+        // If still not on ground, try tp to player (debug) or swim via pathfinder
         if (!bot.entity.onGround) {
             const nearbyPlayers = Object.values(bot.players).filter(p => p.username !== bot.username);
             if (nearbyPlayers.length > 0 && !solidBlocks.length) {
-                // No solid blocks at all — likely in ocean. Try tp to player or ask for help
-                bot.chat(`/tp ${bot.username} ${nearbyPlayers[0].username}`);
-                await new Promise(resolve => setTimeout(resolve, 3000));
-                console.log(`[Actuator] After /tp: pos=(${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
+                if (DEBUG) {
+                    bot.chat(`/tp ${bot.username} ${nearbyPlayers[0].username}`);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+                console.log(`[Actuator] After escape attempt: pos=(${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
             }
         }
     }
 
-    // Always try to tp to the nearest player to get to proper dry land.
-    // The fallback copper-stairs position is water-logged; the player is on land.
-    {
+    // Only in debug mode: teleport to nearest player to reach dry land quickly.
+    if (DEBUG) {
         const nearbyPlayers = Object.values(bot.players)
             .filter(p => p.username !== bot.username && p.entity);
         if (nearbyPlayers.length > 0) {
             const tpTarget = nearbyPlayers[0].username;
             const curPos = bot.entity.position;
             const playerEntity = nearbyPlayers[0].entity;
-            // Only tp if player is significantly above us (on higher ground / land)
-            // OR we are currently in a water-logged area
             const isInWaterArea = (bot.blockAt(curPos)?.name?.includes('water') ||
                 bot.blockAt(curPos.offset(0, -1, 0))?.name?.includes('water') ||
                 bot.blockAt(curPos.offset(1, 0, 0))?.name?.includes('water') ||
                 bot.blockAt(curPos.offset(-1, 0, 0))?.name?.includes('water'));
             const playerHigher = playerEntity && (playerEntity.position.y > curPos.y + 5);
             if (isInWaterArea || playerHigher) {
-                console.log(`[Actuator] Area is water-logged or player is higher. Teleporting to ${tpTarget}...`);
+                console.log(`[Actuator] DEBUG: area water-logged or player higher. Teleporting to ${tpTarget}...`);
                 bot.chat(`/tp ${bot.username} ${tpTarget}`);
                 await new Promise(resolve => setTimeout(resolve, 3000));
 
-                // Wait a tick for chunks to load, then check if we're in water
                 await new Promise(resolve => setTimeout(resolve, 500));
-                // Emerge from water: tp up in steps until above water surface (max 30 blocks)
                 for (let attempt = 0; attempt < 6; attempt++) {
                     const checkPos = bot.entity.position;
                     const atWater = bot.blockAt(checkPos)?.name?.includes('water');
                     const belowWater = bot.blockAt(checkPos.offset(0, -1, 0))?.name?.includes('water');
                     if (!atWater && !belowWater && bot.entity.onGround) break;
-                    if (!atWater && !belowWater) break;  // Above water surface, let gravity handle it
+                    if (!atWater && !belowWater) break;
                     console.log(`[Actuator] In water after player tp (attempt ${attempt+1}). Teleporting up 5 blocks...`);
                     const emergPos = bot.entity.position;
                     bot.chat(`/tp ${bot.username} ${emergPos.x.toFixed(2)} ${(emergPos.y + 5).toFixed(2)} ${emergPos.z.toFixed(2)}`);
@@ -546,22 +617,19 @@ bot.on('spawn', async () => {
             (waterBelow && (waterBelow.name === 'water' || waterBelow.name === 'flowing_water') &&
              !(blockAtFeet && blockAtFeet.boundingBox === 'block'));
         if (inWaterZone) {
-            console.log('[Actuator] Spawned in water. Attempting /tp to nearest player...');
-            // Try teleporting to nearest player via server command (requires op)
+            console.log('[Actuator] Spawned in water. Attempting escape...');
             const nearbyPlayers = Object.values(bot.players).filter(p => p.username !== bot.username);
             let tpTarget = nearbyPlayers.length > 0 ? nearbyPlayers[0].username : null;
             let escaped = false;
 
-            if (tpTarget) {
+            if (DEBUG && tpTarget) {
                 const prePos = bot.entity.position.clone();
                 bot.chat(`/tp ${bot.username} ${tpTarget}`);
-                console.log(`[Actuator] Sent /tp ${bot.username} ${tpTarget}. Waiting for teleport...`);
-                // Wait up to 3 seconds for teleport to take effect
+                console.log(`[Actuator] DEBUG: Sent /tp ${bot.username} ${tpTarget}. Waiting...`);
                 await new Promise(resolve => setTimeout(resolve, 3000));
                 const dist = bot.entity.position.distanceTo(prePos);
                 if (dist > 5) {
-                    console.log(`[Actuator] Teleport successful! Moved ${dist.toFixed(1)} blocks to (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)})`);
-                    // Check if we're still in water at the new location — player may be standing near/above water
+                    console.log(`[Actuator] Teleport successful! Moved ${dist.toFixed(1)} blocks.`);
                     const stillInWater = bot.entity.isInWater ||
                         (bot.blockAt(bot.entity.position)?.name?.includes('water')) ||
                         (bot.blockAt(bot.entity.position.offset(0, -1, 0))?.name?.includes('water'));
@@ -569,7 +637,6 @@ bot.on('spawn', async () => {
                         escaped = true;
                     } else {
                         console.log(`[Actuator] Still in water near player. Scanning for dry ground...`);
-                        // Find nearest solid non-water surface block within 32 blocks
                         const dryBlocks = bot.findBlocks({
                             matching: b => b && b.boundingBox === 'block' &&
                                 !b.name.includes('water') && !b.name.includes('lava') &&
@@ -577,7 +644,6 @@ bot.on('spawn', async () => {
                             maxDistance: 32,
                             count: 50
                         });
-                        // Need block with air above (so we can stand on it)
                         const standable = dryBlocks.find(pos => {
                             const above = bot.blockAt(pos.offset(0, 1, 0));
                             const above2 = bot.blockAt(pos.offset(0, 2, 0));
@@ -586,7 +652,7 @@ bot.on('spawn', async () => {
                         });
                         if (standable) {
                             bot.chat(`/tp ${bot.username} ${standable.x + 0.5} ${standable.y + 1} ${standable.z + 0.5}`);
-                            console.log(`[Actuator] Sending /tp to dry ground at (${standable.x}, ${standable.y + 1}, ${standable.z})...`);
+                            console.log(`[Actuator] DEBUG: /tp to dry ground at (${standable.x}, ${standable.y + 1}, ${standable.z})...`);
                             await new Promise(resolve => setTimeout(resolve, 2000));
                             // Log blocks at new position to confirm solid ground
                             if (process.env.DEBUG === 'true') {
@@ -782,6 +848,10 @@ const STRUCTURE_NAMES = {
 
 // ─── Looted chest tracking (prevents re-looting same chest) ────────────────────
 const _lootedChests = new Set();
+
+// Issue 2: Fall-tracking state for MLG water-bucket and safe-landing maneuvers.
+let _fallStartY = null;
+let _mlgAttempted = false;
 
 // Body (Action)
 let actionQueue = [];
@@ -1433,27 +1503,64 @@ async function processActionQueue() {
                 const targetPos = action.target;
                 if (targetPos) {
                     try {
-                        bot.chat(`Navigating to death coordinates X:${Math.round(targetPos.x)} Z:${Math.round(targetPos.z)} to recover grave...`);
-                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2)), Math.max(timeoutMs, 60000), 'goto gravestone', () => bot.pathfinder.setGoal(null));
+                        // Issue 3: cross-dimension recovery — if death was in a different dimension,
+                        // navigate to the appropriate portal first, then retry recovery there.
+                        const deathDim = targetPos.dimension || 'overworld';
+                        const currentDim = bot.game?.dimension || 'overworld';
+                        if (deathDim !== currentDim) {
+                            bot.chat(`I need to travel to ${deathDim} to recover my grave.`);
+                            const portalTarget = (deathDim === 'the_nether' || deathDim === 'nether') ? 'nether' : 'end';
+                            actionQueue.unshift(
+                                { action: 'navigate_portal', target: portalTarget },
+                                { action: 'recover_gravestone', target: targetPos }
+                            );
+                            continue;
+                        }
 
-                        // Look around for a gravestone block (it may have a modded name, so we search generically or by known name substring)
+                        bot.chat(`Navigating to death coordinates X:${Math.round(targetPos.x)} Y:${Math.round(targetPos.y)} Z:${Math.round(targetPos.z)}...`);
+                        await withTimeout(
+                            bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2)),
+                            Math.max(timeoutMs, 90000), 'goto gravestone', () => bot.pathfinder.setGoal(null)
+                        );
+
+                        // Wait for chunks to load — grave may be just outside loaded range on arrival
+                        try { await bot.waitForChunksToLoad(); } catch (e) {}
+                        await new Promise(r => setTimeout(r, 1000));
+
+                        // Issue 3: search a 32-block radius (was 10) and include 'soul' containers
+                        // as well as any block whose name includes 'grave', 'tomb', or 'crave'
                         const graveIds = Object.values(bot.registry.blocksByName)
-                            .filter(b => b.name.toLowerCase().includes('grave'))
+                            .filter(b => {
+                                const n = b.name.toLowerCase();
+                                return n.includes('grave') || n.includes('tomb') || n.includes('crave');
+                            })
                             .map(b => b.id);
 
-                        if (graveIds.length > 0) {
-                            const graveBlocks = bot.findBlocks({ matching: graveIds, maxDistance: 10, count: 5 });
-                            if (graveBlocks.length > 0) {
-                                bot.chat(`Found GraveStone. Digging it...`);
-                                const graveBlock = bot.blockAt(graveBlocks[0]);
-                                await bot.dig(graveBlock, true);
-                                await new Promise(r => setTimeout(r, 1000));
-                                bot.chat(`Recovered items from GraveStone.`);
-                            } else {
-                                bot.chat(`Could not find a GraveStone block nearby.`);
+                        let recovered = false;
+                        for (const radius of [8, 16, 32]) {
+                            if (graveIds.length > 0) {
+                                const graveBlocks = bot.findBlocks({ matching: graveIds, maxDistance: radius, count: 10 });
+                                if (graveBlocks.length > 0) {
+                                    bot.chat(`Found GraveStone at distance ${radius}. Moving to it...`);
+                                    const graveBlock = bot.blockAt(graveBlocks[0]);
+                                    await withTimeout(
+                                        bot.pathfinder.goto(new goals.GoalNear(graveBlock.position.x, graveBlock.position.y, graveBlock.position.z, 1)),
+                                        15000, 'goto grave', () => bot.pathfinder.setGoal(null)
+                                    );
+                                    await bot.dig(graveBlock, true);
+                                    await new Promise(r => setTimeout(r, 1500));
+                                    bot.chat(`Recovered items from GraveStone.`);
+                                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'Successfully recovered GraveStone items.', environment: getEnvironmentContext() } });
+                                    await equipBestArmor();
+                                    await equipBestWeapon();
+                                    recovered = true;
+                                    break;
+                                }
                             }
-                        } else {
-                            bot.chat(`No GraveStone block type registered. Or grave already broken.`);
+                        }
+                        if (!recovered) {
+                            bot.chat(`Could not find a GraveStone block within 32 blocks.`);
+                            process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'GraveStone not found. Items may have despawned.', environment: getEnvironmentContext() } });
                         }
                     } catch (e) {
                         console.log(`[Actuator] Failed to recover grave: ${e.message}`);
@@ -2207,6 +2314,29 @@ async function processActionQueue() {
 
                 await equipBestArmor();
                 await equipBestWeapon();
+
+                // Issue 2: For ranged/airborne enemies prefer bow over sword.
+                const RANGED_ENEMIES = new Set(['blaze', 'ghast', 'phantom', 'ender_dragon', 'end_crystal']);
+                const isRanged = RANGED_ENEMIES.has(action.target.toLowerCase());
+                if (isRanged) {
+                    const bow = bot.inventory.items().find(i => i.name === 'bow');
+                    if (bow) {
+                        try { await bot.equip(bow, 'hand'); } catch (e) {}
+                    }
+                    // For Blazes: try to stand in/near water to negate fire damage
+                    if (action.target.toLowerCase() === 'blaze') {
+                        const waterId = bot.registry.blocksByName['water']?.id;
+                        if (waterId !== undefined) {
+                            const nearWater = bot.findBlock({ matching: waterId, maxDistance: 16 });
+                            if (nearWater) {
+                                try {
+                                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(nearWater.position.x, nearWater.position.y, nearWater.position.z, 1)), 10000, 'goto water for blaze', () => bot.pathfinder.setGoal(null));
+                                } catch (e) {}
+                            }
+                        }
+                    }
+                }
+
                 bot.chat(`Engaging ${action.target}...`);
 
                 while (killed < killQty && !currentCancelToken.cancelled && Date.now() - combatStart < combatMs) {
@@ -2229,6 +2359,7 @@ async function processActionQueue() {
                     }
 
                     // Combat sub-loop: attack until this entity dies
+                    let _shieldCooldown = 0; // ms timestamp until shield should lower
                     while (target.isValid && !currentCancelToken.cancelled) {
                         // Eat if health is critically low
                         if (bot.health < 6) {
@@ -2238,20 +2369,80 @@ async function processActionQueue() {
                                 await bot.equip(food, 'hand');
                                 await bot.consume().catch(() => {});
                                 await equipBestWeapon();
+                                if (isRanged) {
+                                    const bow = bot.inventory.items().find(i => i.name === 'bow');
+                                    if (bow) try { await bot.equip(bow, 'hand'); } catch(e) {}
+                                }
                             }
                         }
                         const dist = bot.entity.position.distanceTo(target.position);
-                        if (dist > 3.5) {
+
+                        // Issue 2: Detect incoming fireballs / projectiles and dodge
+                        const incomingProjectile = Object.values(bot.entities).find(e => {
+                            if (e === bot.entity || e === target) return false;
+                            const n = (e.name || '').toLowerCase();
+                            if (!n.includes('fireball') && !n.includes('arrow') && !n.includes('snowball')) return false;
+                            const projDist = e.position.distanceTo(bot.entity.position);
+                            return projDist < 8;
+                        });
+
+                        if (incomingProjectile) {
+                            // Raise shield immediately
+                            const shieldSlot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                            if (shieldSlot?.name === 'shield') {
+                                bot.activateItem(true);
+                                _shieldCooldown = Date.now() + 800;
+                            } else {
+                                // No shield — dodge sideways
+                                const dodgeAngle = Math.random() > 0.5 ? Math.PI / 2 : -Math.PI / 2;
+                                const yaw = bot.entity.yaw;
+                                const sx = bot.entity.position.x + 4 * Math.sin(yaw + dodgeAngle);
+                                const sz = bot.entity.position.z + 4 * Math.cos(yaw + dodgeAngle);
+                                bot.pathfinder.goto(new goals.GoalXZ(sx, sz)).catch(() => {});
+                            }
+                        } else if (Date.now() > _shieldCooldown) {
+                            bot.deactivateItem(); // Lower shield when no threat
+                        }
+
+                        if (isRanged && dist > 2) {
+                            // Ranged combat: keep some distance, look at target and charge bow
+                            const idealDist = 10;
+                            if (dist < 6) {
+                                // Back away from target
+                                const angle = Math.atan2(
+                                    bot.entity.position.z - target.position.z,
+                                    bot.entity.position.x - target.position.x
+                                );
+                                const backX = bot.entity.position.x + 6 * Math.cos(angle);
+                                const backZ = bot.entity.position.z + 6 * Math.sin(angle);
+                                bot.pathfinder.goto(new goals.GoalXZ(backX, backZ)).catch(() => {});
+                            } else if (dist > 20) {
+                                bot.pathfinder.setGoal(new goals.GoalFollow(target, 10), true);
+                            }
+                            await bot.lookAt(target.position.offset(0, target.height * 0.9, 0));
+                            // Charge bow: hold use, wait, release
+                            const hasBow = bot.heldItem?.name === 'bow';
+                            const hasArrows = bot.inventory.items().some(i => i.name === 'arrow');
+                            if (hasBow && hasArrows) {
+                                bot.activateItem();
+                                await new Promise(r => setTimeout(r, 900)); // ~1s full charge
+                                bot.deactivateItem();
+                            } else {
+                                // No bow — melee fallback
+                                if (dist <= 3.5) bot.attack(target);
+                            }
+                        } else if (dist > 3.5) {
                             bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
-                            bot.deactivateItem(); // Stop blocking to move faster
+                            if (Date.now() > _shieldCooldown) bot.deactivateItem();
                         } else {
                             bot.pathfinder.setGoal(null);
                             bot.attack(target);
 
-                            // If we have a shield, block right after attacking
+                            // Issue 2: Shield up right after melee hit (precise timing)
                             const offHand = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
-                            if (offHand && offHand.name === 'shield') {
+                            if (offHand?.name === 'shield') {
                                 bot.activateItem(true);
+                                _shieldCooldown = Date.now() + 500;
                             }
                         }
                         await new Promise(r => setTimeout(r, 600)); // ~attack cooldown
@@ -2573,9 +2764,19 @@ async function processActionQueue() {
                 }
 
                 if (tpTargetName) {
-                    console.log(`[find_land] Teleporting to player: ${tpTargetName}`);
-                    bot.chat(`/tp ${bot.username} ${tpTargetName}`);
-                    await new Promise(r => setTimeout(r, 3000));
+                    if (DEBUG) {
+                        console.log(`[find_land] DEBUG: Teleporting to player: ${tpTargetName}`);
+                        bot.chat(`/tp ${bot.username} ${tpTargetName}`);
+                        await new Promise(r => setTimeout(r, 3000));
+                    } else {
+                        console.log(`[find_land] Pathfinding to player: ${tpTargetName}`);
+                        const targetPlayer = bot.players[tpTargetName];
+                        if (targetPlayer?.entity) {
+                            try {
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalFollow(targetPlayer.entity, 3)), 30000, 'find_land follow', () => bot.pathfinder.setGoal(null));
+                            } catch (e) { console.log(`[find_land] Could not reach player: ${e.message}`); }
+                        }
+                    }
                     try { await bot.waitForChunksToLoad(); } catch (e) {}
                     await new Promise(r => setTimeout(r, 1000));
                 } else {
@@ -2583,10 +2784,12 @@ async function processActionQueue() {
                 }
 
                 // ── Step 2: Survival buffs + give oak_log for crafting test ───────
-                bot.chat(`/effect give ${bot.username} minecraft:resistance 600 10 true`);
-                bot.chat(`/effect give ${bot.username} minecraft:saturation 600 10 true`);
-                await new Promise(r => setTimeout(r, 200));
-                bot.chat(`/give ${bot.username} minecraft:oak_log 16`);
+                if (DEBUG) {
+                    bot.chat(`/effect give ${bot.username} minecraft:resistance 600 10 true`);
+                    bot.chat(`/effect give ${bot.username} minecraft:saturation 600 10 true`);
+                    await new Promise(r => setTimeout(r, 200));
+                    bot.chat(`/give ${bot.username} minecraft:oak_log 16`);
+                }
 
                 // ── Step 3: Find the ground Y from actual position post-TP ─────────
                 const pos0 = bot.entity.position;
