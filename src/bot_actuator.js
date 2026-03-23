@@ -96,7 +96,7 @@ bot._client.on('position', (packet) => {
     _serverPosCount++;
     const now = Date.now();
     if (now - _lastServerPosCheck > 10000) {
-        if (_serverPosCount > 0) {
+        if (_serverPosCount > 0 && process.env.DEBUG === 'true') {
             console.log(`[ServerPos] ${_serverPosCount} corrections in 10s. Pos=(${packet.x?.toFixed(1)}, ${packet.y?.toFixed(1)}, ${packet.z?.toFixed(1)})`);
         }
 
@@ -252,18 +252,20 @@ bot.on('spawn', async () => {
                     speed = Math.sqrt(dx * dx + dz * dz) / 5; // blocks per second over 5s
                 }
                 _lastDiagPos = pos.clone();
-                // Block inspection for physics debugging
-                const blockBelow = bot.blockAt(pos.offset(0, -1, 0));
-                const blockAt = bot.blockAt(pos);
-                const blockAbove = bot.blockAt(pos.offset(0, 1, 0));
-                const belowInfo = blockBelow ? `${blockBelow.name}(id=${blockBelow.id},type=${blockBelow.type},bb=${blockBelow.boundingBox})` : 'null';
-                const atInfo = blockAt ? `${blockAt.name}(id=${blockAt.id},type=${blockAt.type},bb=${blockAt.boundingBox})` : 'null';
-                // Log vanilla water id for comparison
-                const vanillaWaterId = bot.registry.blocksByName['water']?.id;
-                const fwd = bot.getControlState('forward');
-                const spr = bot.getControlState('sprint');
-                const jmp = bot.getControlState('jump');
-                console.log(`[MoveDiag] tick=${_moveDiagTick} pos=(${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}) speed=${speed.toFixed(2)}b/s fwd=${fwd} spr=${spr} jmp=${jmp} moving=${moving} mining=${mining} water=${inWater} ground=${onGround} goal=${!!bot.pathfinder.goal} below=${belowInfo} at=${atInfo} vanillaWater=${vanillaWaterId}`);
+                if (process.env.DEBUG === 'true') {
+                    // Block inspection for physics debugging
+                    const blockBelow = bot.blockAt(pos.offset(0, -1, 0));
+                    const blockAt = bot.blockAt(pos);
+                    const blockAbove = bot.blockAt(pos.offset(0, 1, 0));
+                    const belowInfo = blockBelow ? `${blockBelow.name}(id=${blockBelow.id},type=${blockBelow.type},bb=${blockBelow.boundingBox})` : 'null';
+                    const atInfo = blockAt ? `${blockAt.name}(id=${blockAt.id},type=${blockAt.type},bb=${blockAt.boundingBox})` : 'null';
+                    // Log vanilla water id for comparison
+                    const vanillaWaterId = bot.registry.blocksByName['water']?.id;
+                    const fwd = bot.getControlState('forward');
+                    const spr = bot.getControlState('sprint');
+                    const jmp = bot.getControlState('jump');
+                    console.log(`[MoveDiag] tick=${_moveDiagTick} pos=(${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}) speed=${speed.toFixed(2)}b/s fwd=${fwd} spr=${spr} jmp=${jmp} moving=${moving} mining=${mining} water=${inWater} ground=${onGround} goal=${!!bot.pathfinder.goal} below=${belowInfo} at=${atInfo} vanillaWater=${vanillaWaterId}`);
+                }
             }
         });
     }
@@ -274,13 +276,15 @@ bot.on('spawn', async () => {
     await new Promise(resolve => setTimeout(resolve, 1500));
 
     // Diagnostic: log raw block info around spawn point
-    try {
-        const sp = bot.entity.position.floored();
-        for (let dy = -3; dy <= 2; dy++) {
-            const b = bot.blockAt(sp.offset(0, dy, 0));
-            console.log(`[SpawnDiag] Y=${sp.y + dy}: name=${b?.name} type=${b?.type} stateId=${b?.stateId} bb=${b?.boundingBox}`);
-        }
-    } catch (e) {}
+    if (process.env.DEBUG === 'true') {
+        try {
+            const sp = bot.entity.position.floored();
+            for (let dy = -3; dy <= 2; dy++) {
+                const b = bot.blockAt(sp.offset(0, dy, 0));
+                console.log(`[SpawnDiag] Y=${sp.y + dy}: name=${b?.name} type=${b?.type} stateId=${b?.stateId} bb=${b?.boundingBox}`);
+            }
+        } catch (e) {}
+    }
 
     // ── Mark bot ready EARLY so test harness can start, then escape water in background ──
     bot.chat('Forge AI Player Ready.');
@@ -477,13 +481,15 @@ bot.on('spawn', async () => {
                             console.log(`[Actuator] Sending /tp to dry ground at (${standable.x}, ${standable.y + 1}, ${standable.z})...`);
                             await new Promise(resolve => setTimeout(resolve, 2000));
                             // Log blocks at new position to confirm solid ground
-                            try {
-                                const np = bot.entity.position.floored();
-                                for (let dy = -2; dy <= 1; dy++) {
-                                    const b2 = bot.blockAt(np.offset(0, dy, 0));
-                                    console.log(`[GroundDiag] Y=${np.y + dy}: name=${b2?.name} type=${b2?.type} bb=${b2?.boundingBox}`);
-                                }
-                            } catch (e) {}
+                            if (process.env.DEBUG === 'true') {
+                                try {
+                                    const np = bot.entity.position.floored();
+                                    for (let dy = -2; dy <= 1; dy++) {
+                                        const b2 = bot.blockAt(np.offset(0, dy, 0));
+                                        console.log(`[GroundDiag] Y=${np.y + dy}: name=${b2?.name} type=${b2?.type} bb=${b2?.boundingBox}`);
+                                    }
+                                } catch (e) {}
+                            }
                             console.log(`[Actuator] Now at (${bot.entity.position.x.toFixed(1)}, ${bot.entity.position.y.toFixed(1)}, ${bot.entity.position.z.toFixed(1)}) onGround=${bot.entity.onGround}`);
                             escaped = true;
                         } else {
@@ -1030,7 +1036,36 @@ async function ensureToolFor(block) {
     );
     if (hasGoodTool) { await equipBestTool(block); return; }
 
-    console.log(`[Actuator] No ${toolCat} found for ${block.name}. Auto-crafting wooden_${toolCat}...`);
+    const chestId = bot.registry.blocksByName.chest?.id;
+    if (chestId !== undefined) {
+        const chests = bot.findBlocks({ matching: chestId, maxDistance: 16, count: 5 });
+        for (const cpos of chests) {
+            if (currentCancelToken.cancelled) return;
+            try {
+                const chestBlock = bot.blockAt(cpos);
+                if (chestBlock) {
+                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(cpos.x, cpos.y, cpos.z, 2)), 10000, 'goto chest', () => bot.pathfinder.setGoal(null));
+                    const chestWindow = await bot.openContainer(chestBlock);
+                    const neededItems = [`iron_${toolCat}`, `stone_${toolCat}`, `wooden_${toolCat}`, 'iron_ingot', 'cobblestone'];
+                    for (const item of chestWindow.containerItems()) {
+                        if (neededItems.includes(item.name)) {
+                            await chestWindow.withdraw(item.type, null, item.name.endsWith(toolCat) ? 1 : Math.min(item.count, 64));
+                        }
+                    }
+                    bot.closeWindow(chestWindow);
+                }
+            } catch(e) {
+                console.log(`[Actuator] ensureToolFor chest scan: ${e.message}`);
+            }
+            // Re-check if we now have a tool after looting
+            const itemsPostChest = bot.inventory.items();
+            if (itemsPostChest.some(i => (hasRequirement && block.harvestTools[i.type]) || (!hasRequirement && i.name.endsWith(toolSuffix)))) {
+                await equipBestTool(block); return;
+            }
+        }
+    }
+
+    console.log(`[Actuator] No ${toolCat} found for ${block.name}. Auto-crafting tool...`);
     bot.chat(`Need a ${toolCat}. Crafting one...`);
 
     const countBy = (set) => bot.inventory.items().filter(i => set.has(i.name)).reduce((s, i) => s + i.count, 0);
@@ -1112,7 +1147,11 @@ async function ensureToolFor(block) {
 
     if (currentCancelToken.cancelled) return;
     if (craftingTable) {
-        const toolName = `wooden_${toolCat}`;
+        let toolName = `wooden_${toolCat}`;
+        const invNames = new Set(bot.inventory.items().map(i => i.name));
+        if (invNames.has('iron_ingot')) { toolName = `iron_${toolCat}`; }
+        else if (invNames.has('cobblestone')) { toolName = `stone_${toolCat}`; }
+
         const toolId = bot.registry.itemsByName[toolName]?.id;
         if (toolId !== undefined) {
             const toolR = bot.recipesFor(toolId, null, 1, true)[0];
@@ -1461,15 +1500,38 @@ async function processActionQueue() {
                                 const maxDigMs = Math.max(8000, digTimeMs + 3000);
 
                                 await withTimeout(bot.dig(targetBlock, true), maxDigMs, `dig ${action.target}`, () => {});
-                                // VeinMiner may chain-break many more blocks. Wait for the cascade to settle
-                                // (EventDebouncer fires cascading_wait_end after 500 ms of no new breaks).
-                                if (debouncer && debouncer.isCascadingWait) {
-                                    await new Promise(resolve => {
-                                        const onEnd = () => resolve();
-                                        debouncer.once('cascading_wait_end', onEnd);
-                                        setTimeout(() => { debouncer.removeListener('cascading_wait_end', onEnd); resolve(); }, 5000);
-                                    });
+
+                                let veinMined = 1;
+                                const queue = [blockPos];
+                                const visited = new Set([`${blockPos.x},${blockPos.y},${blockPos.z}`]);
+                                const offsets = [{x:1,y:0,z:0}, {x:-1,y:0,z:0}, {x:0,y:1,z:0}, {x:0,y:-1,z:0}, {x:0,y:0,z:1}, {x:0,y:0,z:-1}];
+
+                                while(queue.length > 0 && veinMined < 64 && collected + veinMined < quantity && !currentCancelToken.cancelled) {
+                                    const curr = queue.shift();
+                                    for (const off of offsets) {
+                                        const nx = curr.x + off.x, ny = curr.y + off.y, nz = curr.z + off.z;
+                                        const key = `${nx},${ny},${nz}`;
+                                        if (!visited.has(key)) {
+                                            visited.add(key);
+                                            const adjBlock = bot.blockAt(new Vec3(nx, ny, nz));
+                                            if (adjBlock && searchIds.includes(adjBlock.type)) {
+                                                const held = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+                                                if (held && held.maxDurability) {
+                                                    const usesLeft = held.maxDurability - (held.durabilityUsed || 0);
+                                                    if (usesLeft <= 5) break;
+                                                }
+                                                try {
+                                                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(nx, ny, nz, 2)), 5000, 'vein goto', () => bot.pathfinder.setGoal(null));
+                                                    await bot.lookAt(adjBlock.position.offset(0.5, 0.5, 0.5));
+                                                    await withTimeout(bot.dig(adjBlock, true), maxDigMs, 'vein dig', () => {});
+                                                    queue.push(adjBlock.position);
+                                                    veinMined++;
+                                                } catch(e) {}
+                                            }
+                                        }
+                                    }
                                 }
+
                                 await new Promise(r => setTimeout(r, 600)); // pause for item drop + auto-collect
 
                                 // Issue 4: count via inventory delta, not dig calls.
