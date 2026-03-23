@@ -39,6 +39,16 @@ Entries:
 
 - Added find_land action (/spreadplayers 0 0 0 2000 false <bot>) to scatter bot to dry land before live tests; test_live.js now calls find_land after waitForReady and uses land base coords for return test | src/bot_actuator.js, test_live.js --claude --BUGFIX-20260322-001
 
+## 2026-03-24 — TASK-20260324-001: Combat & Navigation Robustness
+
+### Changes
+- **bot_actuator.js**: 5 improvements, all tests passing (6/6).
+  1. **Death recovery respawn fallback**: 3s setTimeout after spawn scans inventory for gravestone death-marker items (coordinate pattern matching) and falls back to `data/last_death.json` if <15min old. Auto-queues `recover_gravestone` when no recover action pending.
+  2. **navigate_portal enhanced**: checks internal waypoints by keyword first, expands search radius to 128/256 blocks, then explores cardinal directions up to 512 blocks. Saves found portal as waypoint on success.
+  3. **goto XYZ timeout 60s→120s**: Distant targets (>64 XZ blocks) now XZ-step to within 32 blocks before final XYZ approach — avoids A* 3D planning timeout on huge routes.
+  4. **Combat shield improvements**: Shield equip retry loop pre-battle; `_shieldUntil` replaces `_shieldCooldown`; melee adds post-attack sideways strafe; projectile detection uses velocity dot-product to confirm inbound trajectory.
+  5. **Ranged combat non-blocking bow charge**: `_bowCharging` state tracks charge timer per-tick; IDEAL_MIN/MAX engagement range; LoS raycast before shooting; repositions if no LoS.
+
 ## 2026-03-23 — TASK-20260323-001: Navigation & Waypoint Enhancements
 
 ### Changes

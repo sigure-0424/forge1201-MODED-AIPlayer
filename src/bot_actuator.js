@@ -430,6 +430,46 @@ bot.on('spawn', async () => {
     _pendingIpcActions = [];
     if (actionQueue.length > 0) processActionQueue();
 
+    // Issue 1: After respawn, check inventory for death-marker items (gravestone mods often
+    // place a "Death Point" compass or similar) and also try data/last_death.json if no
+    // recover_gravestone is already queued.
+    setTimeout(() => {
+        if (actionQueue.some(a => a.action === 'recover_gravestone')) return; // already queued
+
+        // Scan inventory for items whose display name contains coordinates.
+        try {
+            for (const item of bot.inventory.items()) {
+                const rawName = item.nbt?.value?.display?.value?.Name?.value || item.customName || item.displayName || '';
+                const plain = rawName.replace(/§[0-9a-fk-or]/gi, '').trim();
+                // Match "X: N Y: N Z: N" format (common in Grave mods)
+                let m = plain.match(/X[\s:]+(-?\d+)[^\d-]*Y[\s:]+(-?\d+)[^\d-]*Z[\s:]+(-?\d+)/i);
+                // Match three consecutive integers separated by spaces or commas
+                if (!m) m = plain.match(/(-?\d+)[,\s]+(-?\d+)[,\s]+(-?\d+)/);
+                if (m) {
+                    const recoverPos = { x: +m[1], y: +m[2], z: +m[3], dimension: _lastSafeDim || 'overworld' };
+                    console.log(`[Actuator] Death marker item found: "${plain}" → ${JSON.stringify(recoverPos)}`);
+                    bot.chat(`Found death marker! Navigating to X:${recoverPos.x} Y:${recoverPos.y} Z:${recoverPos.z}...`);
+                    actionQueue.unshift({ action: 'recover_gravestone', target: recoverPos });
+                    processActionQueue();
+                    return;
+                }
+            }
+        } catch (e) {}
+
+        // Fallback: check last_death.json (useful after process restart)
+        try {
+            if (fs.existsSync(LAST_DEATH_FILE)) {
+                const data = JSON.parse(fs.readFileSync(LAST_DEATH_FILE, 'utf8'));
+                const minsAgo = (Date.now() - new Date(data.time || 0).getTime()) / 60000;
+                if (minsAgo < 15) {
+                    console.log(`[Actuator] Restoring recover_gravestone from last_death.json (${minsAgo.toFixed(1)} min ago)`);
+                    actionQueue.unshift({ action: 'recover_gravestone', target: data });
+                    processActionQueue();
+                }
+            }
+        } catch (e) {}
+    }, 3000); // wait 3s for inventory to populate after respawn
+
     // Issue 4: Auto-equip best gear when idle (runs every 15s).
     // Ensures any armor/weapons acquired via crafting, looting, or trading get equipped.
     setInterval(() => {
@@ -1756,26 +1796,68 @@ async function processActionQueue() {
                     continue;
                 }
 
-                // Per-waypoint timeout: 60s gives sprint-jumping bot time for 64 blocks
-                // even on complex terrain.  The outer action timeout is separate.
-                const wpTimeout = Math.max(timeoutMs, 60000);
+                // Per-waypoint timeout: 120s minimum.
+                // At worst-case movement speed (~2 b/s through water/climbing) a 64-block
+                // step takes 32s; 120s gives 3.7× safety margin without masking real hangs.
+                const wpTimeout = Math.max(timeoutMs, 120000);
 
                 if (destY !== undefined) {
                     bot.chat(`Moving to X:${Math.round(destX)}, Y:${destY}, Z:${Math.round(destZ)}.`);
-                    // Goal 2: If destination is significantly below current Y, try without
-                    // digging first to prefer natural paths (caves, stairs, cliff edges).
                     const curY = bot.entity.position.y;
-                    if (destY < curY - 10 && movements) {
+                    const xzDist3 = Math.sqrt((destX - bot.entity.position.x) ** 2 + (destZ - bot.entity.position.z) ** 2);
+
+                    // Issue 3: For distant XYZ targets, use XZ stepping first to avoid
+                    // trying to A*-plan a single huge 3D route (which times out).
+                    // Only do the precise XYZ approach for the last 32 blocks.
+                    if (xzDist3 > 64) {
+                        // Phase 1: navigate to XZ vicinity using step loop
+                        let lr3 = xzDist3, sk3 = 0;
+                        while (!currentCancelToken.cancelled) {
+                            const cx3 = bot.entity.position.x, cz3 = bot.entity.position.z;
+                            const rdx3 = destX - cx3, rdz3 = destZ - cz3;
+                            const rem3 = Math.sqrt(rdx3 * rdx3 + rdz3 * rdz3);
+                            if (rem3 <= 32) break;
+                            if (rem3 >= lr3 - 3) {
+                                if (++sk3 >= 4) {
+                                    bot.setControlState('jump', true);
+                                    await new Promise(r => setTimeout(r, 400));
+                                    bot.setControlState('jump', false);
+                                    sk3 = 0; lr3 = rem3;
+                                }
+                            } else { sk3 = 0; }
+                            lr3 = rem3;
+                            const a3 = Math.atan2(rdz3, rdx3);
+                            const wx3 = rem3 > WAYPOINT_STEP ? cx3 + WAYPOINT_STEP * Math.cos(a3) : destX;
+                            const wz3 = rem3 > WAYPOINT_STEP ? cz3 + WAYPOINT_STEP * Math.sin(a3) : destZ;
+                            try {
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(wx3, wz3)), wpTimeout, 'goto XYZ step', () => bot.pathfinder.setGoal(null));
+                            } catch (e) { console.log(`[Actuator] XYZ step error: ${e.message}`); }
+                        }
+                        // Phase 2: final XYZ approach (with no-dig preference if going down)
+                        if (!currentCancelToken.cancelled) {
+                            if (destY < curY - 10 && movements) {
+                                const savedCanDig = movements.canDig;
+                                movements.canDig = false;
+                                bot.pathfinder.setMovements(movements);
+                                try {
+                                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'final XYZ no-dig', () => bot.pathfinder.setGoal(null));
+                                } catch (e) {}
+                                movements.canDig = savedCanDig;
+                                bot.pathfinder.setMovements(movements);
+                            }
+                            if (!currentCancelToken.cancelled) {
+                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'final XYZ', () => bot.pathfinder.setGoal(null)).catch(() => {});
+                            }
+                        }
+                    } else if (destY < curY - 10 && movements) {
                         const savedCanDig = movements.canDig;
                         movements.canDig = false;
                         bot.pathfinder.setMovements(movements);
                         let noDigOk = false;
                         try {
-                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), Math.min(wpTimeout, 30000), 'goto XYZ no-dig', () => bot.pathfinder.setGoal(null));
+                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), Math.min(wpTimeout, 45000), 'goto XYZ no-dig', () => bot.pathfinder.setGoal(null));
                             noDigOk = true;
-                        } catch (e) {
-                            // No natural path found — restore digging and retry
-                        }
+                        } catch (e) {}
                         movements.canDig = savedCanDig;
                         bot.pathfinder.setMovements(movements);
                         if (!noDigOk && !currentCancelToken.cancelled) {
@@ -2315,29 +2397,33 @@ async function processActionQueue() {
                 await equipBestArmor();
                 await equipBestWeapon();
 
-                // Issue 2: For ranged/airborne enemies prefer bow over sword.
+                // Issues 4 & 5: Classify target and select weapon before combat.
                 const RANGED_ENEMIES = new Set(['blaze', 'ghast', 'phantom', 'ender_dragon', 'end_crystal']);
                 const isRanged = RANGED_ENEMIES.has(action.target.toLowerCase());
-                if (isRanged) {
+
+                // Equip bow for aerial enemies if we have one + arrows; sword otherwise.
+                const hasBow = bot.inventory.items().some(i => i.name === 'bow');
+                const hasArrows = bot.inventory.items().some(i => i.name === 'arrow');
+                if (isRanged && hasBow && hasArrows) {
                     const bow = bot.inventory.items().find(i => i.name === 'bow');
-                    if (bow) {
-                        try { await bot.equip(bow, 'hand'); } catch (e) {}
-                    }
-                    // For Blazes: try to stand in/near water to negate fire damage
-                    if (action.target.toLowerCase() === 'blaze') {
-                        const waterId = bot.registry.blocksByName['water']?.id;
-                        if (waterId !== undefined) {
-                            const nearWater = bot.findBlock({ matching: waterId, maxDistance: 16 });
-                            if (nearWater) {
-                                try {
-                                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(nearWater.position.x, nearWater.position.y, nearWater.position.z, 1)), 10000, 'goto water for blaze', () => bot.pathfinder.setGoal(null));
-                                } catch (e) {}
-                            }
-                        }
+                    try { await bot.equip(bow, 'hand'); } catch (e) {}
+                }
+                // Ensure shield is in off-hand
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    const shield = bot.inventory.items().find(i => i.name === 'shield');
+                    if (!shield) break;
+                    const offSlot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                    if (offSlot?.name === 'shield') break;
+                    try { await bot.equip(shield, 'off-hand'); break; } catch (e) {
+                        await new Promise(r => setTimeout(r, 200));
                     }
                 }
 
                 bot.chat(`Engaging ${action.target}...`);
+
+                // Bow charge state tracking (non-blocking)
+                let _bowChargeStart = 0;
+                let _bowCharging = false;
 
                 while (killed < killQty && !currentCancelToken.cancelled && Date.now() - combatStart < combatMs) {
                     // Find nearest living target
@@ -2358,94 +2444,124 @@ async function processActionQueue() {
                         break;
                     }
 
-                    // Combat sub-loop: attack until this entity dies
-                    let _shieldCooldown = 0; // ms timestamp until shield should lower
+                    // Issues 4 & 5: Combat sub-loop — non-blocking movement + reactive defense.
+                    let _shieldUntil = 0;
+                    let _lastStrafe = 0;
+                    let _strafeSign = 1;
                     while (target.isValid && !currentCancelToken.cancelled) {
-                        // Eat if health is critically low
-                        if (bot.health < 6) {
+                        const now = Date.now();
+
+                        // ── Health check ──────────────────────────────────────────────
+                        if (bot.health < 8) {
                             const food = getBestFoodItem();
                             if (food) {
                                 bot.pathfinder.setGoal(null);
-                                await bot.equip(food, 'hand');
-                                await bot.consume().catch(() => {});
-                                await equipBestWeapon();
-                                if (isRanged) {
+                                if (_bowCharging) { bot.deactivateItem(); _bowCharging = false; }
+                                try {
+                                    await bot.equip(food, 'hand');
+                                    await bot.consume();
+                                } catch (e) {}
+                                if (isRanged && hasBow && hasArrows) {
                                     const bow = bot.inventory.items().find(i => i.name === 'bow');
                                     if (bow) try { await bot.equip(bow, 'hand'); } catch(e) {}
+                                } else {
+                                    await equipBestWeapon();
                                 }
                             }
                         }
-                        const dist = bot.entity.position.distanceTo(target.position);
 
-                        // Issue 2: Detect incoming fireballs / projectiles and dodge
-                        const incomingProjectile = Object.values(bot.entities).find(e => {
+                        const dist = bot.entity.position.distanceTo(target.position);
+                        const botPos = bot.entity.position;
+
+                        // ── Issue 4: Projectile detection ─────────────────────────────
+                        const incomingProj = Object.values(bot.entities).find(e => {
                             if (e === bot.entity || e === target) return false;
-                            const n = (e.name || '').toLowerCase();
-                            if (!n.includes('fireball') && !n.includes('arrow') && !n.includes('snowball')) return false;
-                            const projDist = e.position.distanceTo(bot.entity.position);
-                            return projDist < 8;
+                            const n = (e.name || e.displayName || '').toLowerCase();
+                            const isProj = n.includes('arrow') || n.includes('fireball') ||
+                                           n.includes('snowball') || n.includes('shulker_bullet');
+                            if (!isProj) return false;
+                            if (e.position.distanceTo(botPos) > 10) return false;
+                            const vel = e.velocity;
+                            if (!vel) return true;
+                            const toBot = botPos.minus(e.position).normalize();
+                            const dot = vel.x * toBot.x + vel.y * toBot.y + vel.z * toBot.z;
+                            return dot > 0;
                         });
 
-                        if (incomingProjectile) {
-                            // Raise shield immediately
-                            const shieldSlot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
-                            if (shieldSlot?.name === 'shield') {
+                        if (incomingProj) {
+                            const offSlot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                            if (offSlot?.name === 'shield') {
                                 bot.activateItem(true);
-                                _shieldCooldown = Date.now() + 800;
+                                _shieldUntil = now + 1000;
                             } else {
-                                // No shield — dodge sideways
-                                const dodgeAngle = Math.random() > 0.5 ? Math.PI / 2 : -Math.PI / 2;
-                                const yaw = bot.entity.yaw;
-                                const sx = bot.entity.position.x + 4 * Math.sin(yaw + dodgeAngle);
-                                const sz = bot.entity.position.z + 4 * Math.cos(yaw + dodgeAngle);
+                                // No shield — strafe perpendicular
+                                if (now - _lastStrafe > 600) {
+                                    _strafeSign *= -1;
+                                    _lastStrafe = now;
+                                }
+                                const dodgeYaw = bot.entity.yaw + (_strafeSign * Math.PI / 2);
+                                const sx = botPos.x + 4 * Math.sin(dodgeYaw);
+                                const sz = botPos.z + 4 * Math.cos(dodgeYaw);
                                 bot.pathfinder.goto(new goals.GoalXZ(sx, sz)).catch(() => {});
                             }
-                        } else if (Date.now() > _shieldCooldown) {
-                            bot.deactivateItem(); // Lower shield when no threat
+                        } else if (now > _shieldUntil) {
+                            bot.deactivateItem();
                         }
 
-                        if (isRanged && dist > 2) {
-                            // Ranged combat: keep some distance, look at target and charge bow
-                            const idealDist = 10;
-                            if (dist < 6) {
-                                // Back away from target
-                                const angle = Math.atan2(
-                                    bot.entity.position.z - target.position.z,
-                                    bot.entity.position.x - target.position.x
-                                );
-                                const backX = bot.entity.position.x + 6 * Math.cos(angle);
-                                const backZ = bot.entity.position.z + 6 * Math.sin(angle);
-                                bot.pathfinder.goto(new goals.GoalXZ(backX, backZ)).catch(() => {});
-                            } else if (dist > 20) {
-                                bot.pathfinder.setGoal(new goals.GoalFollow(target, 10), true);
-                            }
-                            await bot.lookAt(target.position.offset(0, target.height * 0.9, 0));
-                            // Charge bow: hold use, wait, release
-                            const hasBow = bot.heldItem?.name === 'bow';
-                            const hasArrows = bot.inventory.items().some(i => i.name === 'arrow');
-                            if (hasBow && hasArrows) {
-                                bot.activateItem();
-                                await new Promise(r => setTimeout(r, 900)); // ~1s full charge
-                                bot.deactivateItem();
+                        // ── Issue 5: Movement / attack decision ─────────────────────
+                        if (isRanged) {
+                            const IDEAL_MIN = 6, IDEAL_MAX = 16;
+                            if (dist > IDEAL_MAX) {
+                                bot.pathfinder.setGoal(new goals.GoalFollow(target, IDEAL_MAX), true);
+                            } else if (dist < IDEAL_MIN) {
+                                const angle = Math.atan2(botPos.z - target.position.z, botPos.x - target.position.x);
+                                const bx = botPos.x + 8 * Math.cos(angle);
+                                const bz = botPos.z + 8 * Math.sin(angle);
+                                bot.pathfinder.goto(new goals.GoalXZ(bx, bz)).catch(() => {});
                             } else {
-                                // No bow — melee fallback
-                                if (dist <= 3.5) bot.attack(target);
+                                bot.pathfinder.setGoal(null);
+                                const targetEye = target.position.offset(0, (target.height || 1.8) * 0.9, 0);
+                                await bot.lookAt(targetEye);
+                                const currentBow = bot.heldItem?.name === 'bow';
+                                const currentArrows = bot.inventory.items().some(i => i.name === 'arrow');
+                                if (currentBow && currentArrows && !_bowCharging) {
+                                    bot.activateItem();
+                                    _bowChargeStart = now;
+                                    _bowCharging = true;
+                                }
+                                if (_bowCharging && now - _bowChargeStart >= 900) {
+                                    bot.deactivateItem();
+                                    _bowCharging = false;
+                                }
                             }
-                        } else if (dist > 3.5) {
-                            bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
-                            if (Date.now() > _shieldCooldown) bot.deactivateItem();
                         } else {
-                            bot.pathfinder.setGoal(null);
-                            bot.attack(target);
+                            // Melee combat — close in and strafe to dodge
+                            if (dist > 3) {
+                                bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+                            } else {
+                                bot.pathfinder.setGoal(null);
+                                await bot.lookAt(target.position.offset(0, (target.height || 1.8) * 0.5, 0));
+                                bot.attack(target);
 
-                            // Issue 2: Shield up right after melee hit (precise timing)
-                            const offHand = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
-                            if (offHand?.name === 'shield') {
-                                bot.activateItem(true);
-                                _shieldCooldown = Date.now() + 500;
+                                // Issue 4: Shield up immediately after attack
+                                const offSlot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                                if (offSlot?.name === 'shield') {
+                                    bot.activateItem(true);
+                                    _shieldUntil = now + 600;
+                                }
+
+                                // Issue 4: Strafe after attacking to avoid next hit
+                                if (now - _lastStrafe > 500) {
+                                    _strafeSign *= -1;
+                                    _lastStrafe = now;
+                                }
+                                const strafeYaw = bot.entity.yaw + (_strafeSign * Math.PI / 2);
+                                const stx = botPos.x + 2 * Math.sin(strafeYaw);
+                                const stz = botPos.z + 2 * Math.cos(strafeYaw);
+                                bot.pathfinder.goto(new goals.GoalXZ(stx, stz)).catch(() => {});
                             }
                         }
-                        await new Promise(r => setTimeout(r, 600)); // ~attack cooldown
+                        await new Promise(r => setTimeout(r, 200)); // shorter tick = more reactive
                     }
 
                     if (!target.isValid) {
@@ -2613,23 +2729,78 @@ async function processActionQueue() {
             } else if (action.action === 'navigate_portal') {
                 const portalName = action.target === 'end' ? 'end_portal' : 'nether_portal';
                 const portalBlockId = bot.registry.blocksByName[portalName]?.id;
-                const portalBlock = portalBlockId !== undefined
-                    ? bot.findBlock({ matching: portalBlockId, maxDistance: 64 })
+                const portalLabel = action.target === 'end' ? 'End' : 'Nether';
+
+                // Helper: scan for portal block up to given radius
+                const findPortal = (radius) => portalBlockId !== undefined
+                    ? bot.findBlock({ matching: portalBlockId, maxDistance: radius })
                     : null;
 
+                let portalBlock = findPortal(64);
+
+                // Issue 2a: check internal waypoints for a known portal position
                 if (!portalBlock) {
-                    bot.chat(`No ${action.target || 'nether'} portal visible.`);
-                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Portal not found. Explore to locate one.`, environment: getEnvironmentContext() } });
+                    const portalKeywords = [action.target || 'nether', 'portal'];
+                    const wp = loadWaypoints().find(w => {
+                        const n = w.name.toLowerCase();
+                        return portalKeywords.some(k => n.includes(k));
+                    });
+                    if (wp) {
+                        bot.chat(`Traveling to waypoint "${wp.name}" to reach portal...`);
+                        try {
+                            await withTimeout(
+                                bot.pathfinder.goto(new goals.GoalNear(wp.x, wp.y, wp.z, 4)),
+                                120000, 'goto portal waypoint', () => bot.pathfinder.setGoal(null)
+                            );
+                        } catch (e) { console.log(`[Actuator] Portal waypoint travel: ${e.message}`); }
+                        portalBlock = findPortal(32);
+                    }
+                }
+
+                // Issue 2b: expand search radius gradually
+                if (!portalBlock) {
+                    for (const radius of [128, 256]) {
+                        portalBlock = findPortal(radius);
+                        if (portalBlock) {
+                            console.log(`[Actuator] Found ${portalLabel} portal at radius ${radius}.`);
+                            break;
+                        }
+                    }
+                }
+
+                // Issue 2c: explore in cardinal directions to find portal (max 512 blocks)
+                if (!portalBlock && !currentCancelToken.cancelled) {
+                    bot.chat(`No ${portalLabel} portal nearby. Exploring to find one...`);
+                    const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+                    outer: for (const [edx, edz] of dirs) {
+                        for (let dist = 64; dist <= 512; dist += 64) {
+                            if (currentCancelToken.cancelled) break outer;
+                            const ex = bot.entity.position.x + edx * dist;
+                            const ez = bot.entity.position.z + edz * dist;
+                            try {
+                                await withTimeout(
+                                    bot.pathfinder.goto(new goals.GoalXZ(ex, ez)),
+                                    60000, 'portal explore step', () => bot.pathfinder.setGoal(null)
+                                );
+                            } catch (e) { /* terrain obstacle, continue */ }
+                            portalBlock = findPortal(48);
+                            if (portalBlock) break outer;
+                        }
+                    }
+                }
+
+                if (!portalBlock) {
+                    bot.chat(`Could not find a ${portalLabel} portal.`);
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `${portalLabel} portal not found after searching. Build one or add a waypoint named "${action.target || 'nether'}_portal".`, environment: getEnvironmentContext() } });
                 } else {
-                    bot.chat(`Entering ${action.target || 'nether'} portal...`);
-                    await withTimeout(bot.pathfinder.goto(new goals.GoalNear(portalBlock.position.x, portalBlock.position.y, portalBlock.position.z, 1)), timeoutMs, 'goto portal', () => bot.pathfinder.setGoal(null));
-                    const currentDim = bot.game.dimension;
-                    // Walk into the portal and wait for teleportation (up to 10s)
+                    bot.chat(`Found ${portalLabel} portal. Entering...`);
                     try {
-                        // Goal 6: Force the bot to walk into the portal block
+                        await withTimeout(bot.pathfinder.goto(new goals.GoalNear(portalBlock.position.x, portalBlock.position.y, portalBlock.position.z, 1)), Math.max(timeoutMs, 60000), 'goto portal', () => bot.pathfinder.setGoal(null));
+                    } catch (e) { /* close enough */ }
+                    const currentDim = bot.game.dimension;
+                    try {
                         bot.lookAt(portalBlock.position.offset(0.5, 0.5, 0.5));
                         bot.setControlState('forward', true);
-
                         await withTimeout(new Promise(resolve => {
                             const check = setInterval(() => {
                                 if (bot.game.dimension !== currentDim) {
@@ -2638,7 +2809,14 @@ async function processActionQueue() {
                                     resolve();
                                 }
                             }, 500);
-                        }), 10000, 'portal teleport');
+                        }), 12000, 'portal teleport');
+                        // Save portal location as waypoint for future use
+                        const waypoints = loadWaypoints();
+                        const wpName = `${action.target || 'nether'}_portal`;
+                        if (!waypoints.find(w => w.name === wpName)) {
+                            waypoints.push({ name: wpName, x: Math.round(portalBlock.position.x), y: Math.round(portalBlock.position.y), z: Math.round(portalBlock.position.z), dimension: bot.game.dimension });
+                            saveWaypoints(waypoints);
+                        }
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Entered portal. Now in ${bot.game.dimension}.`, environment: getEnvironmentContext() } });
                     } catch (e) {
                         bot.setControlState('forward', false);
