@@ -454,14 +454,20 @@ bot.on('spawn', async () => {
         try {
             for (const item of bot.inventory.items()) {
                 const rawName = item.nbt?.value?.display?.value?.Name?.value || item.customName || item.displayName || item.name || '';
-                const plain = rawName.replace(/§[0-9a-fk-or]/gi, '').trim();
+                let plain = rawName.replace(/§[0-9a-fk-or]/gi, '').trim();
+
+                if (item.nbt) {
+                    try {
+                        plain += ' ' + JSON.stringify(item.nbt).replace(/§[0-9a-fk-or]/gi, '');
+                    } catch (e) {}
+                }
 
                 let isMarker = DEATH_MARKER_PATTERNS.some(p => p.test(plain));
                 let m = plain.match(/X[\s:]+(-?\d+)[^\d-]*Y[\s:]+(-?\d+)[^\d-]*Z[\s:]+(-?\d+)/i);
                 if (!m) m = plain.match(/(-?\d+)[,\s]+(-?\d+)[,\s]+(-?\d+)/);
 
-                if (m) return { item, plain, coords: { x: +m[1], y: +m[2], z: +m[3] } };
-                if (isMarker) return { item, plain, coords: null };
+                if (m) return { item, plain: rawName.replace(/§[0-9a-fk-or]/gi, '').trim(), coords: { x: +m[1], y: +m[2], z: +m[3] } };
+                if (isMarker) return { item, plain: rawName.replace(/§[0-9a-fk-or]/gi, '').trim(), coords: null };
             }
         } catch (e) {}
         return null;
@@ -1637,8 +1643,9 @@ async function processActionQueue() {
                                     const graveBlock = bot.blockAt(graveBlocks[0]);
                                     await withTimeout(
                                         bot.pathfinder.goto(new goals.GoalNear(graveBlock.position.x, graveBlock.position.y, graveBlock.position.z, 1)),
-                                        15000, 'goto grave', () => bot.pathfinder.setGoal(null)
+                                        60000, 'goto grave', () => bot.pathfinder.setGoal(null)
                                     );
+                                    await equipBestTool(graveBlock);
                                     await bot.dig(graveBlock, true);
                                     await new Promise(r => setTimeout(r, 1500));
                                     bot.chat(`Recovered items from GraveStone.`);
@@ -1898,8 +1905,7 @@ async function processActionQueue() {
                                 } catch (e) {}
                                 movements.canDig = savedCanDig;
                                 bot.pathfinder.setMovements(movements);
-                            }
-                            if (!currentCancelToken.cancelled) {
+                            } else if (!currentCancelToken.cancelled) {
                                 await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'final XYZ', () => bot.pathfinder.setGoal(null)).catch(() => {});
                             }
                         }
@@ -1907,16 +1913,11 @@ async function processActionQueue() {
                         const savedCanDig = movements.canDig;
                         movements.canDig = false;
                         bot.pathfinder.setMovements(movements);
-                        let noDigOk = false;
                         try {
                             await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), Math.min(wpTimeout, 45000), 'goto XYZ no-dig', () => bot.pathfinder.setGoal(null));
-                            noDigOk = true;
                         } catch (e) {}
                         movements.canDig = savedCanDig;
                         bot.pathfinder.setMovements(movements);
-                        if (!noDigOk && !currentCancelToken.cancelled) {
-                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'goto XYZ', () => bot.pathfinder.setGoal(null));
-                        }
                     } else {
                         await withTimeout(bot.pathfinder.goto(new goals.GoalNear(destX, destY, destZ, 2)), wpTimeout, 'goto XYZ', () => bot.pathfinder.setGoal(null));
                     }
@@ -2836,10 +2837,9 @@ async function processActionQueue() {
                 const isConnected = () => bot._client?.socket?.writable === true;
 
                 // Scan all currently loaded chunks for the portal block.
-                // maxDistance 256 covers every loaded chunk since the server only sends
-                // chunks within view distance (~160 blocks); this cannot return false positives.
+                // Max distance 64 to prevent blocking the event loop for too long.
                 const findPortalAll = () => portalBlockId !== undefined
-                    ? bot.findBlock({ matching: portalBlockId, maxDistance: 256 })
+                    ? bot.findBlock({ matching: portalBlockId, maxDistance: 64 })
                     : null;
 
                 // Yield to the event loop before the synchronous findBlock scan.
