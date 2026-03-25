@@ -26,5 +26,12 @@
     "y": 67,
     "z": -243,
     "dimension": "the_nether"
+  },
+  {
+    "name": "nether_fortress",
+    "x": -528,
+    "y": 67,
+    "z": -244,
+    "dimension": "the_nether"
   }
 ]

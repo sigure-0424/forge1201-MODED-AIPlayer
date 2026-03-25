@@ -173,7 +173,8 @@ bot.on('spawn', async () => {
 
     movements = new Movements(bot, mcData);
     movements.canDig = true;
-    // Issue 6: Prevent bot from falling off 1-block bridges when pathfinding
+    // Sprinting sends rapid movement packets that can trigger Forge server anti-cheat (EPIPE kick).
+    // Walk speed (~4.3 b/s) is sufficient on flat terrain and safer on all terrain types.
     movements.allowSprinting = false;
     movements.liquidCost = 3;
     movements.allow1by1towers = true;
@@ -702,8 +703,8 @@ bot.on('spawn', async () => {
                 isExecuting,
                 actionQueue: [...actionQueue]
             };
-            fs.writeFile(path.join(process.cwd(), 'ai_debug.json'), JSON.stringify(debugState, null, 2), () => {});
-            fs.appendFile(path.join(process.cwd(), 'ai_history.log'), JSON.stringify(debugState) + '\n', () => {});
+            fs.writeFile(path.join(process.cwd(), `ai_debug_${botId}.json`), JSON.stringify(debugState, null, 2), () => {});
+            fs.appendFile(path.join(process.cwd(), `ai_history_${botId}.log`), JSON.stringify(debugState) + '\n', () => {});
 
             // Issue 3: Continuously track last safe position for accurate death recovery.
             // Only update when on ground and healthy (not during a fall or combat death spiral).
@@ -1501,7 +1502,7 @@ async function ensureToolFor(block) {
                 if (currentCancelToken.cancelled) return;
                 const logBlockId = bot.registry.blocksByName[logName]?.id;
                 if (!logBlockId) continue;
-                const logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 32, count: logsNeeded });
+                let logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 32, count: logsNeeded });
                 // Try wider radii if not found close by
                 if (logBlocks.length === 0) logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 64, count: logsNeeded });
                 if (logBlocks.length === 0) logBlocks = bot.findBlocks({ matching: logBlockId, maxDistance: 128, count: logsNeeded });
@@ -2401,7 +2402,7 @@ async function processActionQueue() {
                 if (!currentCancelToken.cancelled) {
                     const finalDist = Math.sqrt(
                         Math.pow(destX - bot.entity.position.x, 2) +
-                        Math.pow((action.z || 0) - bot.entity.position.z, 2)
+                        Math.pow(destZ - bot.entity.position.z, 2)
                     );
                     // Issue 4: status feedback on completion
                     bot.chat(`[System] Reached destination (${Math.round(finalDist)} blocks from target).`);
@@ -2941,15 +2942,19 @@ async function processActionQueue() {
                 // Bow charge state tracking (non-blocking)
                 let _bowChargeStart = 0;
                 let _bowCharging = false;
+                let _notFoundReported = false; // track early "X not found" send to avoid duplicate final message
 
                 while (killed < killQty && !currentCancelToken.cancelled && Date.now() - combatStart < combatMs) {
-                    // Find nearest living target
+                    // Find nearest reachable living target (within 30 blocks, not > 8 below)
                     let target = null, minDist = Infinity;
                     for (const ent of Object.values(bot.entities)) {
                         if (ent === bot.entity) continue;
                         const eName = (ent.name || ent.username || '').toLowerCase();
                         if (eName === action.target.toLowerCase()) {
                             const d = bot.entity.position.distanceTo(ent.position);
+                            const yDiff = bot.entity.position.y - ent.position.y;
+                            // Skip mobs that fell off cliffs (> 8 blocks below) or are very far
+                            if (d > 30 || yDiff > 8) continue;
                             if (d < minDist) { minDist = d; target = ent; }
                         }
                     }
@@ -2957,6 +2962,7 @@ async function processActionQueue() {
                         if (killed === 0) {
                             bot.chat(`[System Error] Cannot find ${action.target}.`);
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `${action.target} not found.`, environment: getEnvironmentContext() } });
+                            _notFoundReported = true;
                         }
                         break;
                     }
@@ -2966,7 +2972,7 @@ async function processActionQueue() {
                     let _lastStrafe = 0;
                     let _strafeSign = 1;
                     let _lastAttack = 0; // Issue 4: track attack cooldown
-                    while (target.isValid && !currentCancelToken.cancelled) {
+                    while (target.isValid && !currentCancelToken.cancelled && Date.now() - combatStart < combatMs) {
                         const now = Date.now();
                         // Issue 4 fix: declare botPos at top of loop iteration to avoid TDZ.
                         // Previously declared at line ~2631 but referenced earlier in the health check block.
@@ -3172,7 +3178,7 @@ async function processActionQueue() {
                     actionQueue = []; // Clear queue on partial success to re-evaluate
                     bot.chat(`[System] Partially eliminated ${killed}/${killQty} ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially killed ${killed}/${killQty} ${action.target}.`, environment: getEnvironmentContext() } });
-                } else {
+                } else if (!_notFoundReported) {
                     actionQueue = []; // Clear queue on failure
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to kill ${action.target}.`, environment: getEnvironmentContext() } });
                 }
@@ -3625,59 +3631,138 @@ async function processActionQueue() {
                         console.log(`[find_land] Pathfinding to player: ${tpTargetName}`);
                         const targetPlayer = bot.players[tpTargetName];
                         if (targetPlayer?.entity) {
-                            try {
-                                await withTimeout(bot.pathfinder.goto(new goals.GoalFollow(targetPlayer.entity, 3)), 30000, 'find_land follow', () => bot.pathfinder.setGoal(null));
-                            } catch (e) { console.log(`[find_land] Could not reach player: ${e.message}`); }
+                            // Step-loop: re-evaluate player position every 15s for up to 90s
+                            // This handles moving targets and avoids pathfinder giving up on
+                            // complex mountain terrain with a single long-lived goal.
+                            const findLandDeadline = Date.now() + 90000;
+                            let reached = false;
+                            while (!reached && Date.now() < findLandDeadline && !currentCancelToken.cancelled) {
+                                const playerEnt = bot.players[tpTargetName]?.entity;
+                                if (!playerEnt) break;
+                                const dist3d = bot.entity.position.distanceTo(playerEnt.position);
+                                if (dist3d < 5) { reached = true; break; }
+                                const stepTimeout = Math.min(15000, findLandDeadline - Date.now());
+                                if (stepTimeout <= 0) break;
+                                try {
+                                    await withTimeout(
+                                        bot.pathfinder.goto(new goals.GoalNear(playerEnt.position.x, playerEnt.position.y, playerEnt.position.z, 4)),
+                                        stepTimeout, 'find_land step', () => bot.pathfinder.setGoal(null)
+                                    );
+                                    reached = true;
+                                } catch (e) {
+                                    // Partial progress is fine — loop and re-target
+                                    console.log(`[find_land] Step timeout/error: ${e.message}`);
+                                }
+                            }
+                            if (!reached) console.log('[find_land] Could not fully reach player — continuing from current position');
                         }
                     }
                     try { await bot.waitForChunksToLoad(); } catch (e) {}
                     await new Promise(r => setTimeout(r, 1000));
                 } else {
                     console.log('[find_land] No players online — using current position.');
+                    // If already on dry land, great; otherwise use /spreadplayers to find land.
+                    if (DEBUG) {
+                        const curPos = bot.entity.position;
+                        const blockHere = bot.blockAt(curPos);
+                        const isUnderwater = blockHere?.name?.includes('water');
+                        const blockBelow0 = bot.blockAt(curPos.offset(0, -1, 0));
+                        const isFloating = !bot.entity.onGround;
+                        if (isUnderwater || isFloating) {
+                            console.log('[find_land] Bot is underwater / floating — using /spreadplayers to find dry land...');
+                            bot.chat(`/spreadplayers 0 0 5 500 false ${bot.username}`);
+                            await new Promise(r => setTimeout(r, 5000)); // wait for TP
+                            try { await bot.waitForChunksToLoad(); } catch (e) {}
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+                    }
                 }
 
                 // ── Step 2: Survival buffs + give oak_log for crafting test ───────
+                // Helper: send a chat command only when the socket is still alive.
+                // Returns false if the connection was lost (caller should abort).
+                const safeSend = async (cmd) => {
+                    if (bot._client?.socket?.writable !== true) return false;
+                    bot.chat(cmd);
+                    await new Promise(r => setTimeout(r, 600));
+                    return bot._client?.socket?.writable === true;
+                };
+
+                // "Forge AI Player Ready." was sent right before find_land was queued.
+                // 2-second cooldown ensures we're well outside the server spam window.
+                // 600ms between each command (< 1.7/s, safely below any 3/s limit).
                 if (DEBUG) {
-                    bot.chat(`/effect give ${bot.username} minecraft:resistance 600 10 true`);
-                    bot.chat(`/effect give ${bot.username} minecraft:saturation 600 10 true`);
-                    await new Promise(r => setTimeout(r, 200));
-                    bot.chat(`/give ${bot.username} minecraft:oak_log 16`);
+                    await new Promise(r => setTimeout(r, 2000));
+                    let ok = await safeSend(`/effect give ${bot.username} minecraft:resistance 600 10 true`);
+                    if (ok) ok = await safeSend(`/effect give ${bot.username} minecraft:saturation 600 10 true`);
+                    if (ok) ok = await safeSend(`/effect give ${bot.username} minecraft:regeneration 600 10 true`);
+                    if (ok) ok = await safeSend(`/give ${bot.username} minecraft:oak_log 16`);
+                    // Iron sword for faster kills
+                    if (ok) ok = await safeSend(`/give ${bot.username} minecraft:iron_sword 1`);
+                    if (!ok) {
+                        console.log('[find_land] Disconnected during buffs — aborting find_land.');
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: 'find_land: disconnected during setup.', environment: getEnvironmentContext() } });
+                        return;
+                    }
                 }
 
                 // ── Step 3: Find the ground Y from actual position post-TP ─────────
                 const pos0 = bot.entity.position;
                 const gx = Math.round(pos0.x), gz = Math.round(pos0.z);
-                // Scan downward from bot feet to find first solid non-water block
+                // When onGround, trust the physics engine: bot feet at pos0.y means
+                // the surface block is at floor(pos0.y) - 1. Modded blocks often
+                // appear as air to blockAt() but are physically solid.
                 let groundY = Math.floor(pos0.y) - 1;
-                for (let dy = 0; dy >= -15; dy--) {
-                    const b = bot.blockAt(new Vec3(gx, Math.floor(pos0.y) + dy, gz));
-                    if (b && b.boundingBox === 'block' && !b.name.includes('water')) {
-                        groundY = Math.floor(pos0.y) + dy;
-                        break;
+                if (!bot.entity.onGround) {
+                    // Not on ground — scan downward for first solid non-water block
+                    for (let dy = 0; dy >= -15; dy--) {
+                        const b = bot.blockAt(new Vec3(gx, Math.floor(pos0.y) + dy, gz));
+                        if (b && b.boundingBox === 'block' && !b.name.includes('water')) {
+                            groundY = Math.floor(pos0.y) + dy;
+                            break;
+                        }
                     }
                 }
-                const logY = groundY + 1; // surface = 1 above detected ground
+                const logY = groundY + 1; // surface level (same Y as bot feet)
 
                 // ── Step 4: Place 5 oak_log columns (separate XZ → collect dedup OK) ─
+                let landOk = true;
                 const logOffsets = [[3,3],[4,3],[5,3],[6,3],[7,3]];
                 for (const [dx, dz] of logOffsets) {
-                    bot.chat(`/setblock ${gx + dx} ${logY} ${gz + dz} minecraft:oak_log`);
-                    await new Promise(r => setTimeout(r, 150));
+                    if (!landOk) break;
+                    landOk = await safeSend(`/setblock ${gx + dx} ${logY} ${gz + dz} minecraft:oak_log`);
                 }
 
-                // ── Step 5: Summon test animals on the surface ────────────────────
-                bot.chat(`/summon minecraft:cow ${gx + 8} ${logY} ${gz + 8}`);
-                bot.chat(`/summon minecraft:pig ${gx + 6} ${logY} ${gz + 6}`);
-                bot.chat(`/summon minecraft:chicken ${gx + 4} ${logY} ${gz + 4}`);
-                await new Promise(r => setTimeout(r, 500));
+                // ── Step 5: Summon test animals with guaranteed solid ground ────────
+                // Mountain terrain means any offset > 1 block risks a cliff edge.
+                // Place a stone platform under each spawn point first, then summon.
+                const animalSpawns = [
+                    { dx: 2, dz: 0, mob: 'cow' },
+                    { dx: 0, dz: 2, mob: 'pig' },
+                    { dx: 2, dz: 2, mob: 'chicken' },
+                ];
+                for (const { dx, dz, mob } of animalSpawns) {
+                    if (!landOk) break;
+                    // Ensure solid ground under the spawn point (handles cliff edges)
+                    landOk = await safeSend(`/setblock ${gx + dx} ${groundY} ${gz + dz} minecraft:stone`);
+                    if (landOk) landOk = await safeSend(`/summon minecraft:${mob} ${gx + dx} ${logY} ${gz + dz}`);
+                }
+                await new Promise(r => setTimeout(r, 200));
 
                 if (movements) bot.pathfinder.setMovements(movements);
 
+                if (!landOk) {
+                    console.log('[find_land] Disconnected during setblock/summon — aborting.');
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: 'find_land: disconnected during platform setup.', environment: getEnvironmentContext() } });
+                    return;
+                }
+
                 const landPos = bot.entity.position;
                 const blockBelow = bot.blockAt(landPos.offset(0, -1, 0));
+                // Accept modded blocks: they appear as air/bb=empty to vanilla registry but
+                // the server physics knows the bot is on solid ground (onGround=true).
                 const onLand = bot.entity.onGround &&
-                    blockBelow && blockBelow.boundingBox === 'block' &&
-                    !blockBelow.name.includes('water');
+                    blockBelow && !blockBelow.name.includes('water');
                 const msg = onLand
                     ? `Platform ready. Bot at (${Math.round(landPos.x)},${Math.round(landPos.y)},${Math.round(landPos.z)}). Logs+animals placed.`
                     : `find_land: At (${Math.round(landPos.x)},${Math.round(landPos.y)},${Math.round(landPos.z)}) onGround=${bot.entity.onGround} below=${blockBelow?.name}.`;

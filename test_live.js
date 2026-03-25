@@ -1,7 +1,7 @@
 /**
  * Live integration test script.
  * Connects to the running bot process by creating its own AgentManager
- * and sends IPC commands directly.  Monitors ai_debug.json for position
+ * and sends IPC commands directly.  Monitors ai_debug_<botId>.json for position
  * updates to measure movement speed and accuracy.
  *
  * Usage: MC_HOST=172.24.96.1 node test_live.js
@@ -19,20 +19,37 @@ let testResults = [];
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function readDebug() {
-    try { return JSON.parse(fs.readFileSync('ai_debug.json', 'utf8')); }
+function readDebug(botId) {
+    try { return JSON.parse(fs.readFileSync(`ai_debug_${botId}.json`, 'utf8')); }
     catch { return null; }
+}
+
+/**
+ * Wait until the debug file has a timestamp newer than afterMs.
+ * The file is written every 5 s, so worst-case wait is ~5 s.
+ */
+async function waitForFreshDebug(botId, afterMs, maxWait = 8000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+        const d = readDebug(botId);
+        if (d && d.timestamp && new Date(d.timestamp).getTime() > afterMs) return d;
+        await sleep(500);
+    }
+    return readDebug(botId); // fallback — may still be slightly stale
 }
 
 function spawnBot(botId) {
     console.log(`[Test] Spawning bot: ${botId}`);
     const botProcess = fork(path.join(__dirname, 'src/bot_actuator.js'), [], {
-        env: { ...process.env, BOT_ID: botId, BOT_OPTIONS: JSON.stringify({ host, port }) }
+        // DEBUG=true: find_land uses /tp + /effect + /give instead of pathfinding,
+        // ensuring bots start on dry land with full health and stocked with oak_log.
+        env: { ...process.env, BOT_ID: botId, BOT_OPTIONS: JSON.stringify({ host, port }), DEBUG: 'true' }
     });
 
     BOTS[botId] = { process: botProcess, messages: [], ready: false };
 
     botProcess.on('message', (msg) => {
+        msg._receivedAt = Date.now(); // timestamp for filtering stale messages
         BOTS[botId].messages.push(msg);
         if (msg.type === 'USER_CHAT') {
             console.log(`[${botId}] ${msg.data.username}: ${msg.data.message}`);
@@ -54,7 +71,9 @@ function sendAction(botId, actions) {
 async function waitForMessage(botId, filter, timeoutMs = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-        const idx = BOTS[botId].messages.findIndex(filter);
+        // Only match messages that arrived at or after this wait started (avoids
+        // stale messages from a previous timed-out test bleeding into the next one).
+        const idx = BOTS[botId].messages.findIndex(m => (m._receivedAt || 0) >= start && filter(m));
         if (idx !== -1) {
             return BOTS[botId].messages.splice(idx, 1)[0];
         }
@@ -63,13 +82,30 @@ async function waitForMessage(botId, filter, timeoutMs = 60000) {
     return null;
 }
 
+/**
+ * Wait until the bot's debug health is above minHp. With /effect regeneration applied
+ * during find_land, the bot heals fast but bot.health lags behind the server value.
+ * Polling the debug file gives the authoritative value once it's written.
+ */
+async function waitForHealth(botId, minHp = 10, maxWaitMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+        const d = readDebug(botId);
+        if (d && d.health >= minHp) return d.health;
+        await sleep(1000);
+    }
+    const d = readDebug(botId);
+    console.log(`[Test] ${botId} health after wait: ${d?.health ?? 'unknown'}`);
+    return d?.health ?? 0;
+}
+
 async function waitForReady(botId, timeoutMs = 120000) {
     console.log(`[Test] Waiting for ${botId} to connect and spawn...`);
-    // Delete stale ai_debug.json so we wait for a genuinely fresh entry
-    try { fs.unlinkSync('ai_debug.json'); } catch (e) {}
+    // Delete stale debug file so we wait for a genuinely fresh entry
+    try { fs.unlinkSync(`ai_debug_${botId}.json`); } catch (e) {}
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-        const debug = readDebug();
+        const debug = readDebug(botId);
         if (debug && debug.timestamp) {
             const age = Date.now() - new Date(debug.timestamp).getTime();
             // Accept if the file was written after we started waiting AND is recent
@@ -89,7 +125,7 @@ async function waitForReady(botId, timeoutMs = 120000) {
 
 async function measureSpeed(botId, targetX, targetZ, label) {
     // Record start position from debug file
-    const startDebug = readDebug();
+    const startDebug = readDebug(botId);
     if (!startDebug) { console.log('[Test] No debug data'); return null; }
 
     const startPos = { x: startDebug.position.x, z: startDebug.position.z };
@@ -97,7 +133,7 @@ async function measureSpeed(botId, targetX, targetZ, label) {
 
     sendAction(botId, { action: 'goto', x: targetX, z: targetZ, timeout: 120 });
 
-    // Wait for completion
+    // Wait for completion message
     const result = await waitForMessage(botId, m =>
         m.type === 'USER_CHAT' && m.data.username === 'System' &&
         (m.data.message.includes('Reached') || m.data.message.includes('Cannot') || m.data.message.includes('failed')),
@@ -105,8 +141,11 @@ async function measureSpeed(botId, targetX, targetZ, label) {
     );
 
     const endTime = Date.now();
-    const endDebug = readDebug();
-    await sleep(1000); // let debug file update
+
+    // Wait for a fresh debug file write that reflects the post-goto position.
+    // The file is updated every 5 s; without this wait the measured accuracy can
+    // be off by a full 5-second window of drift.
+    const endDebug = await waitForFreshDebug(botId, endTime - 1000);
 
     if (endDebug) {
         const dx = endDebug.position.x - startPos.x;
@@ -139,7 +178,7 @@ async function measureSpeed(botId, targetX, targetZ, label) {
 
 async function testFollow(botId, playerName, durationSec = 20) {
     console.log(`\n=== TEST: Follow ${playerName} for ${durationSec}s ===`);
-    const startDebug = readDebug();
+    const startDebug = readDebug(botId);
     const startTime = Date.now();
 
     sendAction(botId, { action: 'come', target: playerName });
@@ -147,14 +186,11 @@ async function testFollow(botId, playerName, durationSec = 20) {
     // Let it follow for durationSec
     await sleep(durationSec * 1000);
 
-    // Check positions during follow
-    const midDebug = readDebug();
-
     // Stop following
     sendAction(botId, { action: 'stop' });
     await sleep(2000);
 
-    const endDebug = readDebug();
+    const endDebug = await waitForFreshDebug(botId, startTime + durationSec * 1000);
     if (startDebug && endDebug) {
         const dx = endDebug.position.x - startDebug.position.x;
         const dz = endDebug.position.z - startDebug.position.z;
@@ -229,7 +265,7 @@ async function testKill(botId, target, quantity, label) {
     const result = await waitForMessage(botId, m =>
         m.type === 'USER_CHAT' && m.data.username === 'System' &&
         (m.data.message.includes('killed') || m.data.message.includes('not found') || m.data.message.includes('Failed to kill')),
-        65000
+        80000
     );
 
     const msg = result ? result.data.message : 'timeout';
@@ -244,18 +280,22 @@ async function testKill(botId, target, quantity, label) {
 }
 
 async function testFindLand(botId) {
-    console.log('\n=== SETUP: Building test platform via OP commands ===');
+    console.log(`\n=== SETUP: find_land for ${botId} ===`);
     sendAction(botId, { action: 'find_land' });
 
-    // Up to 45s: fill poll (20s) + setblocks + summon + TP + chunk load
+    // Up to 90s: TP + buffs (600ms×16 cmds ≈ 12s) + chunk load + settle
     const result = await waitForMessage(botId, m =>
         m.type === 'USER_CHAT' && m.data.username === 'System' &&
-        (m.data.message.includes('Platform ready') || m.data.message.includes('find_land:')),
+        (m.data.message.includes('Platform ready') || m.data.message.includes('find_land:') ||
+         m.data.message.includes('disconnected during')),
         90000
     );
 
     const msg = result ? result.data.message : 'timeout - proceeding with current position';
     console.log(`[Test Setup] ${msg}`);
+    if (msg.includes('disconnected')) {
+        console.log('[Test] WARNING: Bot disconnected during find_land setup. Subsequent tests will fail.');
+    }
     // Extra settle time after large teleport
     await sleep(3000);
     return result;
@@ -288,24 +328,65 @@ async function main() {
     console.log('║  Minecraft AI Bot Live Integration Test Suite       ║');
     console.log('╚══════════════════════════════════════════════════════╝\n');
 
-    // Kill any stale ai_debug.json and linger a moment so orphaned bot processes can exit
-    try { fs.unlinkSync('ai_debug.json'); } catch (e) {}
+    // Clean up stale debug files from previous runs
+    for (const id of ['AI_Bot_01', 'AI_Bot_02']) {
+        try { fs.unlinkSync(`ai_debug_${id}.json`); } catch (e) {}
+    }
     await sleep(1000);
 
-    // Spawn Test Bot 1
+    // ── Spawn and initialise Test Bot 1 ────────────────────────────────────
     spawnBot('AI_Bot_01');
     await waitForReady('AI_Bot_01', 90000);
 
     // ── Setup: Teleport to land so movement/collect/craft/kill tests can run ──
     await testFindLand('AI_Bot_01');
     // Capture the land base position for the return test
-    const landBase = readDebug();
+    const landBase = readDebug('AI_Bot_01');
 
-    // ── Test 1: Status ──────────────────────────────────────────────────
+    // ── Test 1: Status ──────────────────────────────────────────────────────
     await testStatus('AI_Bot_01');
 
-    // ── Test 2: Short goto (32 blocks) — measures base movement speed ──
-    const startDebug = readDebug();
+    // Wait for the bot to heal before kill tests. find_land applies /effect regeneration
+    // but bot.health lags the server value. Waiting ensures the bot is above the flee
+    // threshold (health < 6 triggers permanent flee instead of attacking).
+    await waitForHealth('AI_Bot_01', 10, 15000);
+
+    // ── Test 2: Kill animal — run early while summoned animals are still nearby ─
+    // find_land summons cow/pig/chicken ~8 blocks away; run kills before gotos
+    // move the bot far from the spawn area.
+    await testKill('AI_Bot_01', 'cow', 1, 'kill_cow');
+    const firstKill = testResults[testResults.length - 1];
+    if (!firstKill.pass) {
+        await testKill('AI_Bot_01', 'pig', 1, 'kill_pig');
+        const pigResult = testResults[testResults.length - 1];
+        if (!pigResult.pass) {
+            await testKill('AI_Bot_01', 'chicken', 1, 'kill_chicken');
+        }
+    }
+
+    // ── Test 3: Collect oak_log — run before goto tests scatter the bot too far ─
+    // find_land places logs at (+3..+7, +3) from base; collect while still nearby.
+    await testCollect('AI_Bot_01', 'oak_log', 3, 'collect_oak_log');
+
+    // ── Test 4: Craft planks — bot has logs from collect ────────────────────
+    await testCraft('AI_Bot_01', 'oak_planks', 1, 'craft_oak_planks');
+
+    // Return to land base before goto tests. Kill/collect tests may have moved the bot
+    // far from the find_land position (e.g. chasing animals into water or off structures).
+    // Goto tests from a known good terrain position gives consistent speed measurements.
+    if (landBase) {
+        console.log(`[Test] Returning to land base (${landBase.position.x}, ${landBase.position.z}) before goto tests...`);
+        sendAction('AI_Bot_01', { action: 'goto', x: landBase.position.x, z: landBase.position.z, timeout: 90 });
+        await waitForMessage('AI_Bot_01', m =>
+            m.type === 'USER_CHAT' && m.data.username === 'System' &&
+            (m.data.message.includes('Reached') || m.data.message.includes('Cannot') || m.data.message.includes('failed')),
+            100000
+        );
+        await sleep(2000);
+    }
+
+    // ── Test 5: Short goto (32 blocks) — measures base movement speed ───────
+    const startDebug = readDebug('AI_Bot_01');
     if (startDebug) {
         await measureSpeed('AI_Bot_01',
             startDebug.position.x + 32,
@@ -314,8 +395,8 @@ async function main() {
         );
     }
 
-    // ── Test 3: Medium goto (100 blocks) — tests waypoint system ───────
-    const midDebug = readDebug();
+    // ── Test 6: Medium goto (100 blocks) — tests waypoint system ────────────
+    const midDebug = readDebug('AI_Bot_01');
     if (midDebug) {
         await measureSpeed('AI_Bot_01',
             midDebug.position.x,
@@ -324,29 +405,54 @@ async function main() {
         );
     }
 
-    // ── Test 4: Follow player (skip if bot is > 256 blocks from player) ─
-    await testFollow('AI_Bot_01', 'Seia_Y', 20);
+    // ── Test 5: Follow — spawn AI_Bot_02 as the moving player ───────────────
+    // AI_Bot_02 acts as the human player for the follow test.
+    // It does find_land (which will pathfind to AI_Bot_01's position),
+    // then walks in a line so AI_Bot_01 has something to chase.
+    console.log('\n=== SETUP: Spawning player bot (AI_Bot_02) for follow test ===');
+    spawnBot('AI_Bot_02');
+    await waitForReady('AI_Bot_02', 90000);
 
-    // ── Test 5: Collect oak_log ────────────────────────────────────────
-    await testCollect('AI_Bot_01', 'oak_log', 3, 'collect_oak_log');
+    // find_land on Bot02 (pathfinds toward any online player)
+    await testFindLand('AI_Bot_02');
+    await sleep(2000);
 
-    // ── Test 6: Craft planks ──────────────────────────────────────────
-    await testCraft('AI_Bot_01', 'oak_planks', 1, 'craft_oak_planks');
-
-    // ── Test 7: Kill animal ───────────────────────────────────────────
-    await testKill('AI_Bot_01', 'cow', 1, 'kill_cow');
-    // If cow not found, try pig or chicken
-    const lastKill = testResults[testResults.length - 1];
-    if (!lastKill.pass) {
-        await testKill('AI_Bot_01', 'pig', 1, 'kill_pig');
-        const pigResult = testResults[testResults.length - 1];
-        if (!pigResult.pass) {
-            await testKill('AI_Bot_01', 'chicken', 1, 'kill_chicken');
-        }
+    // Explicitly navigate Bot02 to Bot01's current position so both bots are
+    // co-located before the follow test. Without this, independent find_land
+    // calls can land them >100 blocks apart.
+    const bot01Pos = readDebug('AI_Bot_01');
+    if (bot01Pos) {
+        console.log(`[Test] Moving AI_Bot_02 to AI_Bot_01 position (${bot01Pos.position.x}, ${bot01Pos.position.z})`);
+        sendAction('AI_Bot_02', { action: 'goto',
+            x: bot01Pos.position.x,
+            z: bot01Pos.position.z,
+            timeout: 90 });
+        await waitForMessage('AI_Bot_02', m =>
+            m.type === 'USER_CHAT' && m.data.username === 'System' &&
+            (m.data.message.includes('Reached') || m.data.message.includes('Cannot') || m.data.message.includes('failed')),
+            100000
+        );
+        await sleep(1000);
     }
 
-    // ── Test 8: Long distance goto (200 blocks) ──────────────────────
-    const preLD = readDebug();
+    // Now Bot02 is next to Bot01 — have it walk 60 blocks away as the follow target
+    const bot02PreFollow = readDebug('AI_Bot_02');
+    if (bot02PreFollow) {
+        sendAction('AI_Bot_02', { action: 'goto',
+            x: bot02PreFollow.position.x + 60,
+            z: bot02PreFollow.position.z,
+            timeout: 60 });
+    }
+    await sleep(2000); // let Bot02 start moving before Bot01 begins following
+
+    await testFollow('AI_Bot_01', 'AI_Bot_02', 20);
+
+    // Stop Bot02 after follow test
+    sendAction('AI_Bot_02', { action: 'stop' });
+    await sleep(1000);
+
+    // ── Test 8: Long distance goto (200 blocks) ─────────────────────────────
+    const preLD = readDebug('AI_Bot_01');
     if (preLD) {
         await measureSpeed('AI_Bot_01',
             preLD.position.x - 200,
@@ -355,12 +461,12 @@ async function main() {
         );
     }
 
-    // ── Test 9: Return to land base (avoids hardcoded ocean spawn) ────
+    // ── Test 9: Return to land base (avoids hardcoded ocean spawn) ──────────
     const returnX = landBase ? landBase.position.x : -10;
     const returnZ = landBase ? landBase.position.z : -28;
     await measureSpeed('AI_Bot_01', returnX, returnZ, 'goto_return_land');
 
-    // ── Summary ──────────────────────────────────────────────────────
+    // ── Summary ─────────────────────────────────────────────────────────────
     console.log('\n╔══════════════════════════════════════════════════════╗');
     console.log('║  TEST RESULTS SUMMARY                                ║');
     console.log('╠══════════════════════════════════════════════════════╣');

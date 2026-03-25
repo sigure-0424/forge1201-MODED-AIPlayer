@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-03-25T16:52:52.337Z",
+  "ready": true,
+  "position": {
+    "x": 13.4,
+    "y": 70,
+    "z": 18.6
+  },
+  "health": 20,
+  "food": 19,
+  "isExecuting": false,
+  "actionQueue": []
+}
