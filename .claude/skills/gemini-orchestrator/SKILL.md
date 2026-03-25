@@ -1,5 +1,7 @@
 # gemini-orchestrator
-
+---
+description: ALWAYS invoke this skill for any task involving multi-step planning, delegation to Gemini, or complex implementation with validation loops. DO NOT attempt to use internal bash or direct edits for tasks requiring an orchestrator flow.
+---/
 ## Purpose
 
 Use this skill when a task needs planning, delegation, validation, and possible repair loops.

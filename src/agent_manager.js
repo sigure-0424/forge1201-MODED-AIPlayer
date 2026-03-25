@@ -122,15 +122,15 @@ class AgentManager {
 
             let currentMode = this.botModes.get(botId) || 'normal';
 
-            // Normal mode bypasses automatic LLM tasks (Goal 4) unless forced,
-            // but for safety, we'll allow normal chatting to work unless specified otherwise.
-            // If the user means normal node index.js should NOT run tasks, we check currentMode.
-            if (!isSystem && currentMode === 'normal') {
-                 console.log(`[AgentManager] Ignoring chat command in normal mode: "${data.message}"`);
-                 return; // Silently ignore to avoid doing tasks
-            }
-
             if (!isSystem) {
+                // Improvement 1: '-!' async queries are processed immediately without interrupting
+                // the current bot action. LLM response is delivered via ASYNC_CHAT.
+                if (data.async === true) {
+                    console.log(`[AgentManager] Async query from ${data.username}: "${data.message}"`);
+                    this.processAsyncQuery(botId, data);
+                    return;
+                }
+
                 const isCancellationResponse = this.awaitingCancellationChoice.get(botId);
                 const isRecoveryResponse = this.awaitingRecoveryChoice.get(botId);
                 const queue = this.chatQueue.get(botId) || [];
@@ -353,6 +353,35 @@ class AgentManager {
         setTimeout(() => this.executeTaskModeTasks(botId), 1500);
     }
 
+    // Improvement 1: Process a '-!' async query without interrupting the current bot action.
+    // Calls the LLM with the query and delivers the response as an immediate chat message.
+    async processAsyncQuery(botId, data) {
+        const botProcess = this.bots.get(botId);
+        if (!botProcess) return;
+
+        const prompt = `You are a Minecraft AI bot named ${botId}.
+User '${data.username}' sent an async status query (bot is currently busy): "${data.message}"
+Current Environment: ${JSON.stringify(data.environment)}
+
+IMPORTANT: This is a non-interrupting status query. Respond ONLY with a single chat action.
+Report the requested status concisely based on the environment context.
+Example: [{"action":"chat","message":"I am at X:100, Y:64, Z:200."}]
+Do NOT return any action other than chat.`;
+
+        try {
+            const action = await this.llm.generateAction(prompt);
+            if (!action) return;
+            const sanitized = this.sanitizeLLMAction(action);
+            if (!sanitized) return;
+            const chatActions = sanitized.filter(a => a.action === 'chat' && a.message);
+            if (chatActions.length > 0) {
+                safeBotProcessSend(botProcess, { type: 'ASYNC_CHAT', text: chatActions[0].message });
+            }
+        } catch (e) {
+            console.error(`[AgentManager] processAsyncQuery error: ${e.message}`);
+        }
+    }
+
     processNextQueueItem(botId) {
         if (this.activeLlmRequests.has(botId) || this.awaitingCancellationChoice.get(botId)) {
             return; // Busy
@@ -474,7 +503,8 @@ Current Environment: ${JSON.stringify(data.environment)}${taskContext}
 ━━━ BASIC ACTIONS ━━━
 [{"action": "chat", "message": "text"}]
 [{"action": "come", "target": "player_name"}]                                    -- follows continuously until stopped
-[{"action": "stop"}]                                                              -- halts all current actions
+[{"action": "stop"}]                                                              -- halts ALL actions; bot stands completely still (no combat)
+[{"action": "wait"}]                                                              -- idle combat: bot eliminates nearby threats until next instruction
 [{"action": "goto", "x": 10, "z": 20, "timeout": 60}]                           -- any distance, auto-waypoints
 [{"action": "goto", "x": 10, "y": 64, "z": 20}]
 [{"action": "goto", "target": "WaypointName"}]                                  -- travel to journeymap waypoint by name

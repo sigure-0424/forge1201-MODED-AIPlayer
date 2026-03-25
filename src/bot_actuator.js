@@ -277,9 +277,12 @@ bot.on('spawn', async () => {
             const deathPos = _lastSafePos || (bot.entity?.position?.clone());
             const deathDim = _lastSafeDim || bot.game?.dimension || 'overworld';
             if (deathPos && deathPos.y > -60) {
-                // Issue 3 & 12: Differentiate system chat and ask for permission instead of auto-queuing.
                 bot.chat('[System Error] I died! Do you want me to recover my items? (yes/no)');
                 console.log(`[Actuator] Bot died. Last safe pos: ${JSON.stringify({x:Math.round(deathPos.x),y:Math.round(deathPos.y),z:Math.round(deathPos.z)}) } dim:${deathDim}`);
+                // Issue 2: Send IPC so agent_manager sets awaitingRecoveryChoice.
+                // bot.chat() only sends to server; the bot's own messages are filtered in
+                // the bot.on('chat') handler so they never reach agent_manager via the chat path.
+                process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'I died! Do you want me to recover my items?', environment: getEnvironmentContext() } });
 
                 // Persist to file so recovery works even after process restart. Issue 1 & 2: Use sequential array.
                 const deathRecord = { x: deathPos.x, y: deathPos.y, z: deathPos.z, dimension: deathDim, time: new Date().toISOString(), status: 'pending' };
@@ -294,11 +297,11 @@ bot.on('spawn', async () => {
             }
         });
 
-        // Anti-AFK: rotate the bot's head slightly every ~25 seconds when completely idle.
-        // Without this, servers with AFK detection kick the bot during long LLM processing
-        // windows (~30s), causing ECONNRESET when the next action tries to write.
+        // Anti-AFK: rotate the bot's head slightly every ~25 seconds when not moving.
+        // Fires during idle AND during wait/idle-combat (isExecuting may be true there),
+        // as long as the pathfinder isn't actively steering the bot.
         setInterval(() => {
-            if (isExecuting) return; // Don't interfere with active actions
+            if (bot.pathfinder.isMoving()) return; // Don't interfere while pathfinder steers
             if (bot._client?.socket?.writable !== true) return;
             try {
                 const yaw = (Math.random() * Math.PI * 2) - Math.PI; // random yaw
@@ -307,30 +310,115 @@ bot.on('spawn', async () => {
             } catch (_) {}
         }, 25000);
 
-        // Passive defense: attack nearby hostiles.
-        // Only attack when the bot is IDLE — during active pathfinding the
-        // bot.attack() call changes the look direction, conflicting with the
-        // pathfinder's bot.look() and causing erratic movement.
+        // Issues 3 & 5: Passive defense — attack hostiles within 16 blocks.
+        // Close-range (≤3.5 blocks) enemies are attacked immediately even during
+        // pathfinding, acting as a melee "interrupt" without stopping movement.
+        // Further enemies are handled by the idle combat loop (runWaitLoop).
         _passiveDefenseInterval = setInterval(() => {
             if (!bot.entity || bot.health <= 0) return;
-            if (bot.pathfinder.isMoving() || bot.pathfinder.isMining()) return;  // Don't interfere with active pathfinding
-            const hostile = findNearestHostile(3.5);
+            const hostile = findNearestHostile(16); // Issue 5: 16-block radius
             if (!hostile) {
-                bot.deactivateItem();
+                if (!bot.pathfinder.isMoving() && !bot.pathfinder.isMining()) {
+                    bot.deactivateItem();
+                }
                 return;
             }
-            bot.deactivateItem();
-            bot.attack(hostile);
-            equipBestWeapon().catch(() => {});
-
-            // Shield up after attacking
-            const offHand = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
-            if (offHand && offHand.name === 'shield') {
-                bot.activateItem(true);
+            const distToHostile = bot.entity.position.distanceTo(hostile.position);
+            if (distToHostile <= 3.5) {
+                // Issue 3: attack in melee range even during movement (interrupt)
+                bot.deactivateItem();
+                bot.attack(hostile);
+                equipBestWeapon().catch(() => {});
+                const offHand = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                if (offHand && offHand.name === 'shield') {
+                    bot.activateItem(true);
+                }
             }
+            // Enemies 3.5–16 blocks away: let runWaitLoop handle them during idle
         }, 600);
 
+        // Issue 3: High-priority projectile evasion interrupt.
+        // Runs every 150ms independently of the combat loop and pathfinder.
+        // Raises shield when an inbound projectile is detected; falls back to
+        // dodging to a safe direction (avoiding lava and cliffs).
+        let _evasionCooldown = 0;
+        setInterval(() => {
+            if (!bot.entity || bot.health <= 0) return;
+            if (!bot._client?.socket?.writable) return;
+            const now = Date.now();
+            if (now < _evasionCooldown) return;
+            const evasionPos = bot.entity.position;
+            const incomingProj = Object.values(bot.entities).find(e => {
+                if (e === bot.entity) return false;
+                const n = (e.name || e.displayName || '').toLowerCase();
+                if (!n.includes('fireball') && !n.includes('arrow') &&
+                    !n.includes('shulker_bullet') && !n.includes('wither_skull')) return false;
+                if (e.position.distanceTo(evasionPos) > 12) return false;
+                const vel = e.velocity;
+                if (!vel || (Math.abs(vel.x) < 0.01 && Math.abs(vel.y) < 0.01 && Math.abs(vel.z) < 0.01)) return false;
+                const toBot = evasionPos.minus(e.position).normalize();
+                const dot = vel.x * toBot.x + vel.y * toBot.y + vel.z * toBot.z;
+                return dot > 0.35; // confirmed inbound trajectory
+            });
+            if (!incomingProj) return;
+            // Raise shield first (highest priority)
+            try {
+                const offSlot = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                if (offSlot?.name === 'shield') {
+                    bot.activateItem(true);
+                    _evasionCooldown = now + 900;
+                    return;
+                }
+            } catch (_) {}
+            // No shield — dodge to safest perpendicular direction
+            // Priority: right, left, back, forward (avoid lava/cliff in each)
+            const dodgeAngles = [
+                bot.entity.yaw + Math.PI / 2,
+                bot.entity.yaw - Math.PI / 2,
+                bot.entity.yaw + Math.PI,
+                bot.entity.yaw,
+            ];
+            const DODGE = 4;
+            for (const angle of dodgeAngles) {
+                const tx = evasionPos.x + DODGE * Math.sin(angle);
+                const tz = evasionPos.z + DODGE * Math.cos(angle);
+                const fx = Math.floor(tx), fy = Math.floor(evasionPos.y), fz = Math.floor(tz);
+                const bFoot   = bot.blockAt(new Vec3(fx, fy,     fz));
+                const bBelow1 = bot.blockAt(new Vec3(fx, fy - 1, fz));
+                const bBelow2 = bot.blockAt(new Vec3(fx, fy - 2, fz));
+                const isHazard = b => !b || b.name.includes('lava') || b.name.includes('fire') || b.name === 'magma_block';
+                const isAir    = b => !b || b.name === 'air';
+                if (isHazard(bFoot) || isHazard(bBelow1)) continue;
+                // Avoid cliff: 2+ consecutive air blocks below = drop hazard
+                if (isAir(bBelow1) && isAir(bBelow2)) continue;
+                try {
+                    bot.pathfinder.goto(new goals.GoalXZ(Math.round(tx), Math.round(tz))).catch(() => {});
+                } catch (_) {}
+                _evasionCooldown = now + 500;
+                break;
+            }
+        }, 150);
+
         debouncer = new EventDebouncer(bot, 500);
+
+        // Issue 1 precaution: clear Invisibility effect if present on spawn/respawn.
+        // The root cause is likely server-side (mod applying the effect), so we detect
+        // and neutralise it by drinking milk (clears all potion effects).
+        setTimeout(() => {
+            try {
+                const INVISIBILITY_ID = 14; // Vanilla Minecraft effect ID for Invisibility
+                const effects = bot.entity?.effects || {};
+                if (effects[INVISIBILITY_ID]) {
+                    console.log('[Actuator] Invisibility effect detected after spawn. Attempting to clear with milk...');
+                    const milk = bot.inventory.items().find(i => i.name === 'milk_bucket');
+                    if (milk) {
+                        bot.equip(milk, 'hand').then(() => bot.consume().catch(() => {})).catch(() => {});
+                    } else {
+                        bot.chat('[System] Warning: Invisibility effect active. No milk available to clear it.');
+                    }
+                }
+            } catch (e) {}
+        }, 3000);
 
         let _moveDiagTick = 0;
         let _lastDiagPos = null;
@@ -390,17 +478,16 @@ bot.on('spawn', async () => {
                 }
             }
 
-            // Issue 2: MLG water-bucket — place water when falling > 8 blocks.
-            // Reset tracking on ground or in water. Skip during pathfinder movement
-            // (pathfinder handles controlled descents itself).
+            // Issue 2: MLG water-bucket and lava escape.
             if (bot.entity) {
                 const curY = bot.entity.position.y;
                 if (onGround || inWater) {
                     _fallStartY = null;
                     _mlgAttempted = false;
-                    // Pick up water bucket if we placed one (look for water below feet)
-                } else if (!moving) {
-                    // Track free-fall only when not pathfinder-guided
+                } else {
+                    // Issue 2: Track free-fall regardless of pathfinder state.
+                    // maxDropDown=3 limits planned descents but unexpected falls (knockback,
+                    // terrain errors) still happen. MLG water covers those cases.
                     if (_fallStartY === null) _fallStartY = curY;
                     const fallDist = _fallStartY - curY;
                     if (fallDist > 8 && !_mlgAttempted) {
@@ -414,8 +501,22 @@ bot.on('spawn', async () => {
                     }
                 }
 
-                // Issue 2: shield raise on health drop (precise reaction, not just 600ms polling)
-                // This supplements the passive defense interval which only fires when idle.
+                // Issue 2: Lava escape — if bot lands in lava, cancel pathfinder and jump out.
+                const blockAtFeet = bot.blockAt(bot.entity.position);
+                if (blockAtFeet && (blockAtFeet.name === 'lava' || blockAtFeet.name === 'flowing_lava')) {
+                    if (!_lavaEscapeActive) {
+                        _lavaEscapeActive = true;
+                        console.log('[Actuator] Detected lava at feet. Cancelling pathfinder and jumping out.');
+                        bot.pathfinder.setGoal(null);
+                        bot.setControlState('jump', true);
+                        bot.setControlState('forward', true);
+                        setTimeout(() => {
+                            bot.setControlState('jump', false);
+                            bot.setControlState('forward', false);
+                            _lavaEscapeActive = false;
+                        }, 1000);
+                    }
+                }
             }
         });
     }
@@ -709,6 +810,26 @@ function getEnvironmentContext() {
             if (id !== undefined && bot.findBlock({ matching: id, maxDistance: 16 })) nearbyBlocks.push(name);
         }
     }
+    // Issue 1: Detect what structure the bot is currently inside by scanning for signature blocks.
+    // Gives the LLM accurate location context (e.g. "already in nether_fortress").
+    const nearbyStructures = [];
+    if (bot.entity) {
+        const structureMarkers = [
+            { name: 'nether_fortress', blocks: ['nether_bricks', 'nether_brick_fence', 'nether_brick_stairs'] },
+            { name: 'stronghold',      blocks: ['end_portal_frame', 'mossy_stone_bricks'] },
+            { name: 'ocean_monument',  blocks: ['prismarine', 'sea_lantern'] },
+        ];
+        for (const { name, blocks } of structureMarkers) {
+            for (const blockName of blocks) {
+                const id = bot.registry.blocksByName[blockName]?.id;
+                if (id !== undefined && bot.findBlock({ matching: id, maxDistance: 32 })) {
+                    nearbyStructures.push(name);
+                    break;
+                }
+            }
+        }
+    }
+
     const inventoryItems = bot.inventory ? bot.inventory.items() : [];
     return {
         position: bot.entity ? {
@@ -716,6 +837,7 @@ function getEnvironmentContext() {
             y: Math.round(bot.entity.position.y),
             z: Math.round(bot.entity.position.z)
         } : null,
+        dimension: bot.game?.dimension || null,
         health: bot.health ? Math.round(bot.health) : null,
         food: bot.food ? Math.round(bot.food) : null,
         players_nearby: Object.keys(bot.players).filter(p => p !== bot.username && bot.players[p].entity),
@@ -723,7 +845,8 @@ function getEnvironmentContext() {
         has_pickaxe: inventoryItems.some(i => i.name.endsWith('_pickaxe')),
         has_axe: inventoryItems.some(i => i.name.endsWith('_axe')),
         has_sword: inventoryItems.some(i => i.name.endsWith('_sword')),
-        nearby_blocks: nearbyBlocks
+        nearby_blocks: nearbyBlocks,
+        nearby_structures: nearbyStructures
     };
 }
 
@@ -736,6 +859,11 @@ function getEnvironmentContext() {
 const _chatDedup = new Map(); // 'username:message' → timestamp
 bot.on('chat', (username, message) => {
     if (username === bot.username) return;
+    // Issue 3: Only treat messages prefixed with '-' as instructions.
+    // All other chat (server notifications, player chatter) is ignored to prevent
+    // system logs (e.g. difficulty changes) from accidentally triggering the AI.
+    if (!message.startsWith('-')) return;
+
     const key = `${username}:${message}`;
     const now = Date.now();
     if (now - (_chatDedup.get(key) ?? 0) < 3000) return;
@@ -745,7 +873,11 @@ bot.on('chat', (username, message) => {
         const cutoff = now - 5000;
         for (const [k, t] of _chatDedup) if (t < cutoff) _chatDedup.delete(k);
     }
-    process.send({ type: 'USER_CHAT', data: { username, message, environment: getEnvironmentContext() } });
+    // Improvement 1: '-!' prefix = async (non-interrupting status query).
+    // '-' prefix = normal instruction (interrupts current action).
+    const isAsync = message.startsWith('-!');
+    const cleanMessage = isAsync ? message.slice(2).trim() : message.slice(1).trim();
+    process.send({ type: 'USER_CHAT', data: { username, message: cleanMessage, async: isAsync, environment: getEnvironmentContext() } });
 });
 
 // ─── Internal Waypoint System ──────────────────────────────────────────────────
@@ -803,12 +935,16 @@ const _lootedChests = new Set();
 // Issue 2: Fall-tracking state for MLG water-bucket and safe-landing maneuvers.
 let _fallStartY = null;
 let _mlgAttempted = false;
+let _lavaEscapeActive = false;
 
 // Body (Action)
 let actionQueue = [];
 let currentCancelToken = { cancelled: false };
 let isExecuting = false;
 let movements = null; // initialized in 'spawn'
+// Issue 6: _inStopMode prevents auto-idle-combat loop after explicit stop.
+// Cleared on any new EXECUTE_ACTION that isn't pure stop.
+let _inStopMode = false;
 
 // ─── Self-defense ─────────────────────────────────────────────────────────────
 const HOSTILE_MOBS = new Set([
@@ -1406,6 +1542,37 @@ const STRUCTURE_MARKERS = {
     nether_portal:   ['nether_portal'],
 };
 
+// ─── Idle Combat Loop ─────────────────────────────────────────────────────────
+// Issue 6: Runs after completing all queued actions (and as the 'wait' action).
+// Fights hostiles within 16 blocks and chases those within 12 blocks,
+// until the cancel token is set (new instruction arrives or bot is stopped).
+async function runWaitLoop() {
+    while (!currentCancelToken.cancelled && !_inStopMode) {
+        if (!bot.entity || bot.health <= 0) {
+            await new Promise(r => setTimeout(r, 300));
+            continue;
+        }
+        const hostile = findNearestHostile(16);
+        if (hostile && hostile.isValid) {
+            const dist = bot.entity.position.distanceTo(hostile.position);
+            try { await bot.lookAt(hostile.position.offset(0, (hostile.height || 1.8) * 0.5, 0)); } catch(e) {}
+            if (dist <= 3.5) {
+                bot.attack(hostile);
+                equipBestWeapon().catch(() => {});
+                const offHand = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
+                if (offHand?.name === 'shield') bot.activateItem(true);
+            } else if (dist <= 12) {
+                bot.pathfinder.setGoal(new goals.GoalFollow(hostile, 2), true);
+            }
+        } else {
+            if (bot.pathfinder.isMoving()) bot.pathfinder.setGoal(null);
+            bot.deactivateItem();
+        }
+        await new Promise(r => setTimeout(r, 300));
+    }
+    try { bot.pathfinder.setGoal(null); bot.deactivateItem(); } catch(e) {}
+}
+
 // ─── Main Action Processor ────────────────────────────────────────────────────
 
 async function processActionQueue() {
@@ -1649,6 +1816,14 @@ async function processActionQueue() {
             } else if (action.action === 'come') {
                 const targetEntity = bot.players[action.target]?.entity;
                 if (targetEntity) {
+                    // Improvement 2: Disable digging during follow to prevent erratic block mining
+                    // while moving. The bot should navigate around obstacles, not through them.
+                    const savedCanDigCome = movements ? movements.canDig : true;
+                    if (movements) {
+                        movements.canDig = false;
+                        bot.pathfinder.setMovements(movements);
+                    }
+
                     bot.chat(`[System] Following ${action.target}!`);
                     bot.pathfinder.setGoal(new goals.GoalFollow(targetEntity, 2), true);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Now following ${action.target}.`, environment: getEnvironmentContext() } });
@@ -1680,6 +1855,12 @@ async function processActionQueue() {
                             }
                         }, 1000);
                     });
+
+                    // Restore canDig after come action ends
+                    if (movements) {
+                        movements.canDig = savedCanDigCome;
+                        bot.pathfinder.setMovements(movements);
+                    }
                 } else {
                     bot.chat(`[System Error] I cannot see ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to find ${action.target}.`, environment: getEnvironmentContext() } });
@@ -1687,7 +1868,9 @@ async function processActionQueue() {
 
             // ── goto (waypoints, internal, journeyMap, /locate, no distance cap) ─
             } else if (action.action === 'goto') {
-                const WAYPOINT_STEP = 64;
+                // Issue 1: 32-block steps halve the A* search space vs the previous 64,
+                // eliminating the "Took too long to decide path" timeout on complex terrain.
+                const WAYPOINT_STEP = 32;
                 let destX = action.x;
                 let destY = action.y;
                 let destZ = action.z;
@@ -1957,6 +2140,8 @@ async function processActionQueue() {
                         Math.pow(destX - bot.entity.position.x, 2) +
                         Math.pow((action.z || 0) - bot.entity.position.z, 2)
                     );
+                    // Issue 4: status feedback on completion
+                    bot.chat(`[System] Reached destination (${Math.round(finalDist)} blocks from target).`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Reached destination (${Math.round(finalDist)} blocks from target).`, environment: getEnvironmentContext() } });
                 }
 
@@ -2501,6 +2686,9 @@ async function processActionQueue() {
                     let _strafeSign = 1;
                     while (target.isValid && !currentCancelToken.cancelled) {
                         const now = Date.now();
+                        // Issue 4 fix: declare botPos at top of loop iteration to avoid TDZ.
+                        // Previously declared at line ~2631 but referenced earlier in the health check block.
+                        const botPos = bot.entity.position;
 
                         // ── Health check: eat or flee ─────────────────────────────────
                         if (bot.health < 10) {
@@ -2527,16 +2715,15 @@ async function processActionQueue() {
                         }
 
                         const dist = bot.entity.position.distanceTo(target.position);
-                        const botPos = bot.entity.position;
 
-                        // ── Issue 4: Projectile detection ─────────────────────────────
+                        // ── Issues 4 & 5: Projectile detection (extended to 20 blocks) ──
                         const incomingProj = Object.values(bot.entities).find(e => {
                             if (e === bot.entity || e === target) return false;
                             const n = (e.name || e.displayName || '').toLowerCase();
                             const isProj = n.includes('arrow') || n.includes('fireball') ||
                                            n.includes('snowball') || n.includes('shulker_bullet');
                             if (!isProj) return false;
-                            if (e.position.distanceTo(botPos) > 10) return false;
+                            if (e.position.distanceTo(botPos) > 20) return false; // Issue 5: was 10
                             const vel = e.velocity;
                             if (!vel) return true;
                             const toBot = botPos.minus(e.position).normalize();
@@ -2567,8 +2754,38 @@ async function processActionQueue() {
                         // ── Issue 5: Movement / attack decision ─────────────────────
                         if (isRanged) {
                             const IDEAL_MIN = 6, IDEAL_MAX = 16;
-                            if (dist > IDEAL_MAX) {
+                            const _heldSnowball = bot.heldItem?.name === 'snowball';
+                            const _hasSnowball  = bot.inventory.items().some(i => i.name === 'snowball');
+                            const _currentBow   = bot.heldItem?.name === 'bow';
+                            const _currentArrows = bot.inventory.items().some(i => i.name === 'arrow');
+                            // Issue 2: re-equip snowball if it fell out of hand (e.g. after eating)
+                            if (_hasSnowball && !_heldSnowball && !_bowCharging) {
+                                const sb = bot.inventory.items().find(i => i.name === 'snowball');
+                                if (sb) try { await bot.equip(sb, 'hand'); } catch(_) {}
+                            }
+                            // Issue 2: if no ranged weapon available, fall back to melee approach
+                            const canRanged = _heldSnowball || _hasSnowball || (_currentBow && _currentArrows);
+                            if (!canRanged) {
+                                // Melee fallback for ranged-classified mobs when ammo runs out
+                                if (dist > 3.5) {
+                                    bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
+                                } else {
+                                    bot.pathfinder.setGoal(null);
+                                    await bot.lookAt(target.position.offset(0, (target.height || 1.8) * 0.5, 0));
+                                    if (bot.entity.onGround) {
+                                        bot.setControlState('jump', true);
+                                        await new Promise(r => setTimeout(r, 80));
+                                        bot.setControlState('jump', false);
+                                    }
+                                    bot.attack(target);
+                                }
+                            } else if (dist > IDEAL_MAX) {
+                                // Issue 2: chase AND throw snowballs within extended range (up to 20 blocks)
                                 bot.pathfinder.setGoal(new goals.GoalFollow(target, IDEAL_MAX), true);
+                                if ((_heldSnowball || (_hasSnowball && bot.heldItem?.name === 'snowball')) && dist <= 20 && !_bowCharging) {
+                                    const targetEye2 = target.position.offset(0, (target.height || 1.8) * 0.9, 0);
+                                    try { await bot.lookAt(targetEye2); await bot.activateItem(); } catch(_) {}
+                                }
                             } else if (dist < IDEAL_MIN) {
                                 const angle = Math.atan2(botPos.z - target.position.z, botPos.x - target.position.x);
                                 const bx = botPos.x + 8 * Math.cos(angle);
@@ -2578,14 +2795,9 @@ async function processActionQueue() {
                                 bot.pathfinder.setGoal(null);
                                 const targetEye = target.position.offset(0, (target.height || 1.8) * 0.9, 0);
                                 await bot.lookAt(targetEye);
-                                const currentBow = bot.heldItem?.name === 'bow';
-                                const currentArrows = bot.inventory.items().some(i => i.name === 'arrow');
-                                // Prefer snowballs vs blazes (instant throw, 3 hearts damage)
-                                const heldSnowball = bot.heldItem?.name === 'snowball';
-                                const hasSnowball = bot.inventory.items().some(i => i.name === 'snowball');
-                                if (heldSnowball && !_bowCharging) {
+                                if (_heldSnowball && !_bowCharging) {
                                     try { await bot.activateItem(); } catch (e) {}
-                                } else if (currentBow && currentArrows && !_bowCharging) {
+                                } else if (_currentBow && _currentArrows && !_bowCharging) {
                                     bot.activateItem();
                                     _bowChargeStart = now;
                                     _bowCharging = true;
@@ -2663,9 +2875,12 @@ async function processActionQueue() {
                 }
 
                 if (killed >= killQty) {
+                    // Issue 4: status feedback on completion
+                    bot.chat(`[System] Eliminated ${killed} ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully killed ${killed} ${action.target}.`, environment: getEnvironmentContext() } });
                 } else if (killed > 0) {
                     actionQueue = []; // Clear queue on partial success to re-evaluate
+                    bot.chat(`[System] Partially eliminated ${killed}/${killQty} ${action.target}.`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Partially killed ${killed}/${killQty} ${action.target}.`, environment: getEnvironmentContext() } });
                 } else {
                     actionQueue = []; // Clear queue on failure
@@ -2865,6 +3080,9 @@ async function processActionQueue() {
                             } catch (e) {
                                 console.log(`[Actuator] Portal waypoint step: ${e.message}`);
                                 bot.clearControlStates();
+                                // Issue 4: break immediately if there is genuinely no path — retrying
+                                // costs another 38400ms per step and eventually triggers a keepalive timeout.
+                                if (e.message && e.message.toLowerCase().includes('no path')) break;
                             }
                             portalBlock = findPortalAll();
                             if (portalBlock) break;
@@ -3176,6 +3394,21 @@ async function processActionQueue() {
                 console.log(`[find_land] ${msg}`);
                 process.send({ type: 'USER_CHAT', data: { username: "System", message: msg, environment: getEnvironmentContext() } });
 
+            // ── stop ──────────────────────────────────────────────────────────
+            } else if (action.action === 'stop') {
+                // Issue 6: explicit stop — halt everything and disable idle combat
+                _inStopMode = true;
+                bot.pathfinder.setGoal(null);
+                try { bot.clearControlStates(); } catch(e) {}
+                bot.deactivateItem();
+
+            // ── wait ──────────────────────────────────────────────────────────
+            // Issue 6: enter idle-combat mode immediately (fights nearby threats
+            // until a new instruction cancels the token).
+            } else if (action.action === 'wait') {
+                bot.chat('[System] On standby. Monitoring for threats...');
+                await runWaitLoop();
+
             } // end action dispatch
 
         } catch (err) {
@@ -3186,10 +3419,28 @@ async function processActionQueue() {
         }
     }
 
+    // Issue 6: Auto-transition to idle combat after completing all queued actions.
+    // This loop runs until a new EXECUTE_ACTION arrives (sets currentCancelToken.cancelled)
+    // or the bot was explicitly stopped (_inStopMode = true).
+    if (!currentCancelToken.cancelled && !_inStopMode) {
+        await runWaitLoop();
+    }
+
     isExecuting = false;
 }
 
 process.on('message', async (msg) => {
+    // Improvement 1: ASYNC_CHAT delivers a response immediately without cancelling the current action.
+    // Used for '-!' prefixed queries (e.g. status checks while bot is busy with another task).
+    if (msg.type === 'ASYNC_CHAT') {
+        try {
+            if (bot._client?.socket?.writable === true && msg.text) {
+                bot.chat(msg.text);
+            }
+        } catch (e) {}
+        return;
+    }
+
     if (msg.type === 'EXECUTE_ACTION') {
         let actions = msg.action;
         if (!Array.isArray(actions)) actions = [actions];
@@ -3219,8 +3470,12 @@ process.on('message', async (msg) => {
 
         // 3. Exit if the command was only "stop"
         if (actions.length === 1 && actions[0].action === 'stop') {
+            _inStopMode = true; // Issue 6: prevent auto-idle-combat after stop
             return;
         }
+
+        // Any non-stop instruction clears stop mode
+        _inStopMode = false;
 
         if (remaining.length > 0) {
             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Task interrupted. Remaining actions in queue: ${JSON.stringify(remaining)}`, environment: getEnvironmentContext() } });
