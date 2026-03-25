@@ -640,7 +640,7 @@ bot.on('spawn', async () => {
     equipBestArmor().catch(() => {});
     equipBestWeapon().catch(() => {});
 
-    // ── Goal 3: Idle equipment-chest scanner (runs every 30s when bot is idle) ──
+    // ── Goal 3: Idle equipment-chest scanner + structure auto-waypoint (every 30s) ──
     setInterval(() => {
         if (!_botReady || isExecuting || actionQueue.length > 0) return;
         try {
@@ -660,6 +660,27 @@ bot.on('spawn', async () => {
                     processActionQueue();
                     break;
                 }
+            }
+        } catch (e) {}
+
+        // Issue 1: auto-register nearby structures as waypoints during idle.
+        try {
+            if (!bot.entity) return;
+            const ctx = getEnvironmentContext();
+            if (ctx.nearby_structures && ctx.nearby_structures.length > 0) {
+                const wps = loadWaypoints();
+                const dim = bot.game?.dimension || 'overworld';
+                let saved = false;
+                for (const struct of ctx.nearby_structures) {
+                    const wpName = struct.toLowerCase().replace(/\s+/g, '_');
+                    if (!wps.find(w => w.name === wpName)) {
+                        const pos = bot.entity.position;
+                        wps.push({ name: wpName, x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z), dimension: dim });
+                        bot.chat(`[System] Auto-registered waypoint "${wpName}".`);
+                        saved = true;
+                    }
+                }
+                if (saved) saveWaypoints(wps);
             }
         } catch (e) {}
     }, 30000);
@@ -919,6 +940,36 @@ function saveWaypoints(waypoints) {
 function findWaypoint(name) {
     const waypoints = loadWaypoints();
     return waypoints.find(w => w.name.toLowerCase() === name.toLowerCase()) || null;
+}
+
+// ─── Path Cache System ─────────────────────────────────────────────────────
+// Caches the last successful set of XZ waypoints used to reach a destination.
+// Reduces A* compute on repeated routes (e.g. base→mine, overworld→portal).
+const PATH_CACHE_FILE = path.join(process.cwd(), 'data', 'path_cache.json');
+const PATH_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+function loadPathCache() {
+    try {
+        if (fs.existsSync(PATH_CACHE_FILE)) {
+            return JSON.parse(fs.readFileSync(PATH_CACHE_FILE, 'utf8'));
+        }
+    } catch (e) {}
+    return {};
+}
+
+function savePathCache(cache) {
+    try {
+        const dir = path.dirname(PATH_CACHE_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(PATH_CACHE_FILE, JSON.stringify(cache, null, 2));
+    } catch (e) {
+        console.error(`[Actuator] Failed to save path cache: ${e.message}`);
+    }
+}
+
+function getPathCacheKey(destX, destZ, dimension) {
+    // Quantize to 16-block grid so nearby-destination queries get a cache hit.
+    return `${dimension || 'overworld'}:${Math.round(destX / 16) * 16}:${Math.round(destZ / 16) * 16}`;
 }
 
 // Structure name → minecraft:id mapping for /locate command
@@ -1190,6 +1241,33 @@ function withTimeout(promise, ms, actionName, cancelFn) {
         }, ms);
     });
     return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
+
+// Safety check before any blind forward movement.
+// Returns false if lava, fire, magma, or a >3-block cliff lies within 3 steps in angleRad direction.
+// Convention: angleRad = atan2(rdz, rdx) where cos(a)=dX, sin(a)=dZ (matches all movement code).
+function isSafeForward(angleRad) {
+    try {
+        const pos = bot.entity.position;
+        const fdx = Math.cos(angleRad), fdz = Math.sin(angleRad);
+        for (let step = 1; step <= 3; step++) {
+            const bx = Math.floor(pos.x + step * fdx);
+            const bz = Math.floor(pos.z + step * fdz);
+            const by = Math.floor(pos.y);
+            for (let dy = 0; dy <= 1; dy++) {
+                const b = bot.blockAt(new Vec3(bx, by + dy, bz));
+                if (b && (b.name.includes('lava') || b.name.includes('fire') || b.name === 'magma_block')) return false;
+            }
+            // Require solid ground within 3 blocks below to prevent walking off cliffs
+            let hasGround = false;
+            for (let dy = -1; dy >= -3; dy--) {
+                const b = bot.blockAt(new Vec3(bx, by + dy, bz));
+                if (b && b.boundingBox === 'block' && !b.name.includes('lava')) { hasGround = true; break; }
+            }
+            if (!hasGround) return false;
+        }
+        return true;
+    } catch (_) { return false; }
 }
 
 let debouncer = null; // initialized in 'spawn' — used for VeinMiner cascade detection
@@ -2070,9 +2148,36 @@ async function processActionQueue() {
                                 await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(wx3, wz3)), wpTimeout, 'goto XYZ step', () => bot.pathfinder.setGoal(null));
                             } catch (e) {
                                 console.log(`[Actuator] XYZ step error: ${e.message}`);
-                                // Re-allow digging on fail to bypass obstacle
                                 movements.canDig = true;
                                 bot.pathfinder.setMovements(movements);
+                                // Issue 3: half-step fallback — try 16-block step with a lower
+                                // thinkTimeout so the bot pauses at most 3s instead of 15s.
+                                const cx3f = bot.entity.position.x, cz3f = bot.entity.position.z;
+                                const a3f = Math.atan2(destZ - cz3f, destX - cx3f);
+                                const hx3 = cx3f + 16 * Math.cos(a3f);
+                                const hz3 = cz3f + 16 * Math.sin(a3f);
+                                const prevThink3 = bot.pathfinder.thinkTimeout;
+                                bot.pathfinder.thinkTimeout = 3000;
+                                try {
+                                    await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(hx3, hz3)), 6000, 'XYZ half-step', () => bot.pathfinder.setGoal(null));
+                                } catch (_) {
+                                    // Last resort: force-walk toward destination for 1.5s.
+                                    // Only execute if the path ahead is free of lava and cliffs.
+                                    if (isSafeForward(a3f)) {
+                                        bot.pathfinder.setGoal(null);
+                                        try {
+                                            await bot.lookAt(new Vec3(cx3f + 100 * Math.cos(a3f), bot.entity.position.y, cz3f + 100 * Math.sin(a3f)));
+                                        } catch (_2) {}
+                                        bot.setControlState('forward', true);
+                                        bot.setControlState('sprint', true);
+                                        await new Promise(r => setTimeout(r, 1500));
+                                        bot.setControlState('forward', false);
+                                        bot.setControlState('sprint', false);
+                                    } else {
+                                        console.log('[Actuator] XYZ force-walk aborted: hazard ahead.');
+                                    }
+                                }
+                                bot.pathfinder.thinkTimeout = prevThink3;
                             }
                         }
                         movements.canDig = savedCanDig;
@@ -2109,7 +2214,15 @@ async function processActionQueue() {
                     const total = Math.sqrt(dx0 * dx0 + dz0 * dz0);
                     bot.chat(`[System] Moving to X:${Math.round(destX)}, Z:${Math.round(destZ)}${total > WAYPOINT_STEP ? ` (~${Math.round(total)} blocks)` : ''}.`);
 
-                    let lastRem = total, stuck = 0;
+                    // Issue 2: Path cache — try to reuse the last successful route to this dest.
+                    const _dim = bot.game?.dimension || 'overworld';
+                    const _cacheKey = getPathCacheKey(destX, destZ, _dim);
+                    const _pathCache = loadPathCache();
+                    const _cachedEntry = _pathCache[_cacheKey];
+                    let _cacheWps = (_cachedEntry && Date.now() - _cachedEntry.ts < PATH_CACHE_MAX_AGE_MS)
+                        ? [..._cachedEntry.waypoints] : null;
+                    let _cacheIdx = 0;
+                    const _visitedWps = []; // track for saving on success
 
                     // Issue 4: Discourage tunneling on long trips
                     const savedCanDig = movements.canDig;
@@ -2118,75 +2231,172 @@ async function processActionQueue() {
                         bot.pathfinder.setMovements(movements);
                     }
 
+                    // ── Streaming lookahead goto ─────────────────────────────────────────────
+                    // Computes the next 32-block waypoint from the current position.
+                    // Uses the path cache if available, else fresh A* direction.
+                    // Returns null when already within 4 blocks of the destination.
+                    const _computeNextStreamWp = (cx, cz) => {
+                        if (_cacheWps) {
+                            const rdx = destX - cx, rdz = destZ - cz;
+                            // Advance past cache entries the bot has already passed
+                            while (_cacheIdx < _cacheWps.length) {
+                                const cw = _cacheWps[_cacheIdx];
+                                const cdist = Math.sqrt((cw.x - cx) ** 2 + (cw.z - cz) ** 2);
+                                const isAhead = (cw.x - cx) * rdx + (cw.z - cz) * rdz > 0;
+                                if (cdist > 8 && isAhead) break;
+                                _cacheIdx++;
+                            }
+                            if (_cacheIdx < _cacheWps.length) {
+                                return { x: _cacheWps[_cacheIdx].x, z: _cacheWps[_cacheIdx].z };
+                            }
+                            // Cache exhausted — fall through to fresh A*
+                            _cacheWps = null;
+                        }
+                        const rdx = destX - cx, rdz = destZ - cz;
+                        const rem = Math.sqrt(rdx * rdx + rdz * rdz);
+                        if (rem <= 4) return null;
+                        if (rem > WAYPOINT_STEP) {
+                            const a = Math.atan2(rdz, rdx);
+                            return { x: cx + WAYPOINT_STEP * Math.cos(a), z: cz + WAYPOINT_STEP * Math.sin(a) };
+                        }
+                        return { x: destX, z: destZ };
+                    };
+
+                    // HANDOFF_DIST: hand off to the next waypoint goal this many blocks early.
+                    // The pathfinder starts computing the next segment while the bot is still
+                    // moving — eliminating any inter-segment stop.
+                    const HANDOFF_DIST = 14;
+                    // STALL_MS: ms without movement before triggering stuck recovery.
+                    const STALL_MS = 4000;
+
+                    // Start the first segment immediately (streaming/dynamic goal)
+                    let _sw = _computeNextStreamWp(bot.entity.position.x, bot.entity.position.z);
+                    if (_sw) {
+                        bot.pathfinder.setGoal(new goals.GoalXZ(_sw.x, _sw.z), true);
+                    }
+
+                    let _stLastPos  = bot.entity.position.clone();
+                    let _stLastTime = Date.now();
+                    let _stuckCount = 0;
+
                     while (!currentCancelToken.cancelled) {
+                        await new Promise(r => setTimeout(r, 250)); // poll at ~4 Hz
+
                         const cx = bot.entity.position.x, cz = bot.entity.position.z;
                         const rdx = destX - cx, rdz = destZ - cz;
                         const rem = Math.sqrt(rdx * rdx + rdz * rdz);
-                        if (rem <= 4) break;  // close enough (was 2, too tight for XZ-only goals)
+                        if (rem <= 4) break;
 
-                        // If getting close, re-enable digging to ensure we can reach target
+                        // Re-enable digging when close to destination
                         if (rem <= 32 && movements.canDig === false) {
                             movements.canDig = savedCanDig;
                             bot.pathfinder.setMovements(movements);
                         }
 
-                        // Stuck detection: require at least 3 blocks progress per waypoint.
-                        if (rem >= lastRem - 3) {
-                            if (++stuck >= 5) {
-                                // Goal 1 fix: use a perpendicular escape instead of polluting
-                                // blocksCantBreak/blocksToAvoid (which causes permanent avoidance
-                                // of legitimate terrain types across the whole session).
-                                bot.chat('[System] I am stuck. Trying escape maneuver...');
-                                stuck = 0;
-                                lastRem = rem;
+                        // Movement progress tracking (time-based instead of per-step)
+                        const moved = Math.sqrt((cx - _stLastPos.x) ** 2 + (cz - _stLastPos.z) ** 2);
+                        if (moved > 0.5) {
+                            _stLastPos = bot.entity.position.clone();
+                            _stLastTime = Date.now();
+                            _stuckCount = 0;
+                        }
 
-                                // Re-enable digging on getting stuck
+                        const stalled = Date.now() - _stLastTime;
+                        if (stalled > STALL_MS) {
+                            _stLastTime = Date.now();
+                            _stLastPos  = bot.entity.position.clone();
+                            _stuckCount++;
+
+                            if (_stuckCount <= 2) {
+                                // Mild: jump to escape single-block lip catches
+                                bot.chat('[System] I am stuck. Trying jump escape...');
+                                _cacheWps = null; // stale cache may be guiding into a dead end
                                 if (movements.canDig === false) {
                                     movements.canDig = true;
                                     bot.pathfinder.setMovements(movements);
                                 }
-
-                                // Jump to break free from single-block lip catches
                                 bot.setControlState('jump', true);
                                 await new Promise(r => setTimeout(r, 400));
                                 bot.setControlState('jump', false);
-                                // Sidestep perpendicular to travel direction to get around the obstacle
-                                const a = Math.atan2(rdz, rdx);
-                                const perpX = cx + 5 * Math.cos(a + Math.PI / 2);
-                                const perpZ = cz + 5 * Math.sin(a + Math.PI / 2);
+                                _sw = _computeNextStreamWp(cx, cz);
+                                if (!_sw) break;
+                                bot.pathfinder.setGoal(new goals.GoalXZ(_sw.x, _sw.z), true);
+
+                            } else if (_stuckCount <= 4) {
+                                // Moderate: perpendicular sidestep
+                                bot.chat('[System] Still stuck. Trying sidestep...');
+                                const af = Math.atan2(rdz, rdx);
+                                const perpX = cx + 5 * Math.cos(af + Math.PI / 2);
+                                const perpZ = cz + 5 * Math.sin(af + Math.PI / 2);
+                                bot.pathfinder.setGoal(null);
                                 try {
-                                    await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(perpX, perpZ)), 6000, 'escape sidestep', () => bot.pathfinder.setGoal(null));
-                                } catch(e) { /* try other side */ }
-                                continue;
+                                    await withTimeout(
+                                        bot.pathfinder.goto(new goals.GoalXZ(perpX, perpZ)),
+                                        6000, 'escape sidestep', () => bot.pathfinder.setGoal(null)
+                                    );
+                                } catch (_e) { /* other side next attempt */ }
+                                _sw = _computeNextStreamWp(bot.entity.position.x, bot.entity.position.z);
+                                if (!_sw) break;
+                                bot.pathfinder.setGoal(new goals.GoalXZ(_sw.x, _sw.z), true);
+
+                            } else {
+                                // Severe: force-walk only if safe ahead (no lava/cliff)
+                                const af = Math.atan2(rdz, rdx);
+                                if (isSafeForward(af)) {
+                                    bot.pathfinder.setGoal(null);
+                                    try { await bot.lookAt(new Vec3(cx + 100 * Math.cos(af), bot.entity.position.y, cz + 100 * Math.sin(af))); } catch (_e) {}
+                                    bot.setControlState('forward', true);
+                                    bot.setControlState('sprint', true);
+                                    await new Promise(r => setTimeout(r, 1500));
+                                    bot.setControlState('forward', false);
+                                    bot.setControlState('sprint', false);
+                                } else {
+                                    bot.chat('[System] Blocked by hazard ahead. Cannot force-walk.');
+                                    console.log('[Actuator] Goto force-walk aborted: hazard ahead.');
+                                }
+                                if (_stuckCount >= 7) {
+                                    console.log('[Actuator] Stuck recovery exhausted (7 attempts). Aborting goto.');
+                                    break;
+                                }
+                                _sw = _computeNextStreamWp(bot.entity.position.x, bot.entity.position.z);
+                                if (!_sw) break;
+                                bot.pathfinder.setGoal(new goals.GoalXZ(_sw.x, _sw.z), true);
                             }
-                        } else {
-                            stuck = 0;
+                            continue;
                         }
-                        lastRem = rem;
 
-                        let wpX = destX, wpZ = destZ;
-                        if (rem > WAYPOINT_STEP) {
-                            const a = Math.atan2(rdz, rdx);
-                            wpX = cx + WAYPOINT_STEP * Math.cos(a);
-                            wpZ = cz + WAYPOINT_STEP * Math.sin(a);
-                        }
-                        try {
-                            await withTimeout(bot.pathfinder.goto(new goals.GoalXZ(wpX, wpZ)), wpTimeout, 'goto XZ waypoint', () => { try { bot.pathfinder.setGoal(null); bot.clearControlStates(); } catch (_) {} });
-                        } catch (wpErr) {
-                            // Per-waypoint failure is NOT fatal — the bot might still make
-                            // progress.  Log it and let the stuck detector handle retries.
-                            bot.clearControlStates();
-                            console.log(`[Actuator] goto waypoint error: ${wpErr.message}`);
-
-                            if (movements.canDig === false) {
-                                movements.canDig = true;
-                                bot.pathfinder.setMovements(movements);
+                        // ── Lookahead handoff ────────────────────────────────────────────────
+                        // When HANDOFF_DIST blocks away from the current streaming waypoint,
+                        // immediately switch goal to the next one. The pathfinder recomputes
+                        // the next segment while the bot is still moving forward — zero pause.
+                        if (_sw) {
+                            const d2sw = Math.sqrt((cx - _sw.x) ** 2 + (cz - _sw.z) ** 2);
+                            if (d2sw < HANDOFF_DIST) {
+                                _visitedWps.push({ x: Math.round(_sw.x), z: Math.round(_sw.z) });
+                                const nextSw = _computeNextStreamWp(cx, cz);
+                                if (!nextSw) break; // reached destination vicinity
+                                _sw = nextSw;
+                                // Switch goal while still in motion — no inter-segment stop
+                                bot.pathfinder.setGoal(new goals.GoalXZ(_sw.x, _sw.z), true);
                             }
                         }
                     }
 
+                    // Stop streaming goal and restore settings
+                    try { bot.pathfinder.setGoal(null); bot.clearControlStates(); } catch (_e) {}
                     movements.canDig = savedCanDig;
                     bot.pathfinder.setMovements(movements);
+
+                    // Issue 2: save successful path to cache (only if we made meaningful progress).
+                    if (!currentCancelToken.cancelled && _visitedWps.length >= 2) {
+                        const updatedCache = loadPathCache();
+                        updatedCache[_cacheKey] = { waypoints: _visitedWps, ts: Date.now() };
+                        // Evict entries older than max age to keep cache file small.
+                        for (const k of Object.keys(updatedCache)) {
+                            if (Date.now() - updatedCache[k].ts > PATH_CACHE_MAX_AGE_MS) delete updatedCache[k];
+                        }
+                        savePathCache(updatedCache);
+                    }
                 }
                 if (!currentCancelToken.cancelled) {
                     const finalDist = Math.sqrt(
@@ -2196,6 +2406,24 @@ async function processActionQueue() {
                     // Issue 4: status feedback on completion
                     bot.chat(`[System] Reached destination (${Math.round(finalDist)} blocks from target).`);
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Reached destination (${Math.round(finalDist)} blocks from target).`, environment: getEnvironmentContext() } });
+
+                    // Issue 1: auto-register nearby structures as waypoints.
+                    const ctx = getEnvironmentContext();
+                    if (ctx.nearby_structures && ctx.nearby_structures.length > 0) {
+                        const wps = loadWaypoints();
+                        const dim = bot.game?.dimension || 'overworld';
+                        let saved = false;
+                        for (const struct of ctx.nearby_structures) {
+                            const wpName = struct.toLowerCase().replace(/\s+/g, '_');
+                            if (!wps.find(w => w.name === wpName)) {
+                                const pos = bot.entity.position;
+                                wps.push({ name: wpName, x: Math.round(pos.x), y: Math.round(pos.y), z: Math.round(pos.z), dimension: dim });
+                                bot.chat(`[System] Auto-registered waypoint "${wpName}".`);
+                                saved = true;
+                            }
+                        }
+                        if (saved) saveWaypoints(wps);
+                    }
                 }
 
             // ── collect (3× candidate pool + progressive radius fallback) ─────
@@ -2737,6 +2965,7 @@ async function processActionQueue() {
                     let _shieldUntil = 0;
                     let _lastStrafe = 0;
                     let _strafeSign = 1;
+                    let _lastAttack = 0; // Issue 4: track attack cooldown
                     while (target.isValid && !currentCancelToken.cancelled) {
                         const now = Date.now();
                         // Issue 4 fix: declare botPos at top of loop iteration to avoid TDZ.
@@ -2790,7 +3019,7 @@ async function processActionQueue() {
                                 bot.activateItem(true);
                                 _shieldUntil = now + 1000;
                             } else {
-                                // No shield — strafe perpendicular
+                                // No shield — strafe perpendicular (Issue 5: use setGoal, not goto)
                                 if (now - _lastStrafe > 600) {
                                     _strafeSign *= -1;
                                     _lastStrafe = now;
@@ -2798,7 +3027,7 @@ async function processActionQueue() {
                                 const dodgeYaw = bot.entity.yaw + (_strafeSign * Math.PI / 2);
                                 const sx = botPos.x + 4 * Math.sin(dodgeYaw);
                                 const sz = botPos.z + 4 * Math.cos(dodgeYaw);
-                                bot.pathfinder.goto(new goals.GoalXZ(sx, sz)).catch(() => {});
+                                bot.pathfinder.setGoal(new goals.GoalXZ(sx, sz), true);
                             }
                         } else if (now > _shieldUntil) {
                             bot.deactivateItem();
@@ -2840,10 +3069,11 @@ async function processActionQueue() {
                                     try { await bot.lookAt(targetEye2); await bot.activateItem(); } catch(_) {}
                                 }
                             } else if (dist < IDEAL_MIN) {
+                                // Issue 5: use setGoal (streaming) instead of goto (one-shot blocking)
                                 const angle = Math.atan2(botPos.z - target.position.z, botPos.x - target.position.x);
                                 const bx = botPos.x + 8 * Math.cos(angle);
                                 const bz = botPos.z + 8 * Math.sin(angle);
-                                bot.pathfinder.goto(new goals.GoalXZ(bx, bz)).catch(() => {});
+                                bot.pathfinder.setGoal(new goals.GoalXZ(bx, bz), true);
                             } else {
                                 bot.pathfinder.setGoal(null);
                                 const targetEye = target.position.offset(0, (target.height || 1.8) * 0.9, 0);
@@ -2861,49 +3091,56 @@ async function processActionQueue() {
                                 }
                             }
                         } else {
-                            // ── Melee combat: kite-attack pattern ───────────────────────
-                            // Low-health retreat: back off to regenerate, then re-engage
+                            // ── Melee combat: kite-attack pattern ─────────────────────
+                            // Issue 4: Tactical sequence — approach → jump-crit → retreat
+                            // directly away from mob → wait for attack cooldown → re-engage.
+                            // Issue 5: All movement uses setGoal(..., true) so there are
+                            // no blocking await goto() calls competing with health/projectile
+                            // checks on the same 150ms loop tick.
+                            const MELEE_ATTACK_RANGE = 2.8; // max dist to swing (1 block arm reach + buffer)
+                            const MELEE_FOLLOW_STOP  = 2;   // GoalFollow keeps bot this far from mob
+                            const RETREAT_DIST       = 7;   // blocks to flee after each attack
+                            const ATTACK_COOLDOWN_MS = 625; // sword = 1.6 attacks/s → 625ms between hits
+
                             if (bot.health < 6) {
-                                bot.pathfinder.setGoal(null);
-                                if (_bowCharging) { bot.deactivateItem(); _bowCharging = false; }
-                                // Flee directly away from mob
+                                // Critical HP: flee directly away, no attacking until health recovers.
                                 const fleeAngle = Math.atan2(botPos.z - target.position.z, botPos.x - target.position.x);
-                                const fx = botPos.x + 12 * Math.cos(fleeAngle);
-                                const fz = botPos.z + 12 * Math.sin(fleeAngle);
-                                bot.pathfinder.goto(new goals.GoalXZ(fx, fz)).catch(() => {});
-                                await new Promise(r => setTimeout(r, 600));
-                            } else if (dist > 3.5) {
-                                // Close the gap — use GoalFollow so bot keeps up if mob moves
-                                bot.pathfinder.setGoal(new goals.GoalFollow(target, 2), true);
-                            } else {
+                                const fx = botPos.x + 14 * Math.cos(fleeAngle);
+                                const fz = botPos.z + 14 * Math.sin(fleeAngle);
+                                bot.pathfinder.setGoal(new goals.GoalXZ(fx, fz), true);
+                            } else if (dist <= MELEE_ATTACK_RANGE && now - _lastAttack >= ATTACK_COOLDOWN_MS) {
+                                // In melee range and cooldown ready: stop, swing, retreat.
                                 bot.pathfinder.setGoal(null);
-                                await bot.lookAt(target.position.offset(0, (target.height || 1.8) * 0.5, 0));
+                                try {
+                                    await bot.lookAt(target.position.offset(0, (target.height || 1.8) * 0.5, 0));
+                                    if (bot.entity.onGround) {
+                                        bot.setControlState('jump', true);
+                                        await new Promise(r => setTimeout(r, 80));
+                                        bot.setControlState('jump', false);
+                                    }
+                                    bot.attack(target);
+                                    _lastAttack = now;
+                                } catch (_) {}
 
-                                // Jump-attack: jump before swinging for 150% damage critical hit
-                                if (bot.entity.onGround) {
-                                    bot.setControlState('jump', true);
-                                    await new Promise(r => setTimeout(r, 80));
-                                    bot.setControlState('jump', false);
-                                }
-                                bot.attack(target);
-
-                                // Shield up immediately after attack
+                                // Shield up after attack to absorb any counter-hit.
                                 const offSlotM = bot.inventory.slots[bot.getEquipmentDestSlot('off-hand')];
                                 if (offSlotM?.name === 'shield') {
                                     bot.activateItem(true);
                                     _shieldUntil = now + 700;
                                 }
 
-                                // Strafe away after attacking — perpendicular escape
-                                if (now - _lastStrafe > 400) {
-                                    _strafeSign *= -1;
-                                    _lastStrafe = now;
-                                }
-                                const strafeYaw = bot.entity.yaw + (_strafeSign * Math.PI / 2);
-                                const stx = botPos.x + 3 * Math.sin(strafeYaw);
-                                const stz = botPos.z + 3 * Math.cos(strafeYaw);
-                                bot.pathfinder.goto(new goals.GoalXZ(stx, stz)).catch(() => {});
+                                // Retreat directly away from mob — creates real spacing.
+                                // (Previous strafe-perpendicular only side-stepped, keeping
+                                // the bot at close range where the mob could immediately re-hit.)
+                                const retreatAngle = Math.atan2(botPos.z - target.position.z, botPos.x - target.position.x);
+                                const rx = botPos.x + RETREAT_DIST * Math.cos(retreatAngle);
+                                const rz = botPos.z + RETREAT_DIST * Math.sin(retreatAngle);
+                                bot.pathfinder.setGoal(new goals.GoalXZ(rx, rz), true);
+                            } else if (dist > MELEE_ATTACK_RANGE) {
+                                // Not in range yet — follow the target.
+                                bot.pathfinder.setGoal(new goals.GoalFollow(target, MELEE_FOLLOW_STOP), true);
                             }
+                            // else: in range but cooldown not ready — hold; next tick will attack.
                         }
                         await new Promise(r => setTimeout(r, 150)); // 150ms tick for faster reaction
                     }
