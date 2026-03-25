@@ -46,37 +46,5 @@
     "dimension": "the_nether",
     "time": "2026-03-25T02:26:55.057Z",
     "status": "incomplete"
-  },
-  {
-    "x": -527.0331117322082,
-    "y": 77,
-    "z": -232.925,
-    "dimension": "the_nether",
-    "time": "2026-03-25T03:18:01.601Z",
-    "status": "incomplete"
-  },
-  {
-    "x": -525.6005397971642,
-    "y": 76,
-    "z": -237.31134777370656,
-    "dimension": "the_nether",
-    "time": "2026-03-25T04:02:42.145Z",
-    "status": "pending"
-  },
-  {
-    "x": -152.39341556460727,
-    "y": 52,
-    "z": -84.31749645989792,
-    "dimension": "the_nether",
-    "time": "2026-03-25T04:48:02.382Z",
-    "status": "cancelled"
-  },
-  {
-    "x": -137.5,
-    "y": 52,
-    "z": -83.4996812267922,
-    "dimension": "the_nether",
-    "time": "2026-03-25T04:49:18.768Z",
-    "status": "cancelled"
   }
 ]
