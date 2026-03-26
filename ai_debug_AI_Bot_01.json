@@ -1,24 +1,15 @@
 {
-  "timestamp": "2026-03-26T10:25:14.366Z",
+  "timestamp": "2026-03-26T13:42:33.987Z",
   "ready": true,
   "position": {
-    "x": -40.5,
+    "x": -25.6,
     "y": 63,
-    "z": 27.5
+    "z": 37.6
   },
-  "health": 20,
-  "food": 20,
-  "isExecuting": false,
-  "actionQueue": [
-    {
-      "action": "loot_chest_special",
-      "target": {
-        "x": -32,
-        "y": 67,
-        "z": 30
-      }
-    }
-  ],
+  "health": 2,
+  "food": 17,
+  "isExecuting": true,
+  "actionQueue": [],
   "treeDir": null,
   "inventory": [
     {
@@ -31,6 +22,6 @@
     "torso": null,
     "legs": null,
     "feet": null,
-    "hand": null
+    "hand": "create:metal_girder"
   }
 }
