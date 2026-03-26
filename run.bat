@@ -1,5 +1,4 @@
 @echo off
-<<<<<<< HEAD
 title Forge AI Player System
 cd /d "%~dp0"
 
