@@ -63,6 +63,8 @@ class WebUIServer {
             const { id } = req.params;
             const proc = m.bots.get(id);
             if (!proc) return res.status(404).json({ error: 'Bot not found' });
+            // Clear connection options first so handleProcessCrash won't auto-restart this bot
+            m.botConnOptions.delete(id);
             proc.kill('SIGINT');
             res.json({ ok: true });
         });

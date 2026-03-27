@@ -97,7 +97,7 @@ class AgentManager {
     }
 
     handleProcessCrash(botId, code) {
-        if (code !== 0 && code !== null) {
+        if (code !== 0 && code !== null && this.botConnOptions.has(botId)) {
             console.error(`[AgentManager] Bot process ${botId} crashed with code ${code}.`);
             this.scheduleRestart(botId);
         }

@@ -89,9 +89,11 @@ function connectWS() {
                 break;
 
             case 'bot_disconnected':
-                if (state.bots[msg.botId]) state.bots[msg.botId].online = false;
-                renderBotCard(msg.botId);
-                updateHeaderCount();
+                if (state.bots[msg.botId]) {
+                    state.bots[msg.botId].online = false;
+                    renderBotCard(msg.botId);
+                    updateHeaderCount();
+                }
                 break;
         }
     };
