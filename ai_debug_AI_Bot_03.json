@@ -1,13 +1,155 @@
 {
-  "timestamp": "2026-03-25T18:40:12.120Z",
+  "timestamp": "2026-03-27T06:16:23.416Z",
   "ready": true,
   "position": {
-    "x": -390.5,
-    "y": 66,
-    "z": -538.5
+    "x": 1113.5,
+    "y": 63,
+    "z": 673.5
   },
   "health": 20,
   "food": 20,
   "isExecuting": true,
-  "actionQueue": []
+  "actionQueue": [],
+  "treeDir": null,
+  "inventory": [
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": ".minecraft:entity.parrot.imitate.elder_guardian",
+      "count": 4
+    },
+    {
+      "name": "createbigcannons:set_delayed_inertia_fuze-",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "oak_log",
+      "count": 5
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "wheat_seeds",
+      "count": 3
+    },
+    {
+      "name": "iron_shovel",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_boots",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "carved_pumpkin",
+      "count": 3
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    }
+  ],
+  "armor": {
+    "head": null,
+    "torso": null,
+    "legs": null,
+    "feet": "iron_boots",
+    "hand": "iron_axe"
+  }
 }
