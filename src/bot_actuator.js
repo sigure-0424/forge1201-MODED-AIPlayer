@@ -761,6 +761,9 @@ bot.on('spawn', async () => {
                 _lastSafePos = bot.entity.position.clone();
                 _lastSafeDim = bot.game?.dimension || 'overworld';
             }
+
+            // Auto-shredder: drop junk items when inventory is nearly full
+            if (!_inStopMode) _runAutoShredder().catch(() => {});
         } catch (e) {
             console.error(`[Actuator] Failed to write ai_debug: ${e.message}`);
         }
@@ -1060,6 +1063,52 @@ let movements = null; // initialized in 'spawn'
 // Issue 6: _inStopMode prevents auto-idle-combat loop after explicit stop.
 // Cleared on any new EXECUTE_ACTION that isn't pure stop.
 let _inStopMode = false;
+
+// ─── Auto-Shredder ────────────────────────────────────────────────────────────
+const JUNK_LIST_FILE = path.join(process.cwd(), 'data', 'junk_list.json');
+const DEFAULT_JUNK_LIST = [
+    'granite', 'diorite', 'andesite', 'tuff', 'calcite',
+    'dirt', 'gravel', 'netherrack', 'rotten_flesh',
+    'poisonous_potato', 'ink_sac'
+];
+let _junkList = new Set(DEFAULT_JUNK_LIST);
+
+function _loadJunkList() {
+    try {
+        if (fs.existsSync(JUNK_LIST_FILE)) {
+            _junkList = new Set(JSON.parse(fs.readFileSync(JUNK_LIST_FILE, 'utf8')));
+        } else {
+            _saveJunkList();
+        }
+    } catch (e) { _junkList = new Set(DEFAULT_JUNK_LIST); }
+}
+
+function _saveJunkList() {
+    try {
+        const dir = path.dirname(JUNK_LIST_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(JUNK_LIST_FILE, JSON.stringify([..._junkList], null, 2));
+    } catch (e) {}
+}
+
+// Run only when inventory is nearly full (≤4 free slots)
+async function _runAutoShredder() {
+    if (!bot.inventory) return;
+    const items = bot.inventory.items();
+    // Count occupied 36-slot hotbar+main inventory slots
+    const usedSlots = new Set(items.filter(i => i.slot >= 9 && i.slot <= 44).map(i => i.slot)).size;
+    if (usedSlots < 32) return; // plenty of space, nothing to do
+    for (const item of items) {
+        if (_junkList.has(item.name) && item.slot >= 9) {
+            try {
+                await bot.toss(item.type, null, item.count);
+                console.log(`[AutoShredder] Discarded ${item.count}x ${item.name}`);
+            } catch (e) {}
+        }
+    }
+}
+
+_loadJunkList();
 
 // ─── Self-defense ─────────────────────────────────────────────────────────────
 const HOSTILE_MOBS = new Set([
@@ -1427,9 +1476,23 @@ const ARMOR_TIERS = ['netherite', 'diamond', 'iron', 'golden', 'chainmail', 'lea
 const ARMOR_PIECES = { head: 'helmet', torso: 'chestplate', legs: 'leggings', feet: 'boots' };
 async function equipBestArmor() {
     for (const [slot, piece] of Object.entries(ARMOR_PIECES)) {
-        for (const tier of ARMOR_TIERS) {
-            const a = bot.inventory.items().find(i => i.name === `${tier}_${piece}`);
-            if (a) { try { await bot.equip(a, slot); } catch (e) {} break; }
+        const destSlot = bot.getEquipmentDestSlot(slot);
+        const currentEquipped = bot.inventory.slots[destSlot];
+        // Index of currently equipped tier (lower = better; ARMOR_TIERS.length = nothing equipped)
+        const currentTierIdx = currentEquipped
+            ? ARMOR_TIERS.findIndex(t => currentEquipped.name === `${t}_${piece}`)
+            : ARMOR_TIERS.length;
+        const effectiveIdx = currentTierIdx === -1 ? ARMOR_TIERS.length : currentTierIdx;
+
+        for (let i = 0; i < effectiveIdx; i++) {
+            const a = bot.inventory.items().find(itm => itm.name === `${ARMOR_TIERS[i]}_${piece}`);
+            if (a) {
+                try {
+                    if (currentEquipped) await bot.unequip(slot);
+                    await bot.equip(a, slot);
+                } catch (e) {}
+                break;
+            }
         }
     }
 }
@@ -1463,12 +1526,13 @@ function getEquipmentContainerIds() {
  * 1 of each armor piece that the bot is currently missing.  Returns items taken.
  */
 async function withdrawNeededEquipment(containerWindow) {
-    const invItems = bot.inventory.items();
     const equippedNames = new Set(
         ['head', 'torso', 'legs', 'feet']
             .map(s => bot.inventory.slots[bot.getEquipmentDestSlot(s)]?.name)
             .filter(Boolean)
     );
+    // Use a mutable set so items taken during this session are not taken again
+    const alreadyHaveNames = new Set(bot.inventory.items().map(i => i.name));
     let taken = 0;
     for (const item of containerWindow.containerItems()) {
         if (currentCancelToken.cancelled) break;
@@ -1478,8 +1542,12 @@ async function withdrawNeededEquipment(containerWindow) {
             ARMOR_TIERS.some(t => Object.values(ARMOR_PIECES).some(p => name === `${t}_${p}`));
         if (!isGear) continue;
         if (equippedNames.has(name)) continue;
-        if (invItems.some(i => i.name === name)) continue;
-        try { await containerWindow.withdraw(item.type, null, 1); taken++; } catch (e) {}
+        if (alreadyHaveNames.has(name)) continue;
+        try {
+            await containerWindow.withdraw(item.type, null, 1);
+            alreadyHaveNames.add(name); // Prevent taking a second copy this session
+            taken++;
+        } catch (e) {}
     }
     return taken;
 }
@@ -2867,6 +2935,14 @@ async function processActionQueue() {
                 const itemId = bot.registry.itemsByName[action.target]?.id || bot.registry.blocksByName[action.target]?.id;
                 if (itemId !== undefined) {
                     const quantity = parseInt(action.quantity, 10) || 1;
+                    // _craftPath tracks the call chain to detect cycles (e.g. planks→boat→planks)
+                    const craftPath = action._craftPath || [];
+
+                    if (craftPath.includes(action.target)) {
+                        bot.chat(`[System Error] Crafting cycle detected for ${action.target}.`);
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Crafting cycle: cannot craft ${action.target} (in ${craftPath.join(' → ')}).`, environment: getEnvironmentContext() } });
+                        continue;
+                    }
 
                     const inventoryMap = {};
                     if (bot.inventory) {
@@ -2874,17 +2950,9 @@ async function processActionQueue() {
                             inventoryMap[item.name] = (inventoryMap[item.name] || 0) + item.count;
                         }
                     }
-                    if (bot.chestMemory) {
-                        for (const [chestPosKey, chestItems] of Object.entries(bot.chestMemory)) {
-                            for (const item of chestItems) {
-                                inventoryMap[item.name] = (inventoryMap[item.name] || 0) + item.count;
-                            }
-                        }
-                    }
 
-                    // 1. Dependency Tree Check
+                    // 1. Dependency Tree — check raw materials are available
                     const requiredTree = resolveRequiredMaterials(action.target, quantity, inventoryMap);
-
                     const missing = [];
                     for (const [name, qty] of Object.entries(requiredTree)) {
                         if (qty > 0) missing.push({ name, quantity: qty });
@@ -2894,69 +2962,97 @@ async function processActionQueue() {
                         actionQueue = []; // Clear queue on failure
                         bot.chat(`[System Error] Cannot craft ${action.target}: missing materials.`);
                         const missingStr = missing.map(m => `${m.quantity}x ${m.name}`).join(', ');
-                        process.send({
-                            type: 'USER_CHAT',
-                            data: {
-                                username: "System",
-                                message: `Cannot craft ${action.target}: missing materials. You strictly need to collect: ${missingStr}. Generate actions to collect these specific materials before retrying.`,
-                                environment: getEnvironmentContext()
-                            }
-                        });
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: missing materials. You strictly need to collect: ${missingStr}. Generate actions to collect these specific materials before retrying.`, environment: getEnvironmentContext() } });
                         continue;
                     }
 
+                    // 2. Get recipe (always fetch; `true` = include table recipes)
                     const recipe = bot.recipesFor(itemId, null, 1, true)[0];
-                    if (recipe) {
-                        bot.chat(`[System] Crafting ${action.target}...`);
+                    if (!recipe) {
+                        actionQueue = [];
+                        bot.chat(`[System Error] Cannot craft ${action.target}: recipe not found.`);
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: recipe not found.`, environment: getEnvironmentContext() } });
+                        continue;
+                    }
 
-                        // 2. Isolated Crafting Table Check
-                        if (recipe.requiresTable) {
-                            const ctId = bot.registry.blocksByName.crafting_table.id;
-                            const ct = bot.findBlock({ matching: ctId, maxDistance: 4 });
+                    // 3. Check direct ingredients — auto-prepend sub-crafts for any that are missing
+                    //    This handles intermediate materials (e.g. oak_log → planks → boat) without
+                    //    requiring the LLM to enumerate every step.
+                    const ingCounts = {};
+                    const addIng = (id) => {
+                        if (id == null) return;
+                        const itm = bot.registry.items[id] || bot.registry.blocks[id];
+                        if (!itm) return;
+                        ingCounts[itm.name] = (ingCounts[itm.name] || 0) + 1;
+                    };
+                    if (recipe.ingredients) {
+                        for (const ing of recipe.ingredients) addIng(Array.isArray(ing) ? ing[0] : ing);
+                    } else if (recipe.inShape) {
+                        for (const row of recipe.inShape) for (const ing of row) addIng(Array.isArray(ing) ? ing[0] : ing);
+                    }
 
-                            if (ct) {
-                                await withTimeout(bot.pathfinder.goto(new goals.GoalNear(ct.position.x, ct.position.y, ct.position.z, 1)), timeoutMs, 'goto crafting table', () => bot.pathfinder.setGoal(null));
-                                try {
-                                    await withTimeout(bot.craft(recipe, quantity, ct), timeoutMs, 'craft at table');
-                                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully crafted ${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
-                                } catch (err) {
-                                    bot.chat(`[System Error] Failed to craft ${action.target}.`);
-                                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to craft: ${err.message}`, environment: getEnvironmentContext() } });
-                                }
-                            } else {
-                                bot.chat(`[System] Need a crafting table nearby for ${action.target}. Preparing one...`);
-                                // Determine the available log to craft with.
-                                const logs = bot.inventory.items().filter(i => i.name.endsWith('_log') || i.name.endsWith('_wood'));
-                                const bestLog = logs.length > 0 ? logs[0].name : "oak_log";
-                                const bestPlank = bestLog.replace(/_log$|_wood$/, '_planks');
+                    const recipeYield = recipe.result ? recipe.result.count : 1;
+                    const craftsNeeded = Math.ceil(quantity / recipeYield);
+                    const preCrafts = [];
 
-                                // Bypass LLM and prepend deterministic actions
-                                const deterministicActions = [
-                                    { action: "collect", target: bestLog, quantity: 1, timeout: 60 },
-                                    { action: "craft", target: bestPlank, quantity: 1 },
-                                    { action: "craft", target: "crafting_table", quantity: 1 },
-                                    { action: "place", target: "crafting_table" },
-                                    action // retry the original craft
-                                ];
+                    for (const [ingName, ingPerCraft] of Object.entries(ingCounts)) {
+                        const needed = ingPerCraft * craftsNeeded;
+                        const have = inventoryMap[ingName] || 0;
+                        if (have < needed) {
+                            preCrafts.push({
+                                action: "craft",
+                                target: ingName,
+                                quantity: needed - have,
+                                _craftPath: [...craftPath, action.target]
+                            });
+                        }
+                    }
 
-                                // Put remaining actions after deterministic recovery
-                                const remaining = [...actionQueue];
-                                actionQueue = [...deterministicActions, ...remaining];
-                            }
-                        } else {
+                    if (preCrafts.length > 0) {
+                        // Prepend intermediate craft steps, then retry this craft action
+                        bot.chat(`[System] Preparing ${preCrafts.map(c => c.target).join(', ')} before crafting ${action.target}...`);
+                        actionQueue = [...preCrafts, action, ...actionQueue];
+                        continue;
+                    }
+
+                    // 4. All direct ingredients present — craft now
+                    bot.chat(`[System] Crafting ${action.target}...`);
+                    if (recipe.requiresTable) {
+                        const ctId = bot.registry.blocksByName.crafting_table.id;
+                        const ct = ctId !== undefined ? bot.findBlock({ matching: ctId, maxDistance: 32 }) : null;
+
+                        if (ct) {
+                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(ct.position.x, ct.position.y, ct.position.z, 1)), timeoutMs, 'goto crafting table', () => bot.pathfinder.setGoal(null));
                             try {
-                                await withTimeout(bot.craft(recipe, quantity, null), timeoutMs, 'craft in inventory');
+                                await withTimeout(bot.craft(recipe, quantity, ct), timeoutMs, 'craft at table');
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully crafted ${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
                             } catch (err) {
-                                actionQueue = []; // Clear queue on failure
                                 bot.chat(`[System Error] Failed to craft ${action.target}.`);
                                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to craft: ${err.message}`, environment: getEnvironmentContext() } });
                             }
+                        } else {
+                            bot.chat(`[System] Need a crafting table for ${action.target}. Preparing one...`);
+                            const logs = bot.inventory.items().filter(i => i.name.endsWith('_log') || i.name.endsWith('_wood'));
+                            const bestLog = logs.length > 0 ? logs[0].name : "oak_log";
+                            const bestPlank = bestLog.replace(/_log$|_wood$/, '_planks');
+                            actionQueue = [
+                                { action: "collect", target: bestLog, quantity: 1, timeout: 60 },
+                                { action: "craft", target: bestPlank, quantity: 4, _craftPath: [...craftPath, action.target] },
+                                { action: "craft", target: "crafting_table", quantity: 1, _craftPath: [...craftPath, action.target] },
+                                { action: "place", target: "crafting_table" },
+                                action, // retry original craft
+                                ...actionQueue
+                            ];
                         }
                     } else {
-                        actionQueue = []; // Clear queue on failure
-                        bot.chat(`[System Error] Cannot craft ${action.target}: recipe not found.`);
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Cannot craft ${action.target}: recipe not found.`, environment: getEnvironmentContext() } });
+                        try {
+                            await withTimeout(bot.craft(recipe, quantity, null), timeoutMs, 'craft in inventory');
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully crafted ${quantity} ${action.target}.`, environment: getEnvironmentContext() } });
+                        } catch (err) {
+                            actionQueue = [];
+                            bot.chat(`[System Error] Failed to craft ${action.target}.`);
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Failed to craft: ${err.message}`, environment: getEnvironmentContext() } });
+                        }
                     }
                 } else {
                     actionQueue = []; // Clear queue on failure
@@ -2997,9 +3093,33 @@ async function processActionQueue() {
                     const item = bot.inventory.items().find(i => i.type === itemId);
                     if (item) {
                         try {
-                            await bot.equip(item, 'hand');
-                            bot.chat(`[System] Equipped ${action.target}.`);
-                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Equipped ${action.target}.`, environment: getEnvironmentContext() } });
+                            // Auto-detect destination slot from item name unless caller specifies one
+                            let destSlotName = action.slot || 'hand';
+                            if (!action.slot) {
+                                const n = itemName;
+                                if (n.endsWith('_helmet') || n === 'carved_pumpkin' || n === 'pumpkin'
+                                    || n.endsWith('_head') || n.endsWith('_skull')) {
+                                    destSlotName = 'head';
+                                } else if (n.endsWith('_chestplate') || n === 'elytra') {
+                                    destSlotName = 'torso';
+                                } else if (n.endsWith('_leggings')) {
+                                    destSlotName = 'legs';
+                                } else if (n.endsWith('_boots')) {
+                                    destSlotName = 'feet';
+                                } else if (n === 'shield' || n === 'totem_of_undying') {
+                                    destSlotName = 'off-hand';
+                                }
+                            }
+                            // Unequip whatever is currently in that slot so bot.equip never fails
+                            if (['head', 'torso', 'legs', 'feet', 'off-hand'].includes(destSlotName)) {
+                                try {
+                                    const occupiedSlot = bot.inventory.slots[bot.getEquipmentDestSlot(destSlotName)];
+                                    if (occupiedSlot) await bot.unequip(destSlotName);
+                                } catch (_) {}
+                            }
+                            await bot.equip(item, destSlotName);
+                            bot.chat(`[System] Equipped ${itemName} to ${destSlotName}.`);
+                            process.send({ type: 'USER_CHAT', data: { username: "System", message: `Equipped ${itemName} to ${destSlotName}.`, environment: getEnvironmentContext() } });
                         } catch (err) {
                             actionQueue = []; // Clear queue on failure
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Equip failed: ${err.message}`, environment: getEnvironmentContext() } });
@@ -3018,6 +3138,103 @@ async function processActionQueue() {
             } else if (action.action === 'equip_armor') {
                 await equipBestArmor();
                 process.send({ type: 'USER_CHAT', data: { username: "System", message: `Equipped best available armor.`, environment: getEnvironmentContext() } });
+
+            // ── shredder_add / shredder_remove ────────────────────────────────
+            } else if (action.action === 'shredder_add') {
+                const junkName = (action.target || '').replace(/^[a-z_]+:/, '').trim();
+                if (junkName) {
+                    _junkList.add(junkName);
+                    _saveJunkList();
+                    bot.chat(`[System] Added ${junkName} to auto-shredder list.`);
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `${junkName} added to junk list (${_junkList.size} total).`, environment: getEnvironmentContext() } });
+                }
+            } else if (action.action === 'shredder_remove') {
+                const junkName = (action.target || '').replace(/^[a-z_]+:/, '').trim();
+                if (junkName) {
+                    _junkList.delete(junkName);
+                    _saveJunkList();
+                    bot.chat(`[System] Removed ${junkName} from auto-shredder list.`);
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `${junkName} removed from junk list.`, environment: getEnvironmentContext() } });
+                }
+
+            // ── boat ──────────────────────────────────────────────────────────
+            // Travel by boat across a river or ocean. Requires a destination (x/z) and nearby water.
+            } else if (action.action === 'boat') {
+                const destX = action.x !== undefined ? parseFloat(action.x) : null;
+                const destZ = action.z !== undefined ? parseFloat(action.z) : null;
+
+                // 1. Ensure we have a boat in inventory
+                let boatItem = bot.inventory.items().find(i => i.name.endsWith('_boat'));
+                if (!boatItem) {
+                    bot.chat('[System] No boat in inventory. Crafting one...');
+                    actionQueue = [
+                        { action: "craft", target: "oak_boat", quantity: 1 },
+                        action,
+                        ...actionQueue
+                    ];
+                    continue;
+                }
+
+                // 2. Find nearest water surface within 32 blocks
+                const waterBlock = bot.findBlock({
+                    matching: b => b && b.name === 'water',
+                    maxDistance: 32
+                });
+                if (!waterBlock) {
+                    bot.chat('[System Error] No water nearby for boat travel.');
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: "No water found within 32 blocks for boat travel.", environment: getEnvironmentContext() } });
+                    continue;
+                }
+
+                try {
+                    // Navigate to the water edge
+                    await withTimeout(
+                        bot.pathfinder.goto(new goals.GoalNear(waterBlock.position.x, waterBlock.position.y, waterBlock.position.z, 2)),
+                        timeoutMs, 'goto water for boat', () => bot.pathfinder.setGoal(null)
+                    );
+
+                    // Equip boat and place it on the water surface
+                    await bot.equip(boatItem, 'hand');
+                    const refBlock = bot.blockAt(waterBlock.position.offset(0, 0, 0));
+                    if (refBlock) await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                    await new Promise(r => setTimeout(r, 600));
+
+                    // Find the newly placed boat entity
+                    const boatEntity = Object.values(bot.entities).find(e => {
+                        if (!e.name || !e.position) return false;
+                        const n = e.name.toLowerCase();
+                        return (n === 'boat' || n.endsWith('_boat')) &&
+                               e.position.distanceTo(waterBlock.position) < 6;
+                    });
+
+                    if (boatEntity) {
+                        await bot.mount(boatEntity);
+                        bot.chat('[System] Mounted boat. Navigating...');
+
+                        if (destX !== null && destZ !== null) {
+                            const deadline = Date.now() + timeoutMs;
+                            while (Date.now() < deadline && !currentCancelToken.cancelled) {
+                                const pos = bot.entity.position;
+                                const dist = Math.sqrt((pos.x - destX) ** 2 + (pos.z - destZ) ** 2);
+                                if (dist < 5) break;
+                                const yaw = Math.atan2(-(destX - pos.x), -(destZ - pos.z));
+                                await bot.look(yaw, 0, true);
+                                bot.setControlState('forward', true);
+                                await new Promise(r => setTimeout(r, 500));
+                            }
+                            bot.setControlState('forward', false);
+                        }
+
+                        await bot.dismount();
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Arrived at destination via boat.`, environment: getEnvironmentContext() } });
+                    } else {
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: "Boat placed but could not find entity to mount.", environment: getEnvironmentContext() } });
+                    }
+                } catch (err) {
+                    bot.setControlState('forward', false);
+                    try { await bot.dismount(); } catch (_) {}
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: `Boat travel failed: ${err.message}`, environment: getEnvironmentContext() } });
+                }
 
             // ── eat / drink ───────────────────────────────────────────────────
             } else if (action.action === 'eat') {

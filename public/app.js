@@ -23,19 +23,27 @@ const els = {
     settingsBtn:  $('settings-btn'),
     addBotBtn:    $('add-bot-btn'),
     // Modals
-    manageModal:  $('manage-modal'),
-    settingsModal:$('settings-modal'),
-    botManageList:$('bot-manage-list'),
-    newBotName:   $('new-bot-name'),
-    newBotHost:   $('new-bot-host'),
-    newBotPort:   $('new-bot-port'),
-    manageAdd:    $('manage-add'),
-    manageCancel: $('manage-cancel'),
-    settingsSave: $('settings-save'),
+    manageModal:   $('manage-modal'),
+    settingsModal: $('settings-modal'),
+    sentryModal:   $('sentry-modal'),
+    botManageList: $('bot-manage-list'),
+    newBotName:    $('new-bot-name'),
+    newBotHost:    $('new-bot-host'),
+    newBotPort:    $('new-bot-port'),
+    bulkCount:     $('bulk-count'),
+    bulkHost:      $('bulk-host'),
+    bulkPort:      $('bulk-port'),
+    bulkSpawnBtn:  $('bulk-spawn-btn'),
+    manageAdd:     $('manage-add'),
+    manageCancel:  $('manage-cancel'),
+    settingsSave:  $('settings-save'),
     settingsCancel:$('settings-cancel'),
-    cfgUrl:       $('cfg-url'),
-    cfgModel:     $('cfg-model'),
-    cfgKey:       $('cfg-key'),
+    cfgUrl:        $('cfg-url'),
+    cfgModel:      $('cfg-model'),
+    cfgKey:        $('cfg-key'),
+    sentryAccept:  $('sentry-accept'),
+    sentryDecline: $('sentry-decline'),
+    sentryDontAsk: $('sentry-dont-ask'),
 };
 
 /* ─── WebSocket ──────────────────────────────────────────────────────────────── */
@@ -329,6 +337,36 @@ async function addBot() {
     els.manageModal.classList.add('hidden');
 }
 
+async function spawnBulkBots() {
+    const count = parseInt(els.bulkCount.value, 10);
+    if (!count || count < 1) return;
+    const btn = els.bulkSpawnBtn;
+    btn.disabled = true;
+    btn.textContent = 'Spawning…';
+    try {
+        const res = await fetch('/api/bots/bulk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                count,
+                host: els.bulkHost.value.trim() || undefined,
+                port: els.bulkPort.value.trim() || undefined
+            })
+        });
+        const data = await res.json();
+        if (data.ok) {
+            btn.textContent = `✔ Spawned ${data.botIds.length} bot(s)`;
+            setTimeout(() => { btn.textContent = '⚡ Spawn Bots'; btn.disabled = false; }, 2000);
+        } else {
+            btn.textContent = `Error: ${data.error || 'unknown'}`;
+            btn.disabled = false;
+        }
+    } catch (e) {
+        btn.textContent = 'Request failed';
+        btn.disabled = false;
+    }
+}
+
 /* ─── Settings modal ─────────────────────────────────────────────────────────── */
 async function openSettingsModal() {
     const cfg = await fetch('/api/config').then(r => r.json()).catch(() => ({}));
@@ -345,6 +383,26 @@ async function saveSettings() {
     els.settingsModal.classList.add('hidden');
 }
 
+/* ─── Sentry consent modal ────────────────────────────────────────────────────── */
+async function checkSentryConsent() {
+    try {
+        const prefs = await fetch('/api/crash-prefs').then(r => r.json()).catch(() => null);
+        if (prefs && prefs.needsConsent) {
+            els.sentryModal.classList.remove('hidden');
+        }
+    } catch (_) {}
+}
+
+async function saveSentryChoice(opted) {
+    const dontAskAgain = els.sentryDontAsk.checked;
+    await fetch('/api/crash-prefs', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ opted, dontAskAgain })
+    }).catch(() => {});
+    els.sentryModal.classList.add('hidden');
+}
+
 /* ─── Utilities ──────────────────────────────────────────────────────────────── */
 function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return String(s).replace(/"/g,'&quot;'); }
@@ -359,9 +417,13 @@ els.settingsBtn.addEventListener('click', openSettingsModal);
 els.addBotBtn.addEventListener('click', openManageModal);
 els.manageCancel.addEventListener('click', () => els.manageModal.classList.add('hidden'));
 els.manageAdd.addEventListener('click', addBot);
+els.bulkSpawnBtn.addEventListener('click', spawnBulkBots);
 els.settingsCancel.addEventListener('click', () => els.settingsModal.classList.add('hidden'));
 els.settingsSave.addEventListener('click', saveSettings);
-// Close modal on overlay click
+// Sentry consent
+els.sentryAccept.addEventListener('click',  () => saveSentryChoice('yes'));
+els.sentryDecline.addEventListener('click', () => saveSentryChoice('no'));
+// Close modal on overlay click (not Sentry — user must make an explicit choice)
 [els.manageModal, els.settingsModal].forEach(m => m.addEventListener('click', e => { if (e.target === m) m.classList.add('hidden'); }));
 
 /* ─── Boot ───────────────────────────────────────────────────────────────────── */
@@ -377,3 +439,6 @@ fetch('/api/bots').then(r => r.json()).then(async bots => {
 }).catch(() => {});
 
 connectWS();
+
+// Check Sentry consent after initial render (small delay so the page isn't jarring)
+setTimeout(checkSentryConsent, 800);

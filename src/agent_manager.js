@@ -508,9 +508,23 @@ Do NOT return any action other than chat.`;
             } catch(e) { return ''; }
         })() : '';
 
+        // Build other-bots context for multi-bot coordination
+        const otherBotLines = [...this.botStatus.entries()]
+            .filter(([id]) => id !== botId)
+            .map(([id, s]) => `  ${id}: pos(${Math.round(s.position?.x||0)},${Math.round(s.position?.y||0)},${Math.round(s.position?.z||0)}) hp=${s.health} food=${s.food} inv=[${(s.inventory||[]).slice(0,6).map(i=>`${i.count}x${i.name}`).join(',')}]`)
+            .join('\n');
+        const otherBotsContext = otherBotLines ? `\n\n━━━ OTHER BOTS ━━━\n${otherBotLines}` : '';
+
+        // Coordinator: bot with lexicographically smallest name among all connected bots is coordinator
+        const allBotIds = [...this.bots.keys()].sort();
+        const isCoordinator = allBotIds[0] === botId && allBotIds.length > 1;
+        const coordinatorNote = isCoordinator
+            ? `\n*CRITICAL*: You are the COORDINATOR bot (lowest name). You may delegate tasks or ask other bots for resources using ask_bot.`
+            : (allBotIds.length > 1 ? `\n*NOTE*: ${allBotIds[0]} is the coordinator bot.` : '');
+
         let prompt = `You are a Minecraft AI bot named ${botId}.
 ${isSystemFailure ? `SYSTEM FEEDBACK (previous action result): "${data.message}"` : `${data.username === 'TaskSystem' ? `TASK INSTRUCTION` : `User '${data.username}' said`}: "${data.message}"`}
-Current Environment: ${JSON.stringify(data.environment)}${taskContext}
+Current Environment: ${JSON.stringify(data.environment)}${taskContext}${otherBotsContext}${coordinatorNote}
 
 ━━━ CORE RULES ━━━
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
@@ -565,6 +579,19 @@ Current Environment: ${JSON.stringify(data.environment)}${taskContext}
 [{"action": "goto", "target": "fortress"}]                                        -- uses /locate to find and navigate to structure
 [{"action": "goto", "target": "MyBase"}]                                          -- travels to named internal waypoint (cross-dim)
 [{"action": "add_waypoint", "name": "MyBase"}]                                    -- saves current position+dimension as waypoint
+
+━━━ MULTI-BOT COORDINATION ━━━
+*CRITICAL*: When multiple bots are online, the coordinator (lowest bot name) delegates tasks and requests supplies.
+*CRITICAL*: If you need an item another bot might have, ask them before collecting it yourself.
+[{"action": "ask_bot", "target": "AI_Bot_02", "message": "Do you have cooked_beef? I'm hungry."}]  -- relay a question/request to another bot
+[{"action": "give", "target": "AI_Bot_02", "item": "cooked_beef", "quantity": 5}]               -- give item to another bot (they must be nearby)
+
+━━━ INVENTORY MANAGEMENT ━━━
+[{"action": "shredder_add", "target": "granite"}]     -- add item to auto-shredder junk list (auto-dropped when inventory full)
+[{"action": "shredder_remove", "target": "granite"}]  -- remove item from junk list (to keep it)
+
+━━━ BOAT NAVIGATION ━━━
+[{"action": "boat", "x": 200, "z": 400, "timeout": 120}]  -- travel by boat across water to destination
 
 ━━━ TASK MANAGEMENT ━━━
 *CRITICAL*: When in TASK MODE, judge whether the current task is truly complete based on SYSTEM FEEDBACK and inventory.
@@ -623,6 +650,39 @@ BLAZE (fire resistance): brew(fire_resistance) → navigate_portal(nether) → g
 
         const botProcess = this.bots.get(botId);
         if (botProcess) {
+            // ── Multi-bot coordination: route ask_bot actions ─────────────────
+            const askBotActions = sanitizedActions.filter(a => a.action === 'ask_bot');
+            if (askBotActions.length > 0) {
+                for (const ab of askBotActions) {
+                    const targetId = ab.target;
+                    const targetProc = this.bots.get(targetId);
+                    if (targetProc) {
+                        console.log(`[AgentManager] ${botId} → ${targetId}: "${ab.message}"`);
+                        // Inject as an async query so the target bot is not interrupted
+                        const relayData = {
+                            username: botId,
+                            message: ab.message || 'Status?',
+                            environment: this.botStatus.get(targetId) || {},
+                            async: true,
+                            _replyTo: botId
+                        };
+                        this.handleIPCMessage(targetId, { type: 'USER_CHAT', data: relayData });
+                    } else {
+                        safeBotProcessSend(botProcess, {
+                            type: 'EXECUTE_ACTION',
+                            action: [{ action: 'chat', message: `[System] Bot ${targetId} is not online.` }]
+                        });
+                    }
+                }
+                // Strip ask_bot from the actions dispatched to the requesting bot itself
+                sanitizedActions = sanitizedActions.filter(a => a.action !== 'ask_bot');
+                if (sanitizedActions.length === 0) {
+                    this.activeLlmRequests.delete(botId);
+                    this.processNextQueueItem(botId);
+                    return;
+                }
+            }
+
             // Issue 8: Check for set_tasks to handle abstract task decomposition
             const setTasksAction = sanitizedActions.find(a => a.action === 'set_tasks');
             if (setTasksAction && Array.isArray(setTasksAction.tasks)) {

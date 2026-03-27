@@ -7,9 +7,10 @@ const path     = require('path');
 const fs       = require('fs');
 
 class WebUIServer {
-    constructor(agentManager, connectionDefaults = {}) {
+    constructor(agentManager, connectionDefaults = {}, sentryReporter = null) {
         this.manager  = agentManager;
         this.defaults = connectionDefaults; // { host, port, mode }
+        this.sentry   = sentryReporter;    // optional sentry_reporter module
 
         this.app    = express();
         this.server = http.createServer(this.app);
@@ -141,6 +142,35 @@ class WebUIServer {
                 res.json({ ok: true });
             } catch (e) { res.status(500).json({ error: e.message }); }
         });
+
+        // POST /api/bots/bulk — spawn N bots with auto-generated AI_Bot_XX names
+        this.app.post('/api/bots/bulk', (req, res) => {
+            const count = parseInt(req.body?.count || 1, 10);
+            if (!count || count < 1 || count > 50) return res.status(400).json({ error: 'count must be 1–50' });
+
+            const h    = req.body?.host || this.defaults.host || 'localhost';
+            const p    = parseInt(req.body?.port || this.defaults.port || 25565);
+            const mode = this.defaults.mode || 'full_auto';
+
+            const botIds = this._nextBotNames(count);
+            for (const id of botIds) m.startBot(id, { host: h, port: p, mode }); // m is captured at top of _setupRoutes
+            res.json({ ok: true, botIds });
+        });
+
+        // GET /api/crash-prefs — return current Sentry consent prefs
+        this.app.get('/api/crash-prefs', (req, res) => {
+            const prefs = this.sentry ? this.sentry.getPrefs() : { opted: null, dontAskAgain: false };
+            res.json({ ...prefs, needsConsent: this.sentry ? this.sentry.needsConsent() : false });
+        });
+
+        // PUT /api/crash-prefs — save consent and (re)initialise Sentry if opted in
+        this.app.put('/api/crash-prefs', (req, res) => {
+            if (!this.sentry) return res.status(503).json({ error: 'crash reporting not available' });
+            const { opted, dontAskAgain } = req.body || {};
+            this.sentry.savePrefs({ opted, dontAskAgain: !!dontAskAgain });
+            if (opted === 'yes') this.sentry.initSentry(process.env.SENTRY_DSN);
+            res.json({ ok: true });
+        });
     }
 
     // ─── WebSocket ────────────────────────────────────────────────────────────
@@ -190,6 +220,24 @@ class WebUIServer {
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    /** Generate `count` new AI_Bot_XX names that don't clash with running bots. */
+    _nextBotNames(count) {
+        const used = new Set(this.manager.bots.keys());
+        let max = 0;
+        for (const id of used) {
+            const m = id.match(/^AI_Bot_(\d+)$/);
+            if (m) max = Math.max(max, parseInt(m[1], 10));
+        }
+        const names = [];
+        let n = max + 1;
+        while (names.length < count) {
+            const candidate = `AI_Bot_${String(n).padStart(2, '0')}`;
+            if (!used.has(candidate)) names.push(candidate);
+            n++;
+        }
+        return names;
+    }
 
     _botSummary(id, online) {
         const status = this.manager.botStatus.get(id) || {};
