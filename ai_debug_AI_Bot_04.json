@@ -1,14 +1,14 @@
 {
-  "timestamp": "2026-03-27T06:16:21.602Z",
+  "timestamp": "2026-03-27T10:05:31.737Z",
   "ready": true,
   "position": {
-    "x": -2.5,
-    "y": 92,
-    "z": -7.5
+    "x": 1373.6,
+    "y": 10,
+    "z": 840.5
   },
   "health": 20,
   "food": 20,
-  "isExecuting": false,
+  "isExecuting": true,
   "actionQueue": [],
   "treeDir": null,
   "inventory": [

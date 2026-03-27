@@ -1,167 +1,27 @@
 {
-  "timestamp": "2026-03-27T06:16:19.262Z",
+  "timestamp": "2026-03-27T10:05:31.784Z",
   "ready": true,
   "position": {
-    "x": 1110.5,
-    "y": 63,
-    "z": 673.5
+    "x": 1371.6,
+    "y": 8,
+    "z": 836.5
   },
   "health": 20,
-  "food": 20,
+  "food": 17,
   "isExecuting": true,
   "actionQueue": [],
   "treeDir": null,
   "inventory": [
     {
-      "name": "iron_shovel",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_leggings",
-      "count": 1
-    },
-    {
-      "name": "iron_leggings",
-      "count": 1
-    },
-    {
-      "name": "iron_leggings",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_helmet",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "createbigcannons:molten_cast_iron",
-      "count": 49
-    },
-    {
-      "name": "rotten_flesh",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
+      "name": "unknown",
       "count": 1
     }
   ],
   "armor": {
-    "head": "iron_helmet",
+    "head": null,
     "torso": null,
-    "legs": "iron_leggings",
+    "legs": null,
     "feet": null,
-    "hand": "iron_axe"
+    "hand": "unknown"
   }
 }

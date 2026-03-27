@@ -1,12 +1,12 @@
 {
-  "timestamp": "2026-03-27T10:05:33.159Z",
+  "timestamp": "2026-03-27T10:05:29.305Z",
   "ready": true,
   "position": {
-    "x": 1383.3,
-    "y": 3,
-    "z": 862.5
+    "x": 1384.3,
+    "y": 5,
+    "z": 861.5
   },
-  "health": 18,
+  "health": 17,
   "food": 17,
   "isExecuting": true,
   "actionQueue": [],
@@ -15,10 +15,6 @@
     {
       "name": "unknown",
       "count": 1
-    },
-    {
-      "name": "clay_ball",
-      "count": 28
     }
   ],
   "armor": {

@@ -273,6 +273,16 @@ bot.on('spawn', async () => {
             }
 
             if (bot.health < _lastHealth && bot.health > 0) {
+                // Mark any nearby neutral mobs as aggro'd when the bot takes damage.
+                if (bot.entity) {
+                    for (const ent of Object.values(bot.entities)) {
+                        if (ent === bot.entity || !ent.isValid) continue;
+                        const eName = (ent.name || '').toLowerCase();
+                        if (NEUTRAL_MOBS.has(eName) && bot.entity.position.distanceTo(ent.position) <= 8) {
+                            _aggroedNeutrals.add(ent.id);
+                        }
+                    }
+                }
                 const attacker = findNearestHostile(6);
                 if (attacker) {
                     if (!bot.pathfinder.isMoving() && !bot.pathfinder.isMining()) equipBestWeapon().catch(() => {});
@@ -322,8 +332,27 @@ bot.on('spawn', async () => {
             if (bot.pathfinder.isMoving()) return; // Don't interfere while pathfinder steers
             if (bot._client?.socket?.writable !== true) return;
             try {
-                const yaw = (Math.random() * Math.PI * 2) - Math.PI; // random yaw
-                const pitch = (Math.random() * 0.5) - 0.25;          // slight pitch variation
+                // Issue 1: Prevent Enderman eye contact — avoid looking at non-aggro'd Endermen.
+                // Check if any non-aggro'd Enderman is within 64 blocks; if the random yaw would
+                // face their eye level, choose a different pitch that looks below their eyes.
+                const nearbyEnderman = Object.values(bot.entities).find(e => {
+                    const n = (e.name || '').toLowerCase();
+                    return n === 'enderman' && !_aggroedNeutrals.has(e.id) &&
+                           bot.entity && bot.entity.position.distanceTo(e.position) <= 64;
+                });
+                let yaw = (Math.random() * Math.PI * 2) - Math.PI;
+                let pitch = (Math.random() * 0.5) - 0.25;
+                if (nearbyEnderman && bot.entity) {
+                    // Look below enderman's feet to avoid triggering aggro
+                    const dx = nearbyEnderman.position.x - bot.entity.position.x;
+                    const dz = nearbyEnderman.position.z - bot.entity.position.z;
+                    const endermanYaw = Math.atan2(-dx, -dz);
+                    // If our random yaw is within 30° of the Enderman, adjust pitch downward
+                    const yawDiff = Math.abs(((yaw - endermanYaw) + Math.PI * 3) % (Math.PI * 2) - Math.PI);
+                    if (yawDiff < 0.52) { // ~30 degrees
+                        pitch = 0.6; // look downward, below Enderman eye level
+                    }
+                }
                 bot.look(yaw, pitch, false).catch(() => {});
             } catch (_) {}
         }, 25000);
@@ -354,6 +383,56 @@ bot.on('spawn', async () => {
             }
             // Enemies 3.5–16 blocks away: let runWaitLoop handle them during idle
         }, 600);
+
+        // Issue 4: AoE / continuous-damage evasion.
+        // Detects two hazard types and triggers emergency flee:
+        //   (a) Bot is taking continuous damage while stationary (drowning, fire, Ender Dragon breath).
+        //   (b) area_effect_cloud (Ender Dragon breath cloud, lingering potions) is within 5 blocks.
+        let _aoeLastHealth  = bot.health || 20;
+        let _aoeLastPos     = bot.entity?.position?.clone() || null;
+        let _aoeEvading     = false;
+        setInterval(() => {
+            if (!bot.entity || bot.health <= 0 || _aoeEvading) return;
+            if (!bot._client?.socket?.writable) return;
+
+            // Check for nearby area_effect_cloud (dragon breath, lingering potions)
+            const hazardCloud = Object.values(bot.entities).find(e => {
+                const n = (e.name || e.displayName || '').toLowerCase();
+                return (n.includes('area_effect_cloud') || n.includes('dragon_breath')) &&
+                       bot.entity.position.distanceTo(e.position) < 5;
+            });
+
+            // Check for stationary damage (current health < previous health, position barely changed)
+            const curPos = bot.entity.position;
+            const moved = _aoeLastPos ? curPos.distanceTo(_aoeLastPos) : 999;
+            const tookDamage = bot.health < _aoeLastHealth;
+
+            if (hazardCloud || (tookDamage && moved < 0.5)) {
+                const reason = hazardCloud ? 'AoE cloud nearby' : 'stationary damage (possible drowning/fire)';
+                console.log(`[Actuator] Issue 4: ${reason} — emergency flee.`);
+                _aoeEvading = true;
+
+                // Stop current pathfinder goal and sprint in a random horizontal direction
+                try { bot.pathfinder.setGoal(null); } catch (_) {}
+                const fleeAngle = Math.random() * Math.PI * 2;
+                const fx = curPos.x + 10 * Math.cos(fleeAngle);
+                const fz = curPos.z + 10 * Math.sin(fleeAngle);
+                try {
+                    bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(fx), Math.round(fz)), true);
+                } catch (_) {}
+                // If underwater, also jump to surface
+                if (bot.entity.isInWater) {
+                    bot.setControlState('jump', true);
+                    setTimeout(() => { try { bot.setControlState('jump', false); } catch (_) {} }, 1500);
+                }
+
+                // Reset evasion flag after 2 seconds to allow re-check
+                setTimeout(() => { _aoeEvading = false; }, 2000);
+            }
+
+            _aoeLastHealth = bot.health;
+            _aoeLastPos    = curPos.clone();
+        }, 800);
 
         // Projectile evasion interrupt.
         // Runs every 150ms independently of the combat loop and pathfinder.
@@ -1111,24 +1190,44 @@ async function _runAutoShredder() {
 _loadJunkList();
 
 // ─── Self-defense ─────────────────────────────────────────────────────────────
+// Always-hostile mobs: attack on sight.
 const HOSTILE_MOBS = new Set([
-    'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider',
-    'enderman', 'endermite', 'silverfish', 'witch',
+    'zombie', 'skeleton', 'creeper', 'endermite', 'silverfish', 'witch',
     'pillager', 'vindicator', 'evoker', 'vex', 'ravager',
     'phantom', 'drowned', 'husk', 'stray', 'zombie_villager',
     'blaze', 'ghast', 'slime', 'magma_cube',
     'wither_skeleton', 'wither', 'ender_dragon',
     'elder_guardian', 'guardian', 'shulker',
-    'hoglin', 'zoglin', 'piglin_brute', 'zombified_piglin',
+    'hoglin', 'zoglin', 'piglin_brute',
 ]);
+
+// Neutral mobs: only aggro when provoked. Added to combat when they attack the bot.
+const NEUTRAL_MOBS = new Set([
+    'enderman', 'zombified_piglin', 'spider', 'cave_spider',
+    'wolf', 'bee', 'polar_bear', 'llama', 'trader_llama', 'panda',
+]);
+
+// Entity IDs of neutral mobs that are currently aggro'd (have attacked the bot).
+const _aggroedNeutrals = new Set();
+
+function isNeutralAggro(ent) {
+    return _aggroedNeutrals.has(ent.id);
+}
+
 function findNearestHostile(maxDist = 6) {
     if (!bot.entity) return null;
     let nearest = null, minDist = maxDist;
+    // Clean up dead/despawned entities from the neutral aggro set
+    for (const id of _aggroedNeutrals) {
+        const e = Object.values(bot.entities).find(x => x.id === id);
+        if (!e || !e.isValid) _aggroedNeutrals.delete(id);
+    }
     for (const ent of Object.values(bot.entities)) {
         if (ent === bot.entity || !ent.isValid) continue;
         if (ent.type === 'player') continue;
         const name = (ent.name || '').toLowerCase();
-        if (!HOSTILE_MOBS.has(name)) continue;
+        const isHostile = HOSTILE_MOBS.has(name) || (NEUTRAL_MOBS.has(name) && isNeutralAggro(ent));
+        if (!isHostile) continue;
         const d = bot.entity.position.distanceTo(ent.position);
         if (d < minDist) { minDist = d; nearest = ent; }
     }
@@ -1836,6 +1935,170 @@ const STRUCTURE_MARKERS = {
     nether_portal:   ['nether_portal'],
 };
 
+// ─── Ender Dragon Special Combat ────────────────────────────────────────────
+// Vanilla Ender Dragon fight strategy:
+//   Phase 1 (flying): Destroy all end crystals first (they regenerate dragon HP).
+//                     Use bow+arrows to shoot crystals from a distance.
+//   Phase 2 (perching): Dragon lands on fountain — melee-attack its head.
+//   Throughout: flee area_effect_cloud (dragon breath) entities.
+async function _killEnderDragon(cancelToken, combatMs, combatStart) {
+    bot.chat('[System] Initiating Ender Dragon combat protocol.');
+
+    // --- Phase 1: Destroy end crystals ---
+    bot.chat('[System] Phase 1: Destroying end crystals...');
+    let crystalPhaseDeadline = combatStart + Math.min(combatMs * 0.6, 90000);
+    while (Date.now() < crystalPhaseDeadline && !cancelToken.cancelled) {
+        // Find nearest end_crystal entity
+        let crystal = null;
+        let minCrystalDist = Infinity;
+        for (const ent of Object.values(bot.entities)) {
+            const n = (ent.name || '').toLowerCase();
+            if (n !== 'end_crystal') continue;
+            const d = bot.entity.position.distanceTo(ent.position);
+            if (d < minCrystalDist) { minCrystalDist = d; crystal = ent; }
+        }
+        if (!crystal) {
+            console.log('[DragonCombat] No more end crystals found. Proceeding to Phase 2.');
+            break;
+        }
+
+        // Flee breath clouds while navigating to crystal
+        const breathCloud = Object.values(bot.entities).find(e => {
+            const n = (e.name || e.displayName || '').toLowerCase();
+            return n.includes('area_effect_cloud') && bot.entity.position.distanceTo(e.position) < 6;
+        });
+        if (breathCloud) {
+            const bp = bot.entity.position;
+            const fa = Math.atan2(bp.z - breathCloud.position.z, bp.x - breathCloud.position.x);
+            bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp.x + 8 * Math.cos(fa)), Math.round(bp.z + 8 * Math.sin(fa))), true);
+            await new Promise(r => setTimeout(r, 1000));
+            continue;
+        }
+
+        // Shoot crystal with bow if in range, else approach
+        const hasBow = bot.inventory.items().some(i => i.name === 'bow');
+        const hasArrows = bot.inventory.items().some(i => i.name === 'arrow');
+        if (hasBow && hasArrows && minCrystalDist <= 60) {
+            const bow = bot.inventory.items().find(i => i.name === 'bow');
+            try { await bot.equip(bow, 'hand'); } catch (_) {}
+            try {
+                await bot.lookAt(crystal.position.offset(0, 0.5, 0));
+                bot.activateItem(); // charge bow
+                await new Promise(r => setTimeout(r, 1000));
+                bot.deactivateItem(); // release arrow
+            } catch (_) {}
+        } else {
+            // No bow or out of range — approach crystal
+            try {
+                await withTimeout(
+                    bot.pathfinder.goto(new goals.GoalNear(crystal.position.x, crystal.position.y, crystal.position.z, 3)),
+                    10000, 'goto end crystal', () => bot.pathfinder.setGoal(null)
+                );
+                // Crystals can also be melee-hit (they explode — stand back after hit)
+                try { await bot.lookAt(crystal.position); bot.attack(crystal); } catch (_) {}
+                await new Promise(r => setTimeout(r, 400));
+                // Retreat from explosion
+                const bp2 = bot.entity.position;
+                const ea = Math.atan2(bp2.z - crystal.position.z, bp2.x - crystal.position.x);
+                bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp2.x + 8 * Math.cos(ea)), Math.round(bp2.z + 8 * Math.sin(ea))), true);
+                await new Promise(r => setTimeout(r, 1500));
+            } catch (_) {}
+        }
+        await new Promise(r => setTimeout(r, 200));
+    }
+
+    // --- Phase 2: Fight the dragon ---
+    bot.chat('[System] Phase 2: Attacking Ender Dragon directly...');
+    await equipBestWeapon();
+    const hasBow2 = bot.inventory.items().some(i => i.name === 'bow');
+    const hasArrows2 = bot.inventory.items().some(i => i.name === 'arrow');
+    if (hasBow2 && hasArrows2) {
+        const bow = bot.inventory.items().find(i => i.name === 'bow');
+        try { await bot.equip(bow, 'hand'); } catch (_) {}
+    }
+
+    while (!cancelToken.cancelled && Date.now() - combatStart < combatMs) {
+        // Find dragon entity
+        let dragon = null;
+        for (const ent of Object.values(bot.entities)) {
+            if ((ent.name || '').toLowerCase() === 'ender_dragon' && ent.isValid) { dragon = ent; break; }
+        }
+        if (!dragon) {
+            bot.chat('[System] Ender Dragon defeated!');
+            return true;
+        }
+
+        // Flee breath clouds (priority)
+        const breathCloud2 = Object.values(bot.entities).find(e => {
+            const n = (e.name || e.displayName || '').toLowerCase();
+            return n.includes('area_effect_cloud') && bot.entity.position.distanceTo(e.position) < 8;
+        });
+        if (breathCloud2) {
+            const bp = bot.entity.position;
+            const fa = Math.atan2(bp.z - breathCloud2.position.z, bp.x - breathCloud2.position.x);
+            bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp.x + 10 * Math.cos(fa)), Math.round(bp.z + 10 * Math.sin(fa))), true);
+            await new Promise(r => setTimeout(r, 1000));
+            continue;
+        }
+
+        const dist = bot.entity.position.distanceTo(dragon.position);
+        const dragonVelocity = dragon.velocity;
+        const isPerching = dragonVelocity &&
+            Math.abs(dragonVelocity.x) < 0.05 && Math.abs(dragonVelocity.z) < 0.05;
+
+        if (isPerching && dist <= 8) {
+            // Dragon perched: melee attack its head (offset to head position)
+            bot.pathfinder.setGoal(null);
+            const headPos = dragon.position.offset(0, (dragon.height || 8) * 0.7, 0);
+            try { await bot.lookAt(headPos); } catch (_) {}
+            if (bot.entity.onGround) {
+                bot.setControlState('jump', true);
+                await new Promise(r => setTimeout(r, 80));
+                bot.setControlState('jump', false);
+            }
+            try { bot.attack(dragon); } catch (_) {}
+            await new Promise(r => setTimeout(r, 625)); // sword cooldown
+        } else if (hasBow2 && hasArrows2 && dist > 5 && dist <= 40) {
+            // Ranged: shoot dragon
+            const currentBow = bot.heldItem?.name === 'bow';
+            if (!currentBow) {
+                const bow = bot.inventory.items().find(i => i.name === 'bow');
+                if (bow) try { await bot.equip(bow, 'hand'); } catch (_) {}
+            }
+            try {
+                await bot.lookAt(dragon.position.offset(0, (dragon.height || 8) * 0.5, 0));
+                bot.activateItem();
+                await new Promise(r => setTimeout(r, 1000));
+                bot.deactivateItem();
+            } catch (_) {}
+        } else if (dist > 15) {
+            // Chase to get in range
+            bot.pathfinder.setGoal(new goals.GoalFollow(dragon, 10), true);
+        } else if (dist < 5 && !isPerching) {
+            // Too close to flying dragon — back away to avoid wing damage
+            const bp = bot.entity.position;
+            const fa = Math.atan2(bp.z - dragon.position.z, bp.x - dragon.position.x);
+            bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp.x + 8 * Math.cos(fa)), Math.round(bp.z + 8 * Math.sin(fa))), true);
+        }
+
+        // Eat if low health
+        if (bot.health < 8) {
+            const food = getBestFoodItem();
+            if (food) {
+                bot.pathfinder.setGoal(null);
+                try { await bot.equip(food, 'hand'); await bot.consume(); } catch (_) {}
+                if (hasBow2 && hasArrows2) {
+                    const bow = bot.inventory.items().find(i => i.name === 'bow');
+                    if (bow) try { await bot.equip(bow, 'hand'); } catch (_) {}
+                } else { await equipBestWeapon(); }
+            }
+        }
+
+        await new Promise(r => setTimeout(r, 150));
+    }
+    return dragon ? false : true;
+}
+
 // ─── Idle Combat Loop ─────────────────────────────────────────────────────────
 // Issue 6: Runs after completing all queued actions (and as the 'wait' action).
 // Fights hostiles within 16 blocks and chases those within 12 blocks,
@@ -2057,9 +2320,35 @@ async function processActionQueue() {
                                         bot.pathfinder.goto(new goals.GoalNear(graveBlock.position.x, graveBlock.position.y, graveBlock.position.z, 1)),
                                         60000, 'goto grave', () => bot.pathfinder.setGoal(null)
                                     );
-                                    await equipBestTool(graveBlock);
-                                    try { await bot.dig(graveBlock, 'ignore'); } catch(e) { console.log(`[Actuator] dig grave error: ${e.message}`); }
-                                    await new Promise(r => setTimeout(r, 1500));
+                                    // Issue 3: GraveStone mod typically requires right-click to open
+                                    // a chest-like container window. Try openContainer() first;
+                                    // fall back to digging if the mod stores items differently.
+                                    let graveOpened = false;
+                                    try {
+                                        const graveWindow = await Promise.race([
+                                            bot.openContainer(graveBlock),
+                                            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
+                                        ]);
+                                        // Take all items from the gravestone inventory
+                                        const graveItems = graveWindow.slots.filter(s => s !== null && s.type !== -1);
+                                        for (const gi of graveItems) {
+                                            try {
+                                                await bot.clickWindow(gi.slot, 0, 0); // left-click to take item
+                                                await new Promise(r => setTimeout(r, 100));
+                                            } catch (_) {}
+                                        }
+                                        bot.closeWindow(graveWindow);
+                                        graveOpened = true;
+                                        console.log(`[Actuator] Opened gravestone container, took ${graveItems.length} item slots.`);
+                                    } catch (containerErr) {
+                                        console.log(`[Actuator] Container open failed (${containerErr.message}), falling back to digging.`);
+                                    }
+                                    if (!graveOpened) {
+                                        // Fall back: break the gravestone to drop items
+                                        await equipBestTool(graveBlock);
+                                        try { await bot.dig(graveBlock, 'ignore'); } catch(e) { console.log(`[Actuator] dig grave error: ${e.message}`); }
+                                        await new Promise(r => setTimeout(r, 1500));
+                                    }
                                     bot.chat(`[System] Recovered items from GraveStone.`);
                                     process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'Successfully recovered GraveStone items.', environment: getEnvironmentContext() } });
                                     await equipBestArmor();
@@ -3159,6 +3448,7 @@ async function processActionQueue() {
 
             // ── boat ──────────────────────────────────────────────────────────
             // Travel by boat across a river or ocean. Requires a destination (x/z) and nearby water.
+            // Issue 6: Fixed placement when already in/on water; wider entity search; longer spawn wait.
             } else if (action.action === 'boat') {
                 const destX = action.x !== undefined ? parseFloat(action.x) : null;
                 const destZ = action.z !== undefined ? parseFloat(action.z) : null;
@@ -3175,36 +3465,63 @@ async function processActionQueue() {
                     continue;
                 }
 
-                // 2. Find nearest water surface within 32 blocks
+                // 2. Find nearest water surface within 48 blocks
                 const waterBlock = bot.findBlock({
                     matching: b => b && b.name === 'water',
-                    maxDistance: 32
+                    maxDistance: 48
                 });
                 if (!waterBlock) {
                     bot.chat('[System Error] No water nearby for boat travel.');
-                    process.send({ type: 'USER_CHAT', data: { username: "System", message: "No water found within 32 blocks for boat travel.", environment: getEnvironmentContext() } });
+                    process.send({ type: 'USER_CHAT', data: { username: "System", message: "No water found within 48 blocks for boat travel.", environment: getEnvironmentContext() } });
                     continue;
                 }
 
                 try {
-                    // Navigate to the water edge
-                    await withTimeout(
-                        bot.pathfinder.goto(new goals.GoalNear(waterBlock.position.x, waterBlock.position.y, waterBlock.position.z, 2)),
-                        timeoutMs, 'goto water for boat', () => bot.pathfinder.setGoal(null)
-                    );
+                    // Issue 6: Skip navigation if already in or adjacent to water
+                    const alreadyInWater = bot.entity.isInWater;
+                    const distToWater = bot.entity.position.distanceTo(waterBlock.position);
+                    if (!alreadyInWater && distToWater > 3) {
+                        // Navigate to the water edge
+                        await withTimeout(
+                            bot.pathfinder.goto(new goals.GoalNear(waterBlock.position.x, waterBlock.position.y, waterBlock.position.z, 2)),
+                            timeoutMs, 'goto water for boat', () => bot.pathfinder.setGoal(null)
+                        );
+                    }
 
-                    // Equip boat and place it on the water surface
+                    // Equip boat and look at the water surface before placing
+                    boatItem = bot.inventory.items().find(i => i.name.endsWith('_boat'));
+                    if (!boatItem) throw new Error('Boat disappeared from inventory');
                     await bot.equip(boatItem, 'hand');
-                    const refBlock = bot.blockAt(waterBlock.position.offset(0, 0, 0));
-                    if (refBlock) await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-                    await new Promise(r => setTimeout(r, 600));
 
-                    // Find the newly placed boat entity
+                    // Look at the water surface (face = top) and activate item to place boat
+                    const placeTarget = bot.blockAt(waterBlock.position);
+                    let placedOk = false;
+                    if (placeTarget) {
+                        try {
+                            await bot.lookAt(waterBlock.position.offset(0.5, 1, 0.5), true);
+                            await bot.placeBlock(placeTarget, new Vec3(0, 1, 0));
+                            placedOk = true;
+                        } catch (_) {}
+                    }
+                    if (!placedOk) {
+                        // Fallback: activateItem while looking at water (right-click in hand)
+                        try {
+                            await bot.lookAt(waterBlock.position.offset(0.5, 1, 0.5), true);
+                            await bot.activateItem();
+                            placedOk = true;
+                        } catch (_) {}
+                    }
+
+                    // Issue 6: Wait longer for boat entity to spawn (1.5s instead of 0.6s)
+                    await new Promise(r => setTimeout(r, 1500));
+
+                    // Issue 6: Search near bot position, not waterBlock (bot may have moved slightly)
+                    const botPosForBoat = bot.entity.position;
                     const boatEntity = Object.values(bot.entities).find(e => {
                         if (!e.name || !e.position) return false;
                         const n = e.name.toLowerCase();
-                        return (n === 'boat' || n.endsWith('_boat')) &&
-                               e.position.distanceTo(waterBlock.position) < 6;
+                        return (n === 'boat' || n.endsWith('_boat') || n.includes('boat')) &&
+                               e.position.distanceTo(botPosForBoat) < 10;
                     });
 
                     if (boatEntity) {
@@ -3337,6 +3654,17 @@ async function processActionQueue() {
 
                 await equipBestArmor();
                 await equipBestWeapon();
+
+                // Issue 5: Special boss combat — Ender Dragon uses a dedicated phase-based routine.
+                if ((action.target || '').toLowerCase() === 'ender_dragon') {
+                    const dragonResult = await _killEnderDragon(currentCancelToken, combatMs, combatStart);
+                    if (dragonResult) {
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'Ender Dragon defeated!', environment: getEnvironmentContext() } });
+                    } else {
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'Ender Dragon combat ended (timeout or interrupted).', environment: getEnvironmentContext() } });
+                    }
+                    continue; // skip normal kill loop
+                }
 
                 // Issues 4 & 5: Classify target and select weapon before combat.
                 const RANGED_ENEMIES = new Set(['blaze', 'ghast', 'phantom', 'ender_dragon', 'end_crystal']);
@@ -3677,7 +4005,28 @@ async function processActionQueue() {
                 }
 
             // ── sleep / set_respawn ───────────────────────────────────────────
+            // Issue 2: Sequential access — stagger bed use by bot name lex order to avoid
+            // multiple bots racing to the same bed simultaneously.
+            // Issue 2: Instant wake-up — wake immediately after lying down so the bed is
+            // free for the next bot and we don't sleep through the night unexpectedly.
             } else if (action.action === 'sleep' || action.action === 'set_respawn') {
+                // Staggered delay based on alphabetical bot name position (0-indexed × 4 seconds)
+                const BED_LOCK_FILE = path.join(process.cwd(), 'data', 'bed_lock.json');
+                let bedLockDelay = 0;
+                try {
+                    const lockData = fs.existsSync(BED_LOCK_FILE) ? JSON.parse(fs.readFileSync(BED_LOCK_FILE, 'utf8')) : null;
+                    if (lockData && lockData.botId && lockData.botId !== botId) {
+                        const elapsed = Date.now() - (lockData.timestamp || 0);
+                        if (elapsed < 8000) { // another bot used bed <8s ago — wait
+                            bedLockDelay = 8000 - elapsed;
+                        }
+                    }
+                } catch (_) {}
+                if (bedLockDelay > 0) {
+                    bot.chat(`[System] Waiting ${Math.ceil(bedLockDelay/1000)}s for bed to be free...`);
+                    await new Promise(r => setTimeout(r, bedLockDelay));
+                }
+
                 const bedBlock = bot.findBlock({
                     matching: b => b && b.name.endsWith('_bed'),
                     maxDistance: 32
@@ -3688,12 +4037,20 @@ async function processActionQueue() {
                 } else {
                     await withTimeout(bot.pathfinder.goto(new goals.GoalNear(bedBlock.position.x, bedBlock.position.y, bedBlock.position.z, 2)), timeoutMs, 'goto bed', () => bot.pathfinder.setGoal(null));
                     try {
-                        // Even if it's day, attempting to sleep on a bed sets the respawn point in recent versions
+                        // Write bed lock before sleeping so other bots wait
+                        try { fs.writeFileSync(BED_LOCK_FILE, JSON.stringify({ botId, timestamp: Date.now() })); } catch (_) {}
+
+                        // Even if it's day, attempting to sleep on a bed sets the respawn point
                         await withTimeout(bot.sleep(bedBlock), timeoutMs, 'sleep');
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: 'Sleeping...', environment: getEnvironmentContext() } });
+                        // Issue 2: Wake up immediately — respawn point is now set; no need to
+                        // stay in bed. This also frees the bed for other bots right away.
+                        await new Promise(r => setTimeout(r, 300));
+                        try { await bot.wake(); } catch (_) {}
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: 'Respawn point set. Woke up immediately.', environment: getEnvironmentContext() } });
                     } catch (err) {
+                        try { fs.unlinkSync(BED_LOCK_FILE); } catch (_) {}
                         // Sleep fails if it's day, but the respawn point should still be set.
-                        if (err.message.includes('day') || err.message.includes('time')) {
+                        if (err.message && (err.message.includes('day') || err.message.includes('time'))) {
                             bot.chat('[System] Respawn point set!');
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: 'Respawn point set (cannot sleep during day).', environment: getEnvironmentContext() } });
                         } else {

@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "status": "completed",
+    "description": "craft eye_of_ender"
+  },
+  {
+    "id": 2,
+    "status": "completed",
+    "description": "explore for stronghold"
+  },
+  {
+    "id": 3,
+    "status": "completed",
+    "description": "activate_end_portal"
+  },
+  {
+    "id": 4,
+    "status": "completed",
+    "description": "navigate_portal(end)"
+  },
+  {
+    "id": 5,
+    "status": "completed",
+    "description": "kill end_crystal,qty:8"
+  },
+  {
+    "id": 6,
+    "status": "completed",
+    "description": "kill ender_dragon"
+  }
+]
