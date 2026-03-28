@@ -4,6 +4,7 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const ForgeHandshakeStateMachine = require('./forge_handshake_state_machine');
 const DynamicRegistryInjector = require('./dynamic_registry_injector');
 const EventDebouncer = require('./event_debouncer');
+const { config: runtimeConfig, patch: patchConfig, savePreset, listPresets } = require('./runtime_config');
 const nbt = require('prismarine-nbt');
 const Vec3 = require('vec3');
 const fs = require('fs');
@@ -161,6 +162,15 @@ let _spawnInitDone = false;
 let _passiveDefenseInterval = null;
 let _lastHealth = 20;
 
+// Boss combat mode flag — set true during dedicated boss fight routines.
+// Suppresses the generic AoE-flee and passive-defense intervals to prevent
+// random interference with carefully choreographed boss combat logic.
+let _inBossCombat = false;
+
+// Autonomous maintenance task flag — prevents the idle 30s scanner from
+// double-queuing maintenance tasks.
+let _autonomousTaskBusy = false;
+
 // Issue 3: Reliable death-position tracking.
 // bot.entity.position inside the 'death' event is unreliable (may already be respawn pos).
 // Instead, track the last known safe position on a 2s interval.
@@ -299,6 +309,30 @@ bot.on('spawn', async () => {
             _lastHealth = bot.health;
         });
 
+        // ── Autonomic Hunger Management ──────────────────────────────────────
+        // Independent interval that eats whenever food drops below 18/20.
+        // Runs regardless of current action state so the bot never starves mid-task.
+        // Uses a busy flag to prevent overlapping equip/consume calls.
+        let _autonomicEatBusy = false;
+        setInterval(async () => {
+            if (!bot.entity || bot.health <= 0 || _autonomicEatBusy) return;
+            if (bot.food >= 18) return; // only eat when meaningfully hungry
+            if (!bot._client?.socket?.writable) return;
+            const food = getBestFoodItem();
+            if (!food) return;
+            _autonomicEatBusy = true;
+            const prevItem = bot.heldItem;
+            try {
+                await bot.equip(food, 'hand').catch(() => {});
+                await bot.consume().catch(() => {});
+                // Restore previously held item (weapon/tool) after eating
+                if (prevItem && prevItem.name !== food.name) {
+                    await bot.equip(prevItem, 'hand').catch(() => {});
+                }
+            } catch(e) {}
+            _autonomicEatBusy = false;
+        }, 8000);
+
         // Issue 3: GraveStone Mod Recovery — use _lastSafePos (tracked every 5s on ground)
         // instead of bot.entity.position which may already be the respawn point when 'death' fires.
         bot.on('death', () => {
@@ -362,6 +396,7 @@ bot.on('spawn', async () => {
         // pathfinding, acting as a melee "interrupt" without stopping movement.
         // Further enemies are handled by the idle combat loop (runWaitLoop).
         _passiveDefenseInterval = setInterval(() => {
+            if (_inBossCombat) return; // Boss combat handles its own defense
             if (!bot.entity || bot.health <= 0) return;
             const hostile = findNearestHostile(16); // Issue 5: 16-block radius
             if (!hostile) {
@@ -392,6 +427,7 @@ bot.on('spawn', async () => {
         let _aoeLastPos     = bot.entity?.position?.clone() || null;
         let _aoeEvading     = false;
         setInterval(() => {
+            if (_inBossCombat) return; // Dragon combat handles AoE avoidance internally
             if (!bot.entity || bot.health <= 0 || _aoeEvading) return;
             if (!bot._client?.socket?.writable) return;
 
@@ -601,20 +637,20 @@ bot.on('spawn', async () => {
                     // terrain errors) still happen. MLG water covers those cases.
                     if (_fallStartY === null) _fallStartY = curY;
                     const fallDist = _fallStartY - curY;
-                    if (fallDist > 5 && !_mlgAttempted) {
+                    if (fallDist > 4 && !_mlgAttempted) {
                         // Find distance to solid ground below
                         const cx = Math.floor(bot.entity.position.x);
                         const cz = Math.floor(bot.entity.position.z);
                         let groundY = null;
-                        for (let y = Math.floor(curY); y >= Math.max(Math.floor(curY) - 15, -64); y--) {
+                        for (let y = Math.floor(curY); y >= Math.max(Math.floor(curY) - 20, -64); y--) {
                             const b = bot.blockAt(new Vec3(cx, y, cz));
                             if (b && b.boundingBox === 'block' && !b.name.includes('water') && !b.name.includes('air')) {
                                 groundY = y;
                                 break;
                             }
                         }
-                        // Wait until close to the ground (e.g., 3-4 blocks)
-                        if (groundY !== null && curY - groundY <= 4) {
+                        // Trigger MLG within 6 blocks of ground (wider window = more reliable)
+                        if (groundY !== null && curY - groundY <= 6) {
                             const wb = bot.inventory.items().find(i => i.name === 'water_bucket');
                             if (wb) {
                                 _mlgAttempted = true;
@@ -799,6 +835,65 @@ bot.on('spawn', async () => {
                 if (saved) saveWaypoints(wps);
             }
         } catch (e) {}
+    }, 30000);
+
+    // Issue 11: Autonomous idle maintenance — tool durability and raw food smelting (30s interval)
+    setInterval(async () => {
+        if (!_botReady || isExecuting || actionQueue.length > 0 || _autonomousTaskBusy) return;
+        if (!bot.entity || bot.health <= 0) return;
+
+        // 11a: Replace worn-out tools (durability < 5%)
+        try {
+            for (const item of bot.inventory.items()) {
+                if (!item.durabilityUsed) continue;
+                const maxDur = item.maxDurability || 1;
+                const remaining = maxDur - (item.durabilityUsed || 0);
+                if (remaining / maxDur < 0.05) {
+                    // Craft a replacement — pick the tool type
+                    const toolType = ['pickaxe','axe','shovel','sword','hoe'].find(t => item.name.endsWith('_' + t));
+                    if (!toolType) continue;
+                    const materialOrder = ['netherite','diamond','iron','stone','wood'];
+                    const replacement = materialOrder.map(m => `${m}_${toolType}`).find(n => bot.registry.itemsByName[n]);
+                    if (replacement && replacement !== item.name) {
+                        console.log(`[Actuator] Idle: tool ${item.name} nearly broken, queuing craft of ${replacement}`);
+                        bot.chat(`[System] My ${item.name} is nearly broken. Crafting a replacement.`);
+                        _autonomousTaskBusy = true;
+                        actionQueue.push({ action: 'craft', target: replacement, quantity: 1, _autonomous: true });
+                        processActionQueue().finally(() => { _autonomousTaskBusy = false; });
+                        return;
+                    }
+                }
+            }
+        } catch(e) {}
+
+        // 11b: Smelt raw food if furnace is nearby and bot has raw food
+        try {
+            const rawFoodMap = {
+                'raw_beef': 'cooked_beef', 'raw_porkchop': 'cooked_porkchop',
+                'raw_chicken': 'cooked_chicken', 'raw_mutton': 'cooked_mutton',
+                'raw_rabbit': 'cooked_rabbit', 'raw_cod': 'cooked_cod',
+                'raw_salmon': 'cooked_salmon', 'potato': 'baked_potato'
+            };
+            const furnaceId = bot.registry.blocksByName['furnace']?.id;
+            const litFurnaceId = bot.registry.blocksByName['lit_furnace']?.id;
+            const matchingIds = [furnaceId, litFurnaceId].filter(Boolean);
+            const furnacePos = matchingIds.length > 0
+                ? bot.findBlock({ matching: matchingIds, maxDistance: 16 })
+                : null;
+            if (furnacePos) {
+                for (const [rawName, cookedName] of Object.entries(rawFoodMap)) {
+                    const rawItem = bot.inventory.findInventoryItem(bot.registry.itemsByName[rawName]?.id, null, false);
+                    if (rawItem && rawItem.count >= 4) {
+                        console.log(`[Actuator] Idle: smelting ${rawItem.count}x ${rawName} in nearby furnace`);
+                        bot.chat(`[System] Smelting ${rawItem.count} ${rawName} in nearby furnace.`);
+                        _autonomousTaskBusy = true;
+                        actionQueue.push({ action: 'smelt', target: rawName, quantity: rawItem.count, _autonomous: true });
+                        processActionQueue().finally(() => { _autonomousTaskBusy = false; });
+                        return;
+                    }
+                }
+            }
+        } catch(e) {}
     }, 30000);
 
     // --- File Logging for External AI Monitor ---
@@ -1706,6 +1801,28 @@ const LOG_NAMES = new Set([
     'oak_wood', 'spruce_wood', 'birch_wood', 'jungle_wood', 'acacia_wood', 'dark_oak_wood'
 ]);
 
+// ── Material Tag Groups ─────────────────────────────────────────────────────
+// When the bot can't find the exact requested item (e.g. "oak_log" in a birch
+// forest), it falls back to any member of the same tag group. This prevents the
+// "cannot find Oak logs" failure when other log types are available nearby.
+// Issue 9: Use tags instead of hardcoded specific item names.
+const _LOG_LIST   = [...LOG_NAMES];
+const _PLANK_LIST = [...PLANK_NAMES];
+const MATERIAL_TAG_GROUPS = {
+    // Any log variant satisfies a request for any specific log type
+    oak_log:         _LOG_LIST, spruce_log: _LOG_LIST, birch_log:    _LOG_LIST,
+    jungle_log:      _LOG_LIST, acacia_log: _LOG_LIST, dark_oak_log: _LOG_LIST,
+    mangrove_log:    _LOG_LIST, cherry_log: _LOG_LIST, oak_wood:     _LOG_LIST,
+    // Any plank variant satisfies a request for any specific plank type
+    oak_planks:     _PLANK_LIST, spruce_planks:   _PLANK_LIST, birch_planks:    _PLANK_LIST,
+    jungle_planks:  _PLANK_LIST, acacia_planks:   _PLANK_LIST, dark_oak_planks: _PLANK_LIST,
+    mangrove_planks:_PLANK_LIST, cherry_planks:   _PLANK_LIST, bamboo_planks:   _PLANK_LIST,
+    // Stone variants
+    stone:       ['stone', 'andesite', 'granite', 'diorite', 'tuff', 'calcite', 'deepslate'],
+    andesite:    ['stone', 'andesite', 'granite', 'diorite'],
+    cobblestone: ['cobblestone', 'stone'],
+};
+
 // FIX: ensureToolFor now also proactively crafts a speed-improving tool (axe for logs)
 // even when harvestTools is null, preventing the 30s-per-log timeout without an axe.
 async function ensureToolFor(block) {
@@ -1933,7 +2050,18 @@ const POTION_RECIPES = {
     awkward:         { ingredient: 'nether_wart',            base: 'water_bottle' },
 };
 
-const FUEL_PRIORITY = ['coal', 'charcoal', 'coal_block', 'oak_log', 'spruce_log', 'birch_log', 'oak_planks', 'spruce_planks'];
+// Issue 9: Use any burnable fuel tag, not just hardcoded oak/spruce.
+const FUEL_PRIORITY = [
+    'coal', 'charcoal', 'coal_block', 'blaze_rod',
+    // All log variants (8 smelts each)
+    'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log',
+    'dark_oak_log', 'mangrove_log', 'cherry_log', 'bamboo_block',
+    // All plank variants (1.5 smelts each)
+    'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks', 'acacia_planks',
+    'dark_oak_planks', 'mangrove_planks', 'cherry_planks', 'bamboo_planks',
+    // Other burnables
+    'stick', 'bamboo', 'dried_kelp_block', 'bookshelf', 'crafting_table',
+];
 
 const STRUCTURE_MARKERS = {
     nether_fortress: ['nether_bricks', 'nether_brick_fence', 'nether_brick_stairs'],
@@ -1951,73 +2079,95 @@ const STRUCTURE_MARKERS = {
 //   Throughout: flee area_effect_cloud (dragon breath) entities.
 async function _killEnderDragon(cancelToken, combatMs, combatStart) {
     bot.chat('[System] Initiating Ender Dragon combat protocol.');
+    _inBossCombat = true; // Suppress generic AoE/passive-defense intervals during boss fight
 
     // --- Phase 1: Destroy end crystals ---
-    bot.chat('[System] Phase 1: Destroying end crystals...');
-    let crystalPhaseDeadline = combatStart + Math.min(combatMs * 0.6, 90000);
-    while (Date.now() < crystalPhaseDeadline && !cancelToken.cancelled) {
-        // Find nearest end_crystal entity
-        let crystal = null;
-        let minCrystalDist = Infinity;
-        for (const ent of Object.values(bot.entities)) {
-            if (!ent.isValid) continue;
-            const n = (ent.name || '').toLowerCase();
-            if (n !== 'end_crystal') continue;
-            const d = bot.entity.position.distanceTo(ent.position);
-            if (d < minCrystalDist) { minCrystalDist = d; crystal = ent; }
-        }
-        if (!crystal) {
-            console.log('[DragonCombat] No more end crystals found. Proceeding to Phase 2.');
-            break;
-        }
+    // End Crystals sit atop obsidian pillars (y≈50-100). Approach their XZ base,
+    // then shoot upward with a bow. Skip phase entirely if no crystals present.
+    const hasCrystalsInitially = Object.values(bot.entities).some(e =>
+        e.isValid && (e.name || '').toLowerCase() === 'end_crystal');
+    if (!hasCrystalsInitially) {
+        bot.chat('[System] No end crystals present — skipping Phase 1.');
+    } else {
+        bot.chat('[System] Phase 1: Destroying end crystals...');
+        const crystalPhaseDeadline = combatStart + Math.min(combatMs * 0.6, 90000);
+        while (Date.now() < crystalPhaseDeadline && !cancelToken.cancelled) {
+            let crystal = null;
+            let minCrystalDist = Infinity;
+            for (const ent of Object.values(bot.entities)) {
+                if (!ent.isValid) continue;
+                if ((ent.name || '').toLowerCase() !== 'end_crystal') continue;
+                const d = bot.entity.position.distanceTo(ent.position);
+                if (d < minCrystalDist) { minCrystalDist = d; crystal = ent; }
+            }
+            if (!crystal) {
+                console.log('[DragonCombat] No more end crystals. Proceeding to Phase 2.');
+                break;
+            }
 
-        // Flee breath clouds while navigating to crystal
-        const breathCloud = Object.values(bot.entities).find(e => {
-            const n = (e.name || e.displayName || '').toLowerCase();
-            return n.includes('area_effect_cloud') && bot.entity.position.distanceTo(e.position) < 6;
-        });
-        if (breathCloud) {
-            const bp = bot.entity.position;
-            const fa = Math.atan2(bp.z - breathCloud.position.z, bp.x - breathCloud.position.x);
-            bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp.x + 8 * Math.cos(fa)), Math.round(bp.z + 8 * Math.sin(fa))), true);
-            await new Promise(r => setTimeout(r, 1000));
-            continue;
-        }
-
-        // Shoot crystal with bow if in range, else approach
-        const hasBow = bot.inventory.items().some(i => i.name === 'bow');
-        const hasArrows = bot.inventory.items().some(i => i.name === 'arrow');
-        if (hasBow && hasArrows && minCrystalDist <= 60) {
-            const bow = bot.inventory.items().find(i => i.name === 'bow');
-            try { await bot.equip(bow, 'hand'); } catch (_) {}
-            try {
-                await bot.lookAt(crystal.position.offset(0, 0.5, 0));
-                bot.activateItem(); // charge bow
+            // Flee breath clouds
+            const breathCloud = Object.values(bot.entities).find(e => {
+                const n = (e.name || e.displayName || '').toLowerCase();
+                return (n.includes('area_effect_cloud') || n.includes('dragon_breath')) &&
+                    bot.entity.position.distanceTo(e.position) < 6;
+            });
+            if (breathCloud) {
+                const bp = bot.entity.position;
+                const fa = Math.atan2(bp.z - breathCloud.position.z, bp.x - breathCloud.position.x);
+                bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp.x + 8 * Math.cos(fa)), Math.round(bp.z + 8 * Math.sin(fa))), true);
                 await new Promise(r => setTimeout(r, 1000));
-                bot.deactivateItem(); // release arrow
-            } catch (_) {}
-        } else {
-            // No bow or out of range — approach crystal
-            try {
-                await withTimeout(
-                    bot.pathfinder.goto(new goals.GoalNear(crystal.position.x, crystal.position.y, crystal.position.z, 3)),
-                    10000, 'goto end crystal', () => bot.pathfinder.setGoal(null)
-                );
-                // Crystals can also be melee-hit (they explode — stand back after hit)
-                try { await bot.lookAt(crystal.position); bot.attack(crystal); } catch (_) {}
-                await new Promise(r => setTimeout(r, 400));
-                // Retreat from explosion
-                const bp2 = bot.entity.position;
-                const ea = Math.atan2(bp2.z - crystal.position.z, bp2.x - crystal.position.x);
-                bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp2.x + 8 * Math.cos(ea)), Math.round(bp2.z + 8 * Math.sin(ea))), true);
-                await new Promise(r => setTimeout(r, 1500));
-            } catch (_) {}
+                continue;
+            }
+
+            const hasBow = bot.inventory.items().some(i => i.name === 'bow');
+            const hasArrows = bot.inventory.items().some(i => i.name === 'arrow');
+            if (hasBow && hasArrows) {
+                // Approach the base of the pillar (XZ only — don't try to pathfind to the top)
+                const xzDist = Math.sqrt(
+                    (bot.entity.position.x - crystal.position.x) ** 2 +
+                    (bot.entity.position.z - crystal.position.z) ** 2);
+                if (xzDist > 30) {
+                    bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(crystal.position.x), Math.round(crystal.position.z)), true);
+                    await new Promise(r => setTimeout(r, 2000));
+                    continue;
+                }
+                // In range — shoot upward at the crystal
+                const bow = bot.inventory.items().find(i => i.name === 'bow');
+                try { await bot.equip(bow, 'hand'); } catch (_) {}
+                try {
+                    await bot.lookAt(crystal.position.offset(0, 0.5, 0));
+                    bot.activateItem();
+                    await new Promise(r => setTimeout(r, 1000));
+                    bot.deactivateItem();
+                } catch (_) {}
+            } else {
+                // No bow — approach XZ base and try melee (only works for low pillars)
+                const xzDist2 = Math.sqrt(
+                    (bot.entity.position.x - crystal.position.x) ** 2 +
+                    (bot.entity.position.z - crystal.position.z) ** 2);
+                if (xzDist2 > 4) {
+                    bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(crystal.position.x), Math.round(crystal.position.z)), true);
+                    await new Promise(r => setTimeout(r, 3000));
+                }
+                if (bot.entity.position.distanceTo(crystal.position) <= 5) {
+                    try { await bot.lookAt(crystal.position); bot.attack(crystal); } catch (_) {}
+                    await new Promise(r => setTimeout(r, 400));
+                    const bp2 = bot.entity.position;
+                    const ea = Math.atan2(bp2.z - crystal.position.z, bp2.x - crystal.position.x);
+                    bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp2.x + 8 * Math.cos(ea)), Math.round(bp2.z + 8 * Math.sin(ea))), true);
+                    await new Promise(r => setTimeout(r, 1500));
+                }
+            }
+            await new Promise(r => setTimeout(r, 200));
         }
-        await new Promise(r => setTimeout(r, 200));
     }
 
     // --- Phase 2: Fight the dragon ---
-    bot.chat('[System] Phase 2: Attacking Ender Dragon directly...');
+    // Strategy: Stay near the CENTER of the End island (XZ≈0,0 — the fountain area).
+    // The dragon circles overhead; shoot upward with a bow for the flying phase.
+    // When the dragon perches (velocity≈0), it lands on the fountain at y≈64 —
+    // move toward it and shoot/melee. Do NOT chase the dragon around the perimeter.
+    bot.chat('[System] Phase 2: Moving to fountain center...');
     await equipBestWeapon();
     const hasBow2 = bot.inventory.items().some(i => i.name === 'bow');
     const hasArrows2 = bot.inventory.items().some(i => i.name === 'arrow');
@@ -2025,9 +2175,12 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
         const bow = bot.inventory.items().find(i => i.name === 'bow');
         try { await bot.equip(bow, 'hand'); } catch (_) {}
     }
+    // Move to center for best overhead shooting coverage
+    bot.pathfinder.setGoal(new goals.GoalXZ(0, 0), true);
+    await new Promise(r => setTimeout(r, 3000));
+    bot.chat('[System] Phase 2: Attacking Ender Dragon...');
 
     while (!cancelToken.cancelled && Date.now() - combatStart < combatMs) {
-        // Find dragon entity
         let dragon = null;
         for (const ent of Object.values(bot.entities)) {
             if ((ent.name || '').toLowerCase() === 'ender_dragon' && ent.isValid) { dragon = ent; break; }
@@ -2040,7 +2193,8 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
         // Flee breath clouds (priority)
         const breathCloud2 = Object.values(bot.entities).find(e => {
             const n = (e.name || e.displayName || '').toLowerCase();
-            return n.includes('area_effect_cloud') && bot.entity.position.distanceTo(e.position) < 8;
+            return (n.includes('area_effect_cloud') || n.includes('dragon_breath')) &&
+                bot.entity.position.distanceTo(e.position) < 8;
         });
         if (breathCloud2) {
             const bp = bot.entity.position;
@@ -2051,26 +2205,50 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
         }
 
         const dist = bot.entity.position.distanceTo(dragon.position);
-        const dragonVelocity = dragon.velocity;
-        const isPerching = dragonVelocity &&
-            Math.abs(dragonVelocity.x) < 0.05 && Math.abs(dragonVelocity.z) < 0.05;
+        const dv = dragon.velocity;
+        // Perching: dragon's velocity near zero on all axes (landed on fountain)
+        // Perch detection: dragon has landed on fountain — horizontal velocity ~0.
+        // Use relaxed thresholds (0.1 for x/z, 0.05 for y) since network interpolation
+        // adds noise to the reported velocity even when the dragon is stationary.
+        const isPerching = dv &&
+            Math.abs(dv.x) < 0.1 && Math.abs(dv.z) < 0.1 && Math.abs(dv.y) < 0.05;
 
-        if (isPerching && dist <= 8) {
-            // Dragon perched: melee attack its head (offset to head position)
-            bot.pathfinder.setGoal(null);
-            const headPos = dragon.position.offset(0, (dragon.height || 8) * 0.7, 0);
-            try { await bot.lookAt(headPos); } catch (_) {}
-            if (bot.entity.onGround) {
-                bot.setControlState('jump', true);
-                await new Promise(r => setTimeout(r, 80));
-                bot.setControlState('jump', false);
+        if (isPerching) {
+            // Dragon perched on fountain (~0,64,0). Approach and attack.
+            if (dist > 15) {
+                bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(dragon.position.x), Math.round(dragon.position.z)), true);
+                await new Promise(r => setTimeout(r, 1500));
+                continue;
             }
-            try { bot.attack(dragon); } catch (_) {}
-            await new Promise(r => setTimeout(r, 625)); // sword cooldown
-        } else if (hasBow2 && hasArrows2 && dist > 5 && dist <= 40) {
-            // Ranged: shoot dragon
-            const currentBow = bot.heldItem?.name === 'bow';
-            if (!currentBow) {
+            // Within range: prefer bow (stationary = reliable hit), fall back to melee
+            const hasBowNow = bot.inventory.items().some(i => i.name === 'bow');
+            const hasArrowsNow = bot.inventory.items().some(i => i.name === 'arrow');
+            if (hasBowNow && hasArrowsNow && dist > 4) {
+                const bowItem = bot.inventory.items().find(i => i.name === 'bow');
+                try { await bot.equip(bowItem, 'hand'); } catch (_) {}
+                try {
+                    await bot.lookAt(dragon.position.offset(0, (dragon.height || 8) * 0.5, 0));
+                    bot.activateItem();
+                    await new Promise(r => setTimeout(r, 1000));
+                    bot.deactivateItem();
+                } catch (_) {}
+            } else {
+                bot.pathfinder.setGoal(null);
+                const headPos = dragon.position.offset(0, (dragon.height || 8) * 0.7, 0);
+                try { await bot.lookAt(headPos); } catch (_) {}
+                if (bot.entity.onGround) {
+                    // Jump-critical hit: attack while falling for ~2.5× damage
+                    bot.setControlState('jump', true);
+                    await new Promise(r => setTimeout(r, 80));
+                    bot.setControlState('jump', false);
+                    await new Promise(r => setTimeout(r, 200)); // falling phase = critical
+                }
+                try { bot.attack(dragon); } catch (_) {}
+                await new Promise(r => setTimeout(r, 400)); // shortened to allow more crits per perch
+            }
+        } else if (hasBow2 && hasArrows2 && dist <= 80) {
+            // Flying dragon in range — shoot upward from center position
+            if (bot.heldItem?.name !== 'bow') {
                 const bow = bot.inventory.items().find(i => i.name === 'bow');
                 if (bow) try { await bot.equip(bow, 'hand'); } catch (_) {}
             }
@@ -2080,14 +2258,13 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
                 await new Promise(r => setTimeout(r, 1000));
                 bot.deactivateItem();
             } catch (_) {}
-        } else if (dist > 15) {
-            // Chase to get in range
-            bot.pathfinder.setGoal(new goals.GoalFollow(dragon, 10), true);
-        } else if (dist < 5 && !isPerching) {
-            // Too close to flying dragon — back away to avoid wing damage
+        } else {
+            // Dragon out of range or no bow — stay at center and wait for it to circle back
             const bp = bot.entity.position;
-            const fa = Math.atan2(bp.z - dragon.position.z, bp.x - dragon.position.x);
-            bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(bp.x + 8 * Math.cos(fa)), Math.round(bp.z + 8 * Math.sin(fa))), true);
+            const distToCenter = Math.sqrt(bp.x * bp.x + bp.z * bp.z);
+            if (distToCenter > 10) {
+                bot.pathfinder.setGoal(new goals.GoalXZ(0, 0), true);
+            }
         }
 
         // Eat if low health
@@ -2105,6 +2282,7 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
 
         await new Promise(r => setTimeout(r, 150));
     }
+    _inBossCombat = false; // Re-enable generic intervals
     return dragon ? false : true;
 }
 
@@ -2144,6 +2322,18 @@ async function runWaitLoop() {
 async function processActionQueue() {
     if (isExecuting) return;
     isExecuting = true;
+
+    // Mid-air guard: wait for the bot to land before executing any actions.
+    // Prevents the "flying" kick that occurs when pathfinder or equip calls
+    // are issued while the bot is momentarily airborne (after a jump, knock-
+    // back, or terrain transition). Waits at most 3 seconds.
+    if (bot.entity && !bot.entity.onGround && !bot.entity.isInWater) {
+        let landWait = 0;
+        while (bot.entity && !bot.entity.onGround && !bot.entity.isInWater && landWait < 3000) {
+            await new Promise(r => setTimeout(r, 50));
+            landWait += 50;
+        }
+    }
 
     while (actionQueue.length > 0) {
         const action = actionQueue.shift();
@@ -2435,6 +2625,33 @@ async function processActionQueue() {
                 }
 
             // ── status ────────────────────────────────────────────────────────
+            } else if (action.action === 'patch_config') {
+                // Issue 12: Runtime config patch — supports preset name or key/value object
+                // Examples: { action:'patch_config', preset:'combat_aggressive' }
+                //           { action:'patch_config', values:{ MELEE_RANGE:5 } }
+                //           { action:'patch_config', save:'my_preset' }
+                //           { action:'patch_config', list:true }
+                if (action.list) {
+                    const names = listPresets();
+                    bot.chat(`[Config] Saved presets: ${names.length > 0 ? names.join(', ') : '(none)'}`);
+                } else if (action.save) {
+                    const result = savePreset(action.save, action.values || null);
+                    bot.chat(`[Config] ${result.message}`);
+                } else {
+                    const target = action.preset || action.values;
+                    if (!target) {
+                        bot.chat('[Config] Error: provide preset name or values object.');
+                    } else {
+                        const result = patchConfig(target);
+                        if (result.ok) {
+                            const desc = Object.entries(result.applied).map(([k,v]) => `${k}=${v}`).join(', ');
+                            bot.chat(`[Config] Applied: ${desc}`);
+                        } else {
+                            bot.chat(`[Config] ${result.message}`);
+                        }
+                    }
+                }
+
             } else if (action.action === 'status') {
                 const env = getEnvironmentContext();
                 const posStr = env.position ? `X:${env.position.x} Y:${env.position.y} Z:${env.position.z}` : 'Unknown';
@@ -2948,10 +3165,27 @@ async function processActionQueue() {
                 // from mining stone; flint comes from gravel). DROP_TO_SOURCE maps the requested
                 // item to the actual block(s) to find with findBlocks().
                 const sourceSNames = DROP_TO_SOURCE[action.target];
-                const directBlockId = bot.registry.blocksByName[action.target]?.id;
-                const searchIds = sourceSNames
+                let directBlockId = bot.registry.blocksByName[action.target]?.id;
+                let searchIds = sourceSNames
                     ? sourceSNames.map(n => bot.registry.blocksByName[n]?.id).filter(id => id !== undefined)
                     : (directBlockId !== undefined ? [directBlockId] : []);
+
+                // Issue 9: Tag-group expansion — if exact block is unknown, try all variants.
+                // This prevents "cannot find oak_log" in a birch/spruce forest.
+                if (searchIds.length === 0) {
+                    const tagGroup = MATERIAL_TAG_GROUPS[action.target];
+                    if (tagGroup) {
+                        const tagIds = tagGroup
+                            .map(n => bot.registry.blocksByName[n]?.id)
+                            .filter(id => id !== undefined);
+                        if (tagIds.length > 0) {
+                            console.log(`[collect] '${action.target}' not in registry — expanding to tag group: [${tagGroup.join(',')}]`);
+                            searchIds = tagIds;
+                            // Override countInInventory to count any variant of the group
+                            action._tagGroupNames = tagGroup;
+                        }
+                    }
+                }
 
                 if (searchIds.length === 0) { bot.chat(`[System Error] I don't know what ${action.target} is.`); }
                 else {
@@ -2960,9 +3194,13 @@ async function processActionQueue() {
 
                     // Count actual drops via inventory delta (accurate even for stone→cobblestone,
                     // gravel→flint, ore→raw_iron, etc. where the block ID ≠ drop item ID).
-                    const countInInventory = () => bot.inventory.items()
-                        .filter(i => i.name === action.target)
-                        .reduce((s, i) => s + i.count, 0);
+                    // If tag group expansion was used, count any variant of the group.
+                    const countInInventory = () => {
+                        const names = action._tagGroupNames || [action.target];
+                        return bot.inventory.items()
+                            .filter(i => names.includes(i.name))
+                            .reduce((s, i) => s + i.count, 0);
+                    };
 
                     // Search passes: 32 → 64 → 128 blocks.
                     // Underground resources (stone, ores) rarely appear within 64 blocks
@@ -3271,11 +3509,21 @@ async function processActionQueue() {
                     for (const [ingName, ingPerCraft] of Object.entries(ingCounts)) {
                         const needed = ingPerCraft * craftsNeeded;
                         const have = inventoryMap[ingName] || 0;
-                        if (have < needed) {
+
+                        // Issue 6/9: Variant-aware ingredient check — if the recipe asks for
+                        // 'oak_planks' but the bot has 'birch_planks', count those too.
+                        let effectiveHave = have;
+                        const ingTagGroup = MATERIAL_TAG_GROUPS[ingName];
+                        if (ingTagGroup && effectiveHave < needed) {
+                            effectiveHave = ingTagGroup.reduce((sum, n) => sum + (inventoryMap[n] || 0), 0);
+                        }
+
+                        if (effectiveHave < needed) {
+                            // Only pre-craft if even with variants we're short
                             preCrafts.push({
                                 action: "craft",
                                 target: ingName,
-                                quantity: needed - have,
+                                quantity: needed - effectiveHave,
                                 _craftPath: [...craftPath, action.target]
                             });
                         }
@@ -3379,7 +3627,7 @@ async function processActionQueue() {
                                     destSlotName = 'legs';
                                 } else if (n.endsWith('_boots')) {
                                     destSlotName = 'feet';
-                                } else if (n === 'shield' || n === 'totem_of_undying') {
+                                } else if (n === 'shield' || n.endsWith('_shield') || n === 'totem_of_undying') {
                                     destSlotName = 'off-hand';
                                 }
                             }
@@ -3920,14 +4168,20 @@ async function processActionQueue() {
                                 const fz = botPos.z + 14 * Math.sin(fleeAngle);
                                 bot.pathfinder.setGoal(new goals.GoalXZ(fx, fz), true);
                             } else if (dist <= MELEE_ATTACK_RANGE && now - _lastAttack >= ATTACK_COOLDOWN_MS) {
-                                // In melee range and cooldown ready: stop, swing, retreat.
+                                // In melee range and cooldown ready: stop, jump-crit, retreat.
+                                // Critical hit = attack while falling (velocity.y < 0).
+                                // Timing: jump=true → wait 80ms (near apex) → jump=false →
+                                // wait 200ms (falling phase begins) → attack = guaranteed crit.
                                 bot.pathfinder.setGoal(null);
                                 try {
                                     await bot.lookAt(target.position.offset(0, (target.height || 1.8) * 0.5, 0));
-                                    if (bot.entity.onGround) {
+                                    if (bot.entity.onGround && !incomingProj) {
+                                        // Jump for critical hit — only if no incoming projectile
+                                        // (jumping while blocking a projectile breaks shield)
                                         bot.setControlState('jump', true);
                                         await new Promise(r => setTimeout(r, 80));
                                         bot.setControlState('jump', false);
+                                        await new Promise(r => setTimeout(r, 200)); // fall phase = crit
                                     }
                                     bot.attack(target);
                                     _lastAttack = now;

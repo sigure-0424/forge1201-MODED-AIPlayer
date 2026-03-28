@@ -82,6 +82,8 @@ Actions are sent via IPC as `EXECUTE_ACTION` messages. Key action types:
 | `explore` | `direction, distance, target` | Explore in a direction, optionally scanning for a structure. |
 | `navigate_portal` | `target: "nether"\|"end"` | Find and enter a portal. |
 | `activate_end_portal` | — | Insert Eyes of Ender and activate the End portal. |
+
+> **End Portal requirement:** The bot enters the End portal by walking into the frame. If lava was placed below the End Portal room (common in modded servers to block entry), it must be cleared before `navigate_portal(end)` will succeed. Remove the lava manually or via a build command before issuing the portal navigation order.
 | `place_pattern` | `target, x, y, z` | Place a named block pattern. |
 | `status` | — | Report position, health, and environment. |
 | `stop` | — | Cancel all active goals. |
@@ -123,3 +125,92 @@ There is no built-in screen recorder, but there are two practical approaches:
 
 ---
 *Note: This framework is optimized for reliability on vanilla blocks within a Forge environment. Modded block entities are treated as non-solid by default to ensure safe gravity and movement.*
+
+## AI Prompt for Wiki Data
+
+  You are generating a Minecraft 1.20.1 wiki knowledge file for a    
+  bot's RAG system.
+
+  Rules:
+  - Output plain text only, no markdown tables, no code blocks.      
+  - Write exactly ONE fact per line.
+  - Each line must be self-contained and understandable without      
+  context.
+  - Use underscores for compound game terms: ender_dragon, oak_log,  
+  nether_fortress, fire_resistance.
+  - Keep each line under 120 characters.
+  - Do not use headers as standalone lines — every line must contain 
+  at least one concrete fact.
+  - Avoid filler phrases ("you can", "it is possible to", "note      
+  that") — state the fact directly.
+
+  Topic: [INSERT TOPIC HERE — e.g. "Ender Dragon fight strategy",    
+  "all brewing recipes", "mob drops and spawning conditions"]        
+
+Exhaustively list every single verifiable fact about the topic. Do not stop until all data points are covered.
+
+  Recommended topics to generate for this project:
+
+  ┌─────────────────┬─────────────────────────────────────────────┐  
+  │      File       │              Topic to request               │  
+  ├─────────────────┼─────────────────────────────────────────────┤  
+  │ mobs.md         │ all hostile mob drops, spawn conditions,    │  
+  │                 │ and combat weaknesses                       │  
+  ├─────────────────┼─────────────────────────────────────────────┤  
+  │ potions.md      │ all brewing recipes with ingredients and    │  
+  │                 │ effects                                     │  
+  ├─────────────────┼─────────────────────────────────────────────┤  
+  │ enchanting.md   │ all enchantments, max levels, and what      │  
+  │                 │ items they apply to                         │  
+  ├─────────────────┼─────────────────────────────────────────────┤  
+  │ structures.md   │ nether fortress, stronghold, bastion, ocean │  
+  │                 │  monument layouts and loot                  │  
+  ├─────────────────┼─────────────────────────────────────────────┤  
+  │ ender_dragon.md │ full Ender Dragon fight: crystals, phases,  │  
+  │                 │ breath, perch, exit portal                  │  
+  ├─────────────────┼─────────────────────────────────────────────┤  
+  │ redstone.md     │ redstone components, timing, and common     │
+  │                 │ contraption recipes                         │    ├─────────────────┼─────────────────────────────────────────────┤
+  │ nether.md       │ Nether biomes, mobs, fortresses, bastions,  │  
+  │                 │ gold bartering                              │    └─────────────────┴─────────────────────────────────────────────┘
+# list of all MODs
+appleskin-forge-mc1.20.1-2.5.1.jar
+architectury-9.2.14-forge (1).jar
+balm-forge-1.20.1-7.3.38-all.jar
+chunkloaders-1.2.9-forge-mc1.20.1.jar
+CodeChickenLib-1.20.1-4.4.0.516-universal.jar
+constructionwand-1.20.1-2.11.jar
+copycats-3.0.7+mc.1.20.1-forge.jar
+create-1.20.1-6.0.8.jar
+create-stuff-additions1.20.1_v2.1.0.jar
+createaddition-1.20.1-1.3.3.jar
+createbigcannons-5.11.1-mc.1.20.1-forge.jar
+createdeco-2.0.3-1.20.1-forge.jar
+createliquidfuel-2.1.1-1.20.1.jar
+createsifter-1.20.1-1.8.6-6.0.6.jar
+createteleporters2.3-1.20.1.jar.disabled
+create_connected-1.1.13-mc1.20.1-all.jar
+create_hypertube-0.4.0-FORGE.jar
+create_jetpack-forge-4.4.6.jar
+create_mecanical_extruder-1.20.1-1.6.11-6.0.6.jar
+EnderStorage-1.20.1-2.11.0.188-universal.jar
+ferritecore-6.0.1-forge.jar
+fusion-1.2.12-forge-mc1.20.1.jar
+geckolib-forge-1.20.1-4.8.3.jar
+gravestone-forge-1.20.1-1.0.35.jar
+jei-1.20.1-forge-15.20.0.112.jar
+journeymap-1.20.1-5.10.3-forge.jar
+kotlinforforge-4.12.0-all.jar
+kubejs-forge-2001.6.5-build.16.jar
+modernfix-forge-5.26.2+mc1.20.1.jar
+rhino-forge-2001.2.3-build.10.jar
+ritchiesprojectilelib-2.1.1-mc.1.20.1-forge.jar
+SimpleBackups-1.20.1-3.1.18.jar
+supermartijn642configlib-1.1.8-forge-mc1.20.jar
+supermartijn642corelib-1.1.20-forge-mc1.20.1.jar
+torchmaster-20.1.9.jar
+waystones-forge-1.20.1-14.1.20.jar
+[1.20.1][forge47.1.0]mod_CutAllSMP_v2.5.2.jar
+[1.20.1][forge47.1.0]mod_DigAllSMP_v2.3.3.jar
+[1.20.1][forge47.1.0]mod_MineAllSMP_v2.6.6.jar
+[1.20.1][forge47.1.0]mod_StorageBox_v3.2.5.jar

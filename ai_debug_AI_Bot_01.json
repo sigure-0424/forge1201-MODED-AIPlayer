@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-03-27T10:26:27.769Z",
+  "timestamp": "2026-03-28T07:30:56.494Z",
   "ready": true,
   "position": {
-    "x": 97.6,
-    "y": 33,
-    "z": -31.5
+    "x": 5.1,
+    "y": 66,
+    "z": 17.9
   },
-  "health": 4,
-  "food": 15,
+  "health": 20,
+  "food": 20,
   "isExecuting": true,
   "actionQueue": [],
   "treeDir": null,
@@ -21,32 +21,28 @@
       "count": 1
     },
     {
+      "name": "cooked_porkchop",
+      "count": 5
+    },
+    {
       "name": "iron_pickaxe",
       "count": 1
     },
     {
-      "name": "create_connected:inverted_clutch",
-      "count": 6
+      "name": "createbigcannons:flowing_molten_nethersteel",
+      "count": 12
+    },
+    {
+      "name": "createbigcannons:molten_cast_iron",
+      "count": 11
+    },
+    {
+      "name": "unknown",
+      "count": 1
     },
     {
       "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "end_stone",
-      "count": 15
+      "count": 2
     }
   ],
   "armor": {
@@ -54,6 +50,6 @@
     "torso": null,
     "legs": null,
     "feet": null,
-    "hand": "iron_pickaxe"
+    "hand": "iron_axe"
   }
 }

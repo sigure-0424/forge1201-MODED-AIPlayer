@@ -2,6 +2,7 @@
 const { fork } = require('child_process');
 const path = require('path');
 const LLMClient = require('./llm_client');
+const wikiRag = require('./wiki_rag');
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('[AgentManager] Unhandled Rejection at:', promise, 'reason:', reason);
@@ -42,6 +43,9 @@ class AgentManager {
         this.botActionCounts = new Map(); // Map of botId to number of actions executed (for full auto to task mode switch)
         // Issue 1: task_mode processes tasks one at a time; currentTaskIdx tracks position in the list
         this.currentTaskIdx = new Map(); // Map of botId to index of in-progress task
+
+        // Issue 8: consecutive failure tracking for graceful halt
+        this.consecutiveFailures = new Map(); // botId → number of consecutive failures
 
         // WebUI integration
         this.botStatus = new Map();  // botId → latest BOT_STATUS payload
@@ -263,11 +267,22 @@ class AgentManager {
                     return; // Don't feed this to the LLM
                 }
 
-                const isSuccess = data.message.includes('Successfully') || data.message.includes('Explored') || data.message.includes('Entered portal') || data.message.includes('Reached destination');
-                const isFailure = data.message.includes('Failed') || data.message.includes('Cannot') || data.message.includes('No ');
+                // Issue 8: Expanded success/failure pattern detection
+                const SUCCESS_PATTERNS = [
+                    'Successfully', 'Explored', 'Entered portal', 'Reached destination',
+                    'Eliminated', 'Crafted', 'Smelted', 'Brewed', 'Enchanted', 'Placed',
+                    'Collected', 'Now following', 'Geared up', 'Recovered', 'Done'
+                ];
+                const FAILURE_PATTERNS = [
+                    'Failed', 'Cannot', 'No ', 'Error', 'failed', 'not found',
+                    'cycle', 'timed out', 'unreachable', 'stuck', 'Task Remaining'
+                ];
+                const isSuccess = SUCCESS_PATTERNS.some(p => data.message.includes(p));
+                const isFailure = !isSuccess && FAILURE_PATTERNS.some(p => data.message.includes(p));
 
                 if (isSuccess) {
                     console.log(`[AgentManager] Task completed for ${botId}: ${data.message}.`);
+                    this.consecutiveFailures.set(botId, 0); // reset on success
                     // Issue 1: in task_mode, mark current task done and start the next
                     if (this.botModes.get(botId) === 'task_mode' && this.currentTaskIdx.has(botId)) {
                         this.completeCurrentTask(botId);
@@ -276,6 +291,26 @@ class AgentManager {
                     }
                     return;
                 } else if (isFailure) {
+                    const failures = (this.consecutiveFailures.get(botId) || 0) + 1;
+                    this.consecutiveFailures.set(botId, failures);
+                    console.warn(`[AgentManager] Failure #${failures} for ${botId}: ${data.message}`);
+
+                    if (failures >= 3) {
+                        // Halt: clear queue and notify user instead of looping
+                        this.consecutiveFailures.set(botId, 0);
+                        this.chatQueue.set(botId, []);
+                        this.activeLlmRequests.delete(botId);
+                        const botProcess = this.bots.get(botId);
+                        if (botProcess) {
+                            safeBotProcessSend(botProcess, {
+                                type: 'EXECUTE_ACTION',
+                                action: [{ action: 'chat', message: `I encountered 3 consecutive failures and stopped. Last error: ${data.message}` }]
+                            });
+                        }
+                        console.warn(`[AgentManager] Bot ${botId} halted after 3 consecutive failures.`);
+                        return;
+                    }
+
                     const queue = this.chatQueue.get(botId) || [];
                     queue.unshift(data);
                     this.chatQueue.set(botId, queue);
@@ -524,9 +559,12 @@ Do NOT return any action other than chat.`;
             ? `\n*CRITICAL*: You are the COORDINATOR bot (lowest name). You may delegate tasks or ask other bots for resources using ask_bot.`
             : (allBotIds.length > 1 ? `\n*NOTE*: ${allBotIds[0]} is the coordinator bot.` : '');
 
+        const inTheEnd = data.environment?.dimension === 'the_end';
+        const endDimNote = inTheEnd ? `\n*CRITICAL*: You are in THE END dimension. ONLY use: kill(end_crystal), kill(ender_dragon), goto, eat, equip, equip_armor, status. Do NOT collect, craft, smelt, brew, or attempt to gather resources — there are no useful resources in the End.` : '';
+
         let prompt = `You are a Minecraft AI bot named ${botId}.
 ${isSystemFailure ? `SYSTEM FEEDBACK (previous action result): "${data.message}"` : `${data.username === 'TaskSystem' ? `TASK INSTRUCTION` : `User '${data.username}' said`}: "${data.message}"`}
-Current Environment: ${JSON.stringify(data.environment)}${taskContext}${otherBotsContext}${coordinatorNote}
+Current Environment: ${JSON.stringify(data.environment)}${taskContext}${otherBotsContext}${coordinatorNote}${endDimNote}
 
 ━━━ CORE RULES ━━━
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
@@ -609,6 +647,16 @@ ELDER GUARDIAN: brew(water_breathing) + brew(night_vision) → explore for ocean
 BLAZE (fire resistance): brew(fire_resistance) → navigate_portal(nether) → goto(fortress) → kill(blaze,qty:N,timeout:180)
 `;
 
+
+        // Issue 10: Inject relevant wiki knowledge (RAG) if available
+        try {
+            const ragQuery = data.message || '';
+            const wikiContext = wikiRag.searchForPrompt(ragQuery, 3);
+            if (wikiContext) prompt += wikiContext;
+        } catch(e) {}
+
+        // Issue 12: Add patch_config action to prompt
+        prompt += `\n[{"action":"patch_config","preset":"combat_aggressive"}]       -- apply a named config preset\n[{"action":"patch_config","values":{"MELEE_RANGE":5}}]              -- patch specific config values at runtime\n[{"action":"patch_config","save":"my_preset"}]                       -- save current config as a named preset\n[{"action":"patch_config","list":true}]                              -- list saved presets`;
 
         if (retryCount > 0) {
             prompt += `\n\nYour previous response was incorrectly formatted. Please ensure you respond ONLY with a valid JSON array containing action objects.`;

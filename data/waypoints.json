@@ -40,5 +40,12 @@
     "y": 9,
     "z": 837,
     "dimension": "overworld"
+  },
+  {
+    "name": "end_portal",
+    "x": 1369,
+    "y": 10,
+    "z": 838,
+    "dimension": "the_end"
   }
 ]
