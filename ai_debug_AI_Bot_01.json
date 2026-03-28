@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-03-28T12:05:54.237Z",
+  "timestamp": "2026-03-28T17:07:07.590Z",
   "ready": true,
   "position": {
-    "x": 1375.6,
-    "y": 9,
-    "z": 837.4
+    "x": 86.3,
+    "y": 29,
+    "z": 30.9
   },
   "health": 20,
   "food": 20,
@@ -17,7 +17,7 @@
       "count": 1
     },
     {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
@@ -25,15 +25,15 @@
       "count": 1
     },
     {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
-      "name": "iron_leggings",
-      "count": 1
+      "name": "end_stone",
+      "count": 45
     },
     {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
@@ -49,44 +49,40 @@
       "count": 1
     },
     {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "end_stone",
-      "count": 4
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
       "name": "createbigcannons:flowing_molten_nethersteel",
       "count": 12
     },
     {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
       "name": "createbigcannons:molten_cast_iron",
       "count": 14
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
     },
     {
       "name": "unknown",
@@ -104,8 +100,8 @@
   "armor": {
     "head": null,
     "torso": null,
-    "legs": null,
+    "legs": "iron_leggings",
     "feet": null,
-    "hand": "iron_axe"
+    "hand": "iron_pickaxe"
   }
 }
