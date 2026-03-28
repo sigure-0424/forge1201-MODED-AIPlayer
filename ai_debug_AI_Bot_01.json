@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-03-28T18:51:01.403Z",
+  "timestamp": "2026-03-28T19:39:00.817Z",
   "ready": true,
   "position": {
-    "x": 40.5,
-    "y": 27,
-    "z": 22.5
+    "x": 1376.8,
+    "y": 9.6,
+    "z": 836.2
   },
   "health": 20,
   "food": 20,
@@ -13,11 +13,11 @@
   "treeDir": null,
   "inventory": [
     {
-      "name": "iron_axe",
+      "name": "unknown",
       "count": 1
     },
     {
-      "name": "iron_axe",
+      "name": "iron_pickaxe",
       "count": 1
     },
     {
@@ -49,7 +49,7 @@
       "count": 64
     },
     {
-      "name": "iron_axe",
+      "name": "iron_pickaxe",
       "count": 1
     },
     {
@@ -57,7 +57,7 @@
       "count": 12
     },
     {
-      "name": "iron_axe",
+      "name": "iron_pickaxe",
       "count": 1
     },
     {
@@ -70,38 +70,38 @@
     },
     {
       "name": "end_stone",
-      "count": 22
+      "count": 27
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
     },
     {
       "name": "iron_axe",
       "count": 1
     },
     {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "unknown",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
+      "name": "iron_axe",
       "count": 1
     },
     {
@@ -114,6 +114,6 @@
     "torso": null,
     "legs": "iron_leggings",
     "feet": null,
-    "hand": "iron_pickaxe"
+    "hand": "iron_axe"
   }
 }
