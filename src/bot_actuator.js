@@ -2277,18 +2277,22 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
                     bot.deactivateItem();
                 } catch (_) {}
             } else {
-                // Out of range or no bow: stay near center and wait (Return to 4)
+                // Out of range or no bow: Wait ~20 blocks away from center to avoid breath blocking path
                 const bp = bot.entity.position;
                 const distToCenter = Math.sqrt(bp.x * bp.x + bp.z * bp.z);
-                if (distToCenter > 10) {
-                    bot.pathfinder.setGoal(new goals.GoalXZ(0, 0), true);
+                if (distToCenter < 15 || distToCenter > 25) {
+                    // Try to stay on the outer edge of the fountain area (r≈20)
+                    const angle = Math.atan2(bp.z, bp.x);
+                    bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(20 * Math.cos(angle)), Math.round(20 * Math.sin(angle))), true);
+                } else {
+                    bot.pathfinder.setGoal(null);
                 }
             }
         } else {
             // Dragon is perching (Step 6)
             if (dist > 15) {
                 bot.pathfinder.setGoal(new goals.GoalXZ(Math.round(dragon.position.x), Math.round(dragon.position.z)), true);
-                await new Promise(r => setTimeout(r, 1500));
+                await new Promise(r => setTimeout(r, 800));
                 continue;
             }
 
@@ -2310,15 +2314,11 @@ async function _killEnderDragon(cancelToken, combatMs, combatStart) {
 
             const headPos = dragon.position.offset(0, (dragon.height || 8) * 0.7, 0);
             try { await bot.lookAt(headPos); } catch (_) {}
-            if (bot.entity.onGround) {
-                // Jump-critical hit: attack while falling for ~2.5× damage
-                bot.setControlState('jump', true);
-                await new Promise(r => setTimeout(r, 80));
-                bot.setControlState('jump', false);
-                await new Promise(r => setTimeout(r, 200)); // falling phase = critical
-            }
+
+            // Attack frequently, do not wait for jump crit timing as requested.
             try { bot.attack(dragon); } catch (_) {}
-            await new Promise(r => setTimeout(r, 400));
+            // Axe cooldown is usually around ~1s, sword is ~0.625s. We'll swing every 600ms.
+            await new Promise(r => setTimeout(r, 600));
         }
 
         // Eat if low health
