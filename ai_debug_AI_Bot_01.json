@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-03-28T17:07:07.590Z",
+  "timestamp": "2026-03-28T18:51:01.403Z",
   "ready": true,
   "position": {
-    "x": 86.3,
-    "y": 29,
-    "z": 30.9
+    "x": 40.5,
+    "y": 27,
+    "z": 22.5
   },
   "health": 20,
   "food": 20,
@@ -13,7 +13,7 @@
   "treeDir": null,
   "inventory": [
     {
-      "name": "unknown",
+      "name": "iron_axe",
       "count": 1
     },
     {
@@ -25,16 +25,16 @@
       "count": 1
     },
     {
-      "name": "iron_axe",
+      "name": "unknown",
       "count": 1
     },
     {
       "name": "end_stone",
-      "count": 45
+      "count": 64
     },
     {
-      "name": "iron_axe",
-      "count": 1
+      "name": "end_stone",
+      "count": 64
     },
     {
       "name": "oak_boat",
@@ -43,6 +43,10 @@
     {
       "name": "bucket",
       "count": 1
+    },
+    {
+      "name": "end_stone",
+      "count": 64
     },
     {
       "name": "iron_axe",
@@ -61,7 +65,15 @@
       "count": 14
     },
     {
-      "name": "iron_pickaxe",
+      "name": "end_stone",
+      "count": 64
+    },
+    {
+      "name": "end_stone",
+      "count": 22
+    },
+    {
+      "name": "iron_axe",
       "count": 1
     },
     {
@@ -74,6 +86,18 @@
     },
     {
       "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "unknown",
       "count": 1
     },
     {
@@ -82,18 +106,6 @@
     },
     {
       "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "unknown",
-      "count": 1
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "iron_pickaxe",
       "count": 1
     }
   ],
