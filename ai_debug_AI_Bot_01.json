@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-03-28T10:28:53.137Z",
+  "timestamp": "2026-03-28T10:38:17.408Z",
   "ready": true,
   "position": {
-    "x": 1373.3,
-    "y": 8.1,
-    "z": 836.7
+    "x": 80.5,
+    "y": 47,
+    "z": -6.5
   },
   "health": 20,
-  "food": 20,
+  "food": 19,
   "isExecuting": true,
   "actionQueue": [],
   "treeDir": null,
@@ -22,7 +22,7 @@
     },
     {
       "name": "cooked_porkchop",
-      "count": 5
+      "count": 2
     },
     {
       "name": "iron_pickaxe",
@@ -50,6 +50,6 @@
     "torso": null,
     "legs": null,
     "feet": null,
-    "hand": "iron_axe"
+    "hand": "iron_pickaxe"
   }
 }
