@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-03-29T07:13:55.311Z",
+  "timestamp": "2026-03-29T15:41:32.756Z",
   "ready": true,
   "position": {
-    "x": 88.3,
-    "y": 22,
-    "z": 48.5
+    "x": 116.5,
+    "y": 65,
+    "z": 370.5
   },
   "health": 20,
   "food": 20,
@@ -13,107 +13,19 @@
   "treeDir": null,
   "inventory": [
     {
-      "name": "unknown",
-      "count": 1
+      "name": "oak_log",
+      "count": 19
     },
     {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "flint_and_steel",
-      "count": 1
-    },
-    {
-      "name": "unknown",
-      "count": 1
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "oak_boat",
-      "count": 1
-    },
-    {
-      "name": "bucket",
-      "count": 1
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "createbigcannons:flowing_molten_nethersteel",
-      "count": 12
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "createbigcannons:molten_cast_iron",
-      "count": 14
-    },
-    {
-      "name": "end_stone",
-      "count": 64
-    },
-    {
-      "name": "end_stone",
-      "count": 35
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_pickaxe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
-      "count": 1
-    },
-    {
-      "name": "iron_axe",
+      "name": "create:crafting_blueprint",
       "count": 1
     }
   ],
   "armor": {
     "head": null,
     "torso": null,
-    "legs": "iron_leggings",
+    "legs": null,
     "feet": null,
-    "hand": "iron_pickaxe"
+    "hand": "oak_log"
   }
 }
