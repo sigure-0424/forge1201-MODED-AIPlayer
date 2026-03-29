@@ -730,6 +730,20 @@ bot.on('spawn', async () => {
         actionQueue.push(...pending);
     }
     _pendingIpcActions = [];
+
+    // Bug Fix 10: Restore checkpoint — if the bot restarted after a crash/disconnect
+    // and there are no buffered IPC actions (no new instructions yet), attempt to
+    // resume the previous task queue. Skip restore on first-ever spawn.
+    if (actionQueue.length === 0) {
+        const checkpoint = _loadQueueCheckpoint();
+        if (checkpoint) {
+            console.log(`[Actuator] Resuming ${checkpoint.length} checkpointed action(s) after restart.`);
+            bot.chat(`[System] Resuming ${checkpoint.length} task(s) from before disconnect.`);
+            actionQueue.push(...checkpoint);
+            _clearQueueCheckpoint();
+        }
+    }
+
     if (actionQueue.length > 0) processActionQueue();
 
     // Death Recovery: check for gravestone mod death-marker item in inventory.
@@ -1324,6 +1338,46 @@ let movements = null; // initialized in 'spawn'
 // Issue 6: _inStopMode prevents auto-idle-combat loop after explicit stop.
 // Cleared on any new EXECUTE_ACTION that isn't pure stop.
 let _inStopMode = false;
+
+// ─── Bug Fix 10: Task Queue Checkpoint ────────────────────────────────────────
+// Persist the action queue to disk so tasks survive ECONNRESET/crash restarts.
+// Only resumable, side-effect-free action types are checkpointed (navigation,
+// collection, combat). One-shot destructive actions (give, smelt, craft) are
+// excluded because replaying them after a partial execution would be incorrect.
+const QUEUE_CHECKPOINT_FILE = path.join(process.cwd(), 'data', `queue_checkpoint_${botId}.json`);
+const NON_RESUMABLE_ACTIONS = new Set(['give', 'smelt', 'brew', 'enchant', 'activate_end_portal', 'place_pattern', 'place', 'sleep', 'find_land', 'find_and_equip', 'loot_chest_special']);
+
+function _saveQueueCheckpoint(queue) {
+    try {
+        const resumable = queue.filter(a => a && a.action && !NON_RESUMABLE_ACTIONS.has(a.action));
+        if (resumable.length === 0) {
+            // Nothing worth persisting — clear stale checkpoint
+            if (fs.existsSync(QUEUE_CHECKPOINT_FILE)) fs.unlinkSync(QUEUE_CHECKPOINT_FILE);
+            return;
+        }
+        const dir = path.dirname(QUEUE_CHECKPOINT_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(QUEUE_CHECKPOINT_FILE, JSON.stringify({ savedAt: new Date().toISOString(), queue: resumable }, null, 2));
+    } catch (e) { /* non-fatal */ }
+}
+
+function _loadQueueCheckpoint() {
+    try {
+        if (!fs.existsSync(QUEUE_CHECKPOINT_FILE)) return null;
+        const raw = JSON.parse(fs.readFileSync(QUEUE_CHECKPOINT_FILE, 'utf8'));
+        // Only restore checkpoints that are less than 10 minutes old
+        const age = Date.now() - new Date(raw.savedAt).getTime();
+        if (age > 10 * 60 * 1000) {
+            fs.unlinkSync(QUEUE_CHECKPOINT_FILE);
+            return null;
+        }
+        return Array.isArray(raw.queue) && raw.queue.length > 0 ? raw.queue : null;
+    } catch (e) { return null; }
+}
+
+function _clearQueueCheckpoint() {
+    try { if (fs.existsSync(QUEUE_CHECKPOINT_FILE)) fs.unlinkSync(QUEUE_CHECKPOINT_FILE); } catch (e) {}
+}
 
 // ─── Auto-Shredder ────────────────────────────────────────────────────────────
 const JUNK_LIST_FILE = path.join(process.cwd(), 'data', 'junk_list.json');
@@ -4660,12 +4714,37 @@ async function processActionQueue() {
                             const check = setInterval(() => {
                                 if (bot.game.dimension !== currentDim) {
                                     clearInterval(check);
-                                    bot.setControlState('forward', false);
-                                    try { bot.pathfinder.setGoal(null); } catch (e) {} // Stop previous goals so we don't pathfind to overworld coords
+                                    // Bug Fix 1: Hard-flush all movement state on dimension change.
+                                    // clearControlStates() stops every key (forward, sprint, jump, sneak,
+                                    // back, left, right) so the bot cannot drift on the obsidian platform
+                                    // or in the End void while waiting for chunks to load.
+                                    bot.clearControlStates();
+                                    try { bot.pathfinder.setGoal(null); } catch (e) {}
                                     resolve();
                                 }
                             }, 500);
                         }), 12000, 'portal teleport');
+
+                        // Bug Fix 1: Give the new dimension time to load chunks and for the bot to
+                        // land on the obsidian platform (End) or Nether floor before any further
+                        // pathfinding. Without this, the pathfinder immediately tries to compute
+                        // routes using stale/unloaded chunk data, producing phantom movement.
+                        const newDim = bot.game.dimension;
+                        const enteringEnd = newDim === 'the_end' || newDim === 'minecraft:the_end';
+                        const settleMs = enteringEnd ? 2000 : 1000;
+                        await new Promise(r => setTimeout(r, settleMs));
+                        // Extra guard: if still airborne after the settle delay (e.g. spawning above
+                        // the obsidian platform in the End), wait up to 3s more to land.
+                        if (bot.entity && !bot.entity.onGround && !bot.entity.isInWater) {
+                            let airWait = 0;
+                            while (bot.entity && !bot.entity.onGround && !bot.entity.isInWater && airWait < 3000) {
+                                await new Promise(r => setTimeout(r, 100));
+                                airWait += 100;
+                            }
+                        }
+                        // Final pathfinder flush after landing — clears any internal path state
+                        // that built up while the bot was airborne on the platform.
+                        try { bot.pathfinder.setGoal(null); bot.clearControlStates(); } catch (e) {}
 
                         // CLEAR the action queue to avoid carrying overworld coordinates or old tasks into the new dimension
                         actionQueue = [];
@@ -4679,7 +4758,7 @@ async function processActionQueue() {
                         }
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Entered portal. Now in ${bot.game.dimension}. Actions cleared.`, environment: getEnvironmentContext() } });
                     } catch (e) {
-                        bot.setControlState('forward', false);
+                        bot.clearControlStates();
                         try { bot.pathfinder.setGoal(null); } catch (err) {}
                         actionQueue = [];
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Portal transit timeout: ${e.message}`, environment: getEnvironmentContext() } });
@@ -5205,6 +5284,10 @@ async function processActionQueue() {
         await runWaitLoop();
     }
 
+    // Bug Fix 10: All actions completed normally — clear the checkpoint so stale
+    // tasks are not re-queued on the next restart.
+    _clearQueueCheckpoint();
+
     isExecuting = false;
 }
 
@@ -5224,12 +5307,35 @@ process.on('message', async (msg) => {
         let actions = msg.action;
         if (!Array.isArray(actions)) actions = [actions];
 
+        // Bug Fix 2: queue_op controls how incoming actions relate to the current queue.
+        //   replace (default) — cancel current tasks and start fresh (previous behaviour)
+        //   append            — add new actions to the end of the current queue
+        //   ignore            — do nothing if the bot is currently executing a task
+        const queueOp = (msg.queue_op || 'replace').toLowerCase();
+
         // If bot hasn't finished login/spawn yet, buffer the action
         if (!_botReady) {
             console.log(`[Actuator] Bot not ready yet — buffering ${actions.length} action(s).`);
             _pendingIpcActions.push(actions);
             return;
         }
+
+        // ── ignore: discard new actions while busy ───────────────────────────
+        if (queueOp === 'ignore' && (isExecuting || actionQueue.length > 0)) {
+            console.log(`[Actuator] queue_op=ignore: bot is busy, discarding ${actions.length} incoming action(s).`);
+            return;
+        }
+
+        // ── append: tack onto the current queue without cancelling ───────────
+        if (queueOp === 'append') {
+            _inStopMode = false;
+            actionQueue.push(...actions);
+            console.log(`[Actuator] queue_op=append: added ${actions.length} action(s). Queue length now ${actionQueue.length}.`);
+            if (!isExecuting) processActionQueue();
+            return;
+        }
+
+        // ── replace (default): cancel current tasks and start fresh ──────────
 
         // 1. Signal the running loop to stop
         const remaining = [...actionQueue];
@@ -5263,6 +5369,8 @@ process.on('message', async (msg) => {
         // 4. Fresh token + queue for the new command
         currentCancelToken = { cancelled: false };
         actionQueue.push(...actions);
+        // Bug Fix 10: Persist the incoming queue so a crash/disconnect can resume it.
+        _saveQueueCheckpoint(actionQueue);
         processActionQueue();
     }
 });
