@@ -3554,6 +3554,14 @@ async function processActionQueue() {
                                 consecutiveProtected = 0;
                                 break;
                             }
+                            // Change 3: Skip blocks inside safe zones.
+                            {
+                                const currentDimForCollect = bot.game?.dimension || 'overworld';
+                                if (_isInSafeZone(blockPos, currentDimForCollect)) {
+                                    console.log(`[collect] Skipping block at (${blockPos.x},${blockPos.y},${blockPos.z}) — inside safe zone.`);
+                                    continue;
+                                }
+                            }
                             triedSet.add(`${blockPos.x},${blockPos.z}`);
 
                             try {
@@ -5369,6 +5377,36 @@ async function processActionQueue() {
                 const invDebug = bot.inventory.items().map(i=>`${i.name}x${i.count}`).join(',') || '(empty)';
                 console.log(`[find_land] ${msg} inv=[${invDebug}]`);
                 process.send({ type: 'USER_CHAT', data: { username: "System", message: msg, environment: getEnvironmentContext() } });
+
+            // ── blackboard_set ────────────────────────────────────────────────
+            // Change 2: write a key/value pair to the shared blackboard file.
+            } else if (action.action === 'blackboard_set') {
+                const bbKey = action.key;
+                const bbValue = action.value;
+                if (bbKey !== undefined) {
+                    const bbData = _readBlackboard();
+                    bbData[bbKey] = bbValue;
+                    _writeBlackboard(bbData);
+                    const msg = `Blackboard: set "${bbKey}" = ${JSON.stringify(bbValue)}`;
+                    bot.chat(`[System] ${msg}`);
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: msg, environment: getEnvironmentContext() } });
+                } else {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'blackboard_set: missing key.', environment: getEnvironmentContext() } });
+                }
+
+            // ── blackboard_get ────────────────────────────────────────────────
+            // Change 2: read a key from the shared blackboard file.
+            } else if (action.action === 'blackboard_get') {
+                const bbKey = action.key;
+                if (bbKey !== undefined) {
+                    const bbData = _readBlackboard();
+                    const bbVal = bbData.hasOwnProperty(bbKey) ? bbData[bbKey] : null;
+                    const msg = `Blackboard: "${bbKey}" = ${JSON.stringify(bbVal)}`;
+                    bot.chat(`[System] ${msg}`);
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: msg, environment: getEnvironmentContext() } });
+                } else {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'blackboard_get: missing key.', environment: getEnvironmentContext() } });
+                }
 
             // ── stop ──────────────────────────────────────────────────────────
             } else if (action.action === 'stop') {

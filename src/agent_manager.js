@@ -580,6 +580,21 @@ Do NOT return any action other than chat.`;
             .join('\n');
         const otherBotsContext = otherBotLines ? `\n\n━━━ OTHER BOTS ━━━\n${otherBotLines}` : '';
 
+        // Change 2: Read shared blackboard and inject into prompt (up to 10 entries).
+        const blackboardContext = (() => {
+            try {
+                const fs = require('fs');
+                const path = require('path');
+                const bbPath = path.join(process.cwd(), 'data', 'blackboard.json');
+                if (!fs.existsSync(bbPath)) return '';
+                const bb = JSON.parse(fs.readFileSync(bbPath, 'utf8'));
+                const entries = Object.entries(bb).slice(0, 10);
+                if (entries.length === 0) return '';
+                const lines = entries.map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`).join('\n');
+                return `\n\n━━━ SHARED BLACKBOARD ━━━\n${lines}`;
+            } catch(e) { return ''; }
+        })();
+
         // Coordinator: bot with lexicographically smallest name among all connected bots is coordinator
         const allBotIds = [...this.bots.keys()].sort();
         const isCoordinator = allBotIds[0] === botId && allBotIds.length > 1;
@@ -592,7 +607,7 @@ Do NOT return any action other than chat.`;
 
         let prompt = `You are a Minecraft AI bot named ${botId}.
 ${isSystemFailure ? `SYSTEM FEEDBACK (previous action result): "${data.message}"` : `${data.username === 'TaskSystem' ? `TASK INSTRUCTION` : `User '${data.username}' said`}: "${data.message}"`}
-Current Environment: ${JSON.stringify(data.environment)}${taskContext}${currentQueueContext}${otherBotsContext}${coordinatorNote}${endDimNote}
+Current Environment: ${JSON.stringify(data.environment)}${taskContext}${currentQueueContext}${otherBotsContext}${blackboardContext}${coordinatorNote}${endDimNote}
 
 ━━━ CORE RULES ━━━
 *CRITICAL*: Respond ONLY with a valid JSON array of action objects. No prose, no explanations.
@@ -653,6 +668,8 @@ Current Environment: ${JSON.stringify(data.environment)}${taskContext}${currentQ
 *CRITICAL*: If you need an item another bot might have, ask them before collecting it yourself.
 [{"action": "ask_bot", "target": "AI_Bot_02", "message": "Do you have cooked_beef? I'm hungry."}]  -- relay a question/request to another bot
 [{"action": "give", "target": "AI_Bot_02", "item": "cooked_beef", "quantity": 5}]               -- give item to another bot (they must be nearby)
+[{"action": "blackboard_set", "key": "target_area", "value": "cave_north"}]  -- write shared key to blackboard (all bots can read it)
+[{"action": "blackboard_get", "key": "target_area"}]                          -- read shared key from blackboard
 
 ━━━ INVENTORY MANAGEMENT ━━━
 [{"action": "shredder_add", "target": "granite"}]     -- add item to auto-shredder junk list (auto-dropped when inventory full)
