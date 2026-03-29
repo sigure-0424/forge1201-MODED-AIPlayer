@@ -1020,7 +1020,9 @@ bot.on('spawn', async () => {
     }
 
     // Only in debug mode: teleport to nearest player to reach dry land quickly.
-    if (DEBUG) {
+    // Skip if in the End dimension as it usually means teleporting into the void or away from the obsidian platform
+    const isEndDimension = bot.game?.dimension === 'the_end' || bot.game?.dimension === 'minecraft:the_end';
+    if (DEBUG && !isEndDimension) {
         const nearbyPlayers = Object.values(bot.players)
             .filter(p => p.username !== bot.username && p.entity);
         if (nearbyPlayers.length > 0) {
@@ -1376,7 +1378,7 @@ const HOSTILE_MOBS = new Set([
     'pillager', 'vindicator', 'evoker', 'vex', 'ravager',
     'phantom', 'drowned', 'husk', 'stray', 'zombie_villager',
     'blaze', 'ghast', 'slime', 'magma_cube',
-    'wither_skeleton', 'wither', 'ender_dragon',
+    'wither_skeleton', 'wither',
     'elder_guardian', 'guardian', 'shulker',
     'hoglin', 'zoglin', 'piglin_brute',
 ]);
@@ -3039,7 +3041,10 @@ async function processActionQueue() {
 
                     // Issue 4: Discourage tunneling on long trips
                     const savedCanDig = movements.canDig;
-                    if (total > 64) {
+                    // Note: Do not disable digging in the End dimension because End Stone is harder to navigate around without digging,
+                    // and disabling it causes the bot to spasm click End Stone instead of mining it.
+                    const isEndDimension = bot.game?.dimension === 'the_end' || bot.game?.dimension === 'minecraft:the_end';
+                    if (total > 64 && !isEndDimension) {
                         movements.canDig = false;
                         bot.pathfinder.setMovements(movements);
                     }
@@ -4655,6 +4660,7 @@ async function processActionQueue() {
                                 if (bot.game.dimension !== currentDim) {
                                     clearInterval(check);
                                     bot.setControlState('forward', false);
+                                    try { bot.pathfinder.setGoal(null); } catch (e) {} // Stop previous goals so we don't pathfind to overworld coords
                                     resolve();
                                 }
                             }, 500);
@@ -4669,6 +4675,7 @@ async function processActionQueue() {
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Entered portal. Now in ${bot.game.dimension}.`, environment: getEnvironmentContext() } });
                     } catch (e) {
                         bot.setControlState('forward', false);
+                        try { bot.pathfinder.setGoal(null); } catch (err) {}
                         process.send({ type: 'USER_CHAT', data: { username: "System", message: `Portal transit timeout: ${e.message}`, environment: getEnvironmentContext() } });
                     }
                     } // close isConnected else
