@@ -1,31 +1,143 @@
 {
-  "timestamp": "2026-03-29T15:41:32.756Z",
+  "timestamp": "2026-03-30T02:36:29.931Z",
   "ready": true,
   "position": {
-    "x": 116.5,
-    "y": 65,
-    "z": 370.5
+    "x": 182.6,
+    "y": 41,
+    "z": 111.1
   },
-  "health": 20,
-  "food": 20,
+  "health": 19,
+  "food": 17,
   "isExecuting": true,
   "actionQueue": [],
   "treeDir": null,
   "inventory": [
     {
-      "name": "oak_log",
-      "count": 19
+      "name": "unknown",
+      "count": 1
     },
     {
-      "name": "create:crafting_blueprint",
+      "name": "flint_and_steel",
+      "count": 1
+    },
+    {
+      "name": "unknown",
+      "count": 1
+    },
+    {
+      "name": "end_stone",
+      "count": 64
+    },
+    {
+      "name": "end_stone",
+      "count": 64
+    },
+    {
+      "name": "oak_boat",
+      "count": 1
+    },
+    {
+      "name": "bucket",
+      "count": 1
+    },
+    {
+      "name": "end_stone",
+      "count": 64
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "createbigcannons:flowing_molten_nethersteel",
+      "count": 12
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "createbigcannons:molten_cast_iron",
+      "count": 14
+    },
+    {
+      "name": "end_stone",
+      "count": 64
+    },
+    {
+      "name": "end_stone",
+      "count": 37
+    },
+    {
+      "name": "createaddition:portable_energy_interface",
+      "count": 1
+    },
+    {
+      "name": "clay_ball",
+      "count": 16
+    },
+    {
+      "name": "create:content_observer",
+      "count": 1
+    },
+    {
+      "name": "create:funnel",
+      "count": 1
+    },
+    {
+      "name": "bone",
+      "count": 1
+    },
+    {
+      "name": "stone_bricks",
+      "count": 3
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
+      "count": 1
+    },
+    {
+      "name": "iron_axe",
       "count": 1
     }
   ],
   "armor": {
     "head": null,
     "torso": null,
-    "legs": null,
+    "legs": "iron_leggings",
     "feet": null,
-    "hand": "oak_log"
+    "hand": "iron_axe"
   }
 }
