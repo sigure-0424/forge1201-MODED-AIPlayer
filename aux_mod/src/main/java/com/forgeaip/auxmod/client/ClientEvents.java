@@ -2,18 +2,23 @@ package com.forgeaip.auxmod.client;
 
 import com.forgeaip.auxmod.AuxMod;
 import com.forgeaip.auxmod.ForgeAIPConfig;
+import com.forgeaip.auxmod.data.SafeZoneManager;
 import com.forgeaip.auxmod.network.OrchestratorClient;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.*;
 import net.minecraftforge.event.TickEvent;
-import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
+import org.joml.Matrix3f;
+import org.joml.Matrix4f;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
@@ -171,5 +176,85 @@ public class ClientEvents {
         if (s == null) return "";
         return s.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+    }
+
+    // -------------------------------------------------------------------------
+    // Safe zone outline rendering
+    // -------------------------------------------------------------------------
+
+    /**
+     * Renders a green outline around the block the player is looking at when that
+     * block is inside a registered safe zone.
+     */
+    @SubscribeEvent
+    public static void onRenderLevelStage(RenderLevelStageEvent event) {
+        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS) return;
+
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.level == null) return;
+
+        HitResult hitResult = mc.hitResult;
+        if (hitResult == null || hitResult.getType() != HitResult.Type.BLOCK) return;
+
+        BlockPos pos = ((BlockHitResult) hitResult).getBlockPos();
+        SafeZoneManager.SafeZone zone = SafeZoneManager.getInstance()
+                .findContaining(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+        if (zone == null) return;
+
+        // Inflate the block AABB slightly for visibility
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(pos).inflate(0.003);
+        Vec3 camPos = mc.gameRenderer.getMainCamera().getPosition();
+
+        com.mojang.blaze3d.vertex.PoseStack poseStack = event.getPoseStack();
+        poseStack.pushPose();
+        poseStack.translate(-camPos.x, -camPos.y, -camPos.z);
+
+        com.mojang.blaze3d.vertex.VertexConsumer consumer = mc.renderBuffers()
+                .bufferSource()
+                .getBuffer(net.minecraft.client.renderer.RenderType.lines());
+
+        renderAABBOutline(poseStack, consumer, box, 0.0f, 1.0f, 0.0f, 0.7f);
+
+        mc.renderBuffers().bufferSource().endBatch(net.minecraft.client.renderer.RenderType.lines());
+        poseStack.popPose();
+    }
+
+    private static void renderAABBOutline(com.mojang.blaze3d.vertex.PoseStack poseStack,
+                                           com.mojang.blaze3d.vertex.VertexConsumer consumer,
+                                           net.minecraft.world.phys.AABB box,
+                                           float r, float g, float b, float a) {
+        float x1 = (float) box.minX, y1 = (float) box.minY, z1 = (float) box.minZ;
+        float x2 = (float) box.maxX, y2 = (float) box.maxY, z2 = (float) box.maxZ;
+        com.mojang.blaze3d.vertex.PoseStack.Pose pose = poseStack.last();
+        Matrix4f mat = pose.pose();
+        Matrix3f norm = pose.normal();
+
+        // Bottom edges
+        line(consumer, mat, norm, x1,y1,z1, x2,y1,z1, r,g,b,a);
+        line(consumer, mat, norm, x2,y1,z1, x2,y1,z2, r,g,b,a);
+        line(consumer, mat, norm, x2,y1,z2, x1,y1,z2, r,g,b,a);
+        line(consumer, mat, norm, x1,y1,z2, x1,y1,z1, r,g,b,a);
+        // Top edges
+        line(consumer, mat, norm, x1,y2,z1, x2,y2,z1, r,g,b,a);
+        line(consumer, mat, norm, x2,y2,z1, x2,y2,z2, r,g,b,a);
+        line(consumer, mat, norm, x2,y2,z2, x1,y2,z2, r,g,b,a);
+        line(consumer, mat, norm, x1,y2,z2, x1,y2,z1, r,g,b,a);
+        // Vertical edges
+        line(consumer, mat, norm, x1,y1,z1, x1,y2,z1, r,g,b,a);
+        line(consumer, mat, norm, x2,y1,z1, x2,y2,z1, r,g,b,a);
+        line(consumer, mat, norm, x2,y1,z2, x2,y2,z2, r,g,b,a);
+        line(consumer, mat, norm, x1,y1,z2, x1,y2,z2, r,g,b,a);
+    }
+
+    private static void line(com.mojang.blaze3d.vertex.VertexConsumer c,
+                              Matrix4f mat, Matrix3f norm,
+                              float x1, float y1, float z1,
+                              float x2, float y2, float z2,
+                              float r, float g, float b, float a) {
+        float dx = x2 - x1, dy = y2 - y1, dz = z2 - z1;
+        float len = (float) Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (len > 0) { dx /= len; dy /= len; dz /= len; }
+        c.vertex(mat, x1, y1, z1).color(r, g, b, a).normal(norm, dx, dy, dz).endVertex();
+        c.vertex(mat, x2, y2, z2).color(r, g, b, a).normal(norm, dx, dy, dz).endVertex();
     }
 }
