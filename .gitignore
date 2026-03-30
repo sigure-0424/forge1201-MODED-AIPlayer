@@ -69,3 +69,18 @@ analysis/**
 !tmp/orchestrator/archive/
 !tmp/orchestrator/archive/.gitkeep
 !analysis/.gitkeep
+
+# Java / Gradle
+build/
+.gradle/
+out/
+.idea/
+*.iml
+run/
+
+# JDK & Archives
+jdk-*/
+*.tar.gz
+
+# Temp folders
+temp/

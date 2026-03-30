@@ -65,7 +65,7 @@ public class SafeZoneCommand {
                                     DoubleArgumentType.getDouble(ctx, "z2")
                                 );
                                 return 1;
-                            }))))))))
+                            })))))))))
 
                 // /safezone remove <name>
                 .then(net.minecraft.commands.Commands.literal("remove")
