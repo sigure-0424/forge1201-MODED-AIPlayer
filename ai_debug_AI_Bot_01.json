@@ -1,15 +1,15 @@
 {
-  "timestamp": "2026-03-31T07:02:20.673Z",
+  "timestamp": "2026-03-31T12:37:27.415Z",
   "ready": true,
   "position": {
-    "x": 97.1,
-    "y": 49,
-    "z": 0.5
+    "x": -384.5,
+    "y": 66,
+    "z": -532.5
   },
   "health": 20,
-  "food": 17,
-  "dimension": "the_end",
-  "isExecuting": false,
+  "food": 20,
+  "dimension": "overworld",
+  "isExecuting": true,
   "actionQueue": [],
   "treeDir": null,
   "inventory": [
@@ -75,6 +75,10 @@
     },
     {
       "name": "createaddition:portable_energy_interface",
+      "count": 1
+    },
+    {
+      "name": "egg",
       "count": 1
     },
     {
