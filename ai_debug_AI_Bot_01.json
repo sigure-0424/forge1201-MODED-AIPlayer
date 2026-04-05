@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-04-05T06:25:53.705Z",
+  "timestamp": "2026-04-05T07:17:59.053Z",
   "ready": true,
   "position": {
     "x": -384.5,
@@ -10,16 +10,20 @@
   "food": 20,
   "dimension": "overworld",
   "isExecuting": true,
-  "currentAction": "equip_armor",
-  "actionQueue": [
-    {
-      "action": "equip_armor"
-    }
-  ],
+  "currentAction": "chat",
+  "actionQueue": [],
   "treeDir": null,
   "inventory": [
     {
       "name": "unknown",
+      "count": 1
+    },
+    {
+      "name": "iron_ingot",
+      "count": 1
+    },
+    {
+      "name": "create:creative_crate",
       "count": 1
     }
   ],
@@ -28,6 +32,6 @@
     "torso": null,
     "legs": null,
     "feet": null,
-    "hand": null
+    "hand": "unknown"
   }
 }
