@@ -11,6 +11,8 @@ const fs = require('fs');
 const path = require('path');
 const util = require('util');
 const { resolveRequiredMaterials } = require('./material_resolver');
+const { executeMacro } = require('./mod_interaction_executor');
+const wikiRag = require('./wiki_rag');
 
 // --- Overwrite Console Logging for External AI Monitor ---
 const originalLog = console.log;
@@ -1065,15 +1067,30 @@ bot.on('spawn', async () => {
                 console.log('[Actuator] No standable solid block found nearby. Will try pathfinder or ask player.');
                 // Check for void environment and initiate bridging
                 console.log('[Actuator] No solid ground detected. Initiating bridge construction...');
-                const bridgeStart = bot.entity.position.offset(0, -1, 0);
-                for (let i = 0; i < 2000; i++) {
+                // Attempt to place blocks forward from the bot's current position.
+                // bridgeStart is one block below the bot; we place on the top face (+Y) of
+                // blocks two below the bot and extending outward in Z.
+                for (let i = 0; i < 10; i++) {
                     const bridgeBlock = bot.inventory.items().find(item => item.name.includes('planks') || item.name.includes('stone'));
                     if (!bridgeBlock) {
                         console.log('[Actuator] Out of blocks for bridging. Stopping operation.');
                         break;
                     }
+                    // Reference block: two blocks below the bot, extended i blocks in +Z
+                    const refPos = bot.entity.position.offset(0, -2, i);
+                    const refBlock = bot.blockAt(refPos);
+                    // Can only place against a solid block; skip if void/air
+                    if (!refBlock || refBlock.boundingBox !== 'block') {
+                        console.log(`[Actuator] No reference block at step ${i}. Stopping bridge.`);
+                        break;
+                    }
                     await bot.equip(bridgeBlock, 'hand');
-                    await bot.placeBlock(bot.blockAt(bridgeStart.offset(0, -1, i)), bot.entity.position.offset(0, -1, i));
+                    try {
+                        await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+                    } catch (e) {
+                        console.log(`[Actuator] placeBlock failed at step ${i}: ${e.message}`);
+                        break;
+                    }
                 }
             }
         }
@@ -2505,10 +2522,11 @@ function inferToolCategory(block) {
     }
 
     if (name.includes('log') || name.includes('_wood') || name.includes('plank') ||
+        name.includes('bamboo_block') || name.includes('bamboo_mosaic') ||
         name.includes('fence') || name.includes('stem') || name.includes('hyphae') ||
         name.includes('chest') || name.includes('barrel') || name.includes('bookshelf') ||
         name.includes('crafting_table') || name.includes('jukebox') || name.includes('note_block') ||
-        name.includes('ladder') || name.includes('door') || name.includes('trapdoor')) {
+        name.includes('door') || name.includes('trapdoor')) {
         return 'axe';
     }
     if (name.includes('dirt') || name.includes('gravel') || name.includes('sand') ||
@@ -2529,7 +2547,10 @@ const PLANK_NAMES = new Set([
 const LOG_NAMES = new Set([
     'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log',
     'dark_oak_log', 'mangrove_log', 'cherry_log',
-    'oak_wood', 'spruce_wood', 'birch_wood', 'jungle_wood', 'acacia_wood', 'dark_oak_wood'
+    'oak_wood', 'spruce_wood', 'birch_wood', 'jungle_wood', 'acacia_wood',
+    'dark_oak_wood', 'mangrove_wood', 'cherry_wood',
+    // Bamboo (1.20+): bamboo_block is the log-equivalent, bamboo is the plant item
+    'bamboo_block', 'stripped_bamboo_block',
 ]);
 
 // ── Material Tag Groups ─────────────────────────────────────────────────────
@@ -2541,9 +2562,10 @@ const _LOG_LIST   = [...LOG_NAMES];
 const _PLANK_LIST = [...PLANK_NAMES];
 const MATERIAL_TAG_GROUPS = {
     // Any log variant satisfies a request for any specific log type
-    oak_log:         _LOG_LIST, spruce_log: _LOG_LIST, birch_log:    _LOG_LIST,
-    jungle_log:      _LOG_LIST, acacia_log: _LOG_LIST, dark_oak_log: _LOG_LIST,
-    mangrove_log:    _LOG_LIST, cherry_log: _LOG_LIST, oak_wood:     _LOG_LIST,
+    oak_log:         _LOG_LIST, spruce_log:    _LOG_LIST, birch_log:     _LOG_LIST,
+    jungle_log:      _LOG_LIST, acacia_log:    _LOG_LIST, dark_oak_log:  _LOG_LIST,
+    mangrove_log:    _LOG_LIST, cherry_log:    _LOG_LIST, oak_wood:      _LOG_LIST,
+    bamboo_block:    _LOG_LIST, stripped_bamboo_block: _LOG_LIST,
     // Any plank variant satisfies a request for any specific plank type
     oak_planks:     _PLANK_LIST, spruce_planks:   _PLANK_LIST, birch_planks:    _PLANK_LIST,
     jungle_planks:  _PLANK_LIST, acacia_planks:   _PLANK_LIST, dark_oak_planks: _PLANK_LIST,
@@ -5439,13 +5461,29 @@ async function processActionQueue() {
                             const blazePowder = bot.inventory.items().find(i => i.name === 'blaze_powder');
                             if (blazePowder) await brewingStand.putFuel(blazePowder.type, null, 1);
 
-                            // Add ingredient
+                            // Place base (water bottles or base potions) into the three potion slots.
+                            // In Minecraft, water_bottle and awkward_potion are both stored as the
+                            // 'potion' item with different NBT {Potion:"minecraft:water/awkward"}.
+                            // We search by the base name first; if not found, fall back to 'potion'.
+                            const baseItemId = bot.registry.itemsByName[recipe.base]?.id
+                                             ?? bot.registry.itemsByName['potion']?.id;
+                            if (baseItemId !== undefined) {
+                                const baseItems = bot.inventory.items().filter(i => i.type === baseItemId);
+                                const toDeposit = Math.min(baseItems.reduce((s, i) => s + i.count, 0), 3);
+                                if (toDeposit > 0) {
+                                    await brewingStand.deposit(baseItemId, null, toDeposit);
+                                } else {
+                                    console.log(`[Actuator] brew: no base item (${recipe.base}) in inventory`);
+                                }
+                            }
+
+                            // Add ingredient (top slot)
                             const ingredientId = bot.registry.itemsByName[recipe.ingredient]?.id;
                             const ingredient = ingredientId !== undefined ? bot.inventory.items().find(i => i.type === ingredientId) : null;
                             if (ingredient) await brewingStand.putIngredient(ingredient.type, null, 1);
 
                             bot.chat(`[System] Brewing ${potionKey} potion...`);
-                            // Wait for brewing to complete (~20 seconds)
+                            // Wait for brewing to complete (~20 seconds per cycle, Minecraft spec)
                             await new Promise(r => setTimeout(r, Math.min(22000, timeoutMs - 3000)));
                             brewingStand.close();
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully brewed ${potionKey}.`, environment: getEnvironmentContext() } });
@@ -6319,6 +6357,156 @@ async function processActionQueue() {
                 bot.deactivateItem();
 
             // ── wait ──────────────────────────────────────────────────────────
+            // ── activate_block ─────────────────────────────────────────────────
+            // Right-click (optionally while sneaking) on a block.
+            // Supports equipping a specific item and choosing which block face to use.
+            // Primary use: Create MOD wrench (sneak+right-click = pickup,
+            // right-click = rotate), industrial MOD interactions, etc.
+            //
+            //   { action:"activate_block", x:10, y:65, z:20,
+            //     item:"create:wrench",   -- optional: equip before clicking
+            //     sneak:true,             -- optional: hold sneak during click
+            //     face:"top"             -- optional: "top"|"bottom"|"north"|"south"|"east"|"west"
+            //   }
+            } else if (action.action === 'activate_block') {
+                const { x, y, z } = action;
+                if (x === undefined || y === undefined || z === undefined) {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'activate_block requires x, y, z.', environment: getEnvironmentContext() } });
+                } else {
+                    // Navigate near the block
+                    await withTimeout(
+                        bot.pathfinder.goto(new goals.GoalNear(Number(x), Number(y), Number(z), 3)),
+                        timeoutMs, 'goto for activate_block', () => bot.pathfinder.setGoal(null)
+                    ).catch(() => {});
+
+                    // Equip specified item
+                    if (action.item) {
+                        const itemName = String(action.item);
+                        const item = bot.inventory.items().find(i =>
+                            i.name === itemName ||
+                            i.name.endsWith(':' + itemName) ||
+                            i.name.includes(itemName)
+                        );
+                        if (item) {
+                            try { await bot.equip(item, 'hand'); } catch (e) {}
+                        } else {
+                            process.send({ type: 'USER_CHAT', data: { username: 'System', message: `activate_block: item "${itemName}" not in inventory.`, environment: getEnvironmentContext() } });
+                        }
+                    }
+
+                    const block = bot.blockAt(new Vec3(Number(x), Number(y), Number(z)));
+                    if (!block || block.name === 'air') {
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: `No block at (${x},${y},${z}).`, environment: getEnvironmentContext() } });
+                    } else {
+                        const wasSneak = bot.getControlState('sneak');
+                        if (action.sneak) bot.setControlState('sneak', true);
+                        const { FACE_VECTORS } = require('./mod_interaction_executor');
+                        const faceVec = FACE_VECTORS[action.face] || null;
+                        try {
+                            await bot.activateBlock(block, faceVec);
+                            process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Successfully activated block ${block.name} at (${x},${y},${z}).`, environment: getEnvironmentContext() } });
+                        } catch (e) {
+                            process.send({ type: 'USER_CHAT', data: { username: 'System', message: `activate_block failed: ${e.message}`, environment: getEnvironmentContext() } });
+                        } finally {
+                            if (action.sneak && !wasSneak) bot.setControlState('sneak', false);
+                        }
+                    }
+                }
+
+            // ── macro ──────────────────────────────────────────────────────────
+            // Execute a sequence of primitive interaction steps generated by the LLM.
+            // This is the main building block for MOD-specific interactions where
+            // the LLM has looked up wiki information and constructed the exact steps.
+            //
+            // Example (Create MOD wrench pickup):
+            //   { action: "macro", description: "Pick up Create block with wrench",
+            //     steps: [
+            //       { primitive: "equip",          item: "create:wrench" },
+            //       { primitive: "goto",            x: 10, y: 64, z: 20, tolerance: 3 },
+            //       { primitive: "look_at",         x: 10, y: 65, z: 20 },
+            //       { primitive: "sneak",           value: true },
+            //       { primitive: "activate_block",  x: 10, y: 65, z: 20 },
+            //       { primitive: "sneak",           value: false }
+            //     ]
+            //   }
+            //
+            // Available primitives: equip, goto, look_at, sneak, sprint,
+            //   activate_block, activate_item, swing_arm, attack_block,
+            //   wait, send_packet, chat
+            } else if (action.action === 'macro') {
+                const steps = Array.isArray(action.steps) ? action.steps : [];
+                const desc = action.description || 'macro';
+                if (steps.length === 0) {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'macro: no steps provided.', environment: getEnvironmentContext() } });
+                } else {
+                    console.log(`[Actuator] Executing macro "${desc}" (${steps.length} steps)`);
+                    bot.chat(`[System] Running macro: ${desc}`);
+                    const continueOnError = !!action.continue_on_error;
+                    const result = await executeMacro(bot, steps, currentCancelToken, continueOnError);
+                    if (result.ok) {
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Macro "${desc}" completed successfully (${result.stepsRun} steps).`, environment: getEnvironmentContext() } });
+                    } else {
+                        const errSummary = result.errors.slice(0, 3).join('; ');
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Macro "${desc}" failed after ${result.stepsRun} steps: ${errSummary}`, environment: getEnvironmentContext() } });
+                    }
+                }
+
+            // ── wiki_search ────────────────────────────────────────────────────
+            // Search the local wiki index for MOD interaction info and return
+            // the results to the LLM as a SYSTEM message.
+            // The LLM uses the results to construct a macro or activate_block action.
+            //
+            //   { action: "wiki_search", query: "create mod wrench usage pickup block" }
+            } else if (action.action === 'wiki_search') {
+                const query = String(action.query || action.target || '');
+                if (!query) {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'wiki_search: query is empty.', environment: getEnvironmentContext() } });
+                } else {
+                    let wikiResult = '';
+                    try {
+                        const topN = Math.min(Number(action.top_n) || 5, 10);
+                        const results = wikiRag.search(query, topN);
+                        if (results.length === 0) {
+                            wikiResult = `[Wiki] No results found for "${query}". Try rephrasing or use activate_block/macro directly.`;
+                        } else {
+                            const lines = results.map((r, i) => `[${i+1}] (${r.file}:${r.line}) ${r.text}`);
+                            wikiResult = `[Wiki results for "${query}"]:\n${lines.join('\n')}\n\nBased on this, construct a macro or activate_block action to perform the interaction.`;
+                        }
+                    } catch (e) {
+                        wikiResult = `[Wiki] Search error: ${e.message}`;
+                    }
+                    console.log(`[Actuator] wiki_search "${query}" → ${wikiResult.length} chars`);
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: wikiResult, environment: getEnvironmentContext() } });
+                }
+
+            // ── send_custom_payload ────────────────────────────────────────────
+            // Send a Forge custom payload packet (ServerboundCustomPayloadPacket).
+            // Used for MOD keybinding events that require a server-side packet.
+            // Example: remote storage access, tool mode toggle, etc.
+            //
+            //   { action: "send_custom_payload",
+            //     channel: "modname:channel_name",
+            //     data: "0100ff"   -- optional hex string
+            //   }
+            } else if (action.action === 'send_custom_payload') {
+                const channel = String(action.channel || '');
+                if (!channel || !channel.includes(':')) {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'send_custom_payload: channel must be "modname:channel_name".', environment: getEnvironmentContext() } });
+                } else {
+                    try {
+                        let dataBuf = Buffer.alloc(0);
+                        if (action.data) {
+                            const hexStr = String(action.data).replace(/\s+/g, '');
+                            if (hexStr.length % 2 !== 0) throw new Error('data hex string must have even length');
+                            dataBuf = Buffer.from(hexStr, 'hex');
+                        }
+                        bot._client.write('custom_payload', { channel, data: dataBuf });
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Sent custom packet to channel "${channel}" (${dataBuf.length} bytes).`, environment: getEnvironmentContext() } });
+                    } catch (e) {
+                        process.send({ type: 'USER_CHAT', data: { username: 'System', message: `send_custom_payload failed: ${e.message}`, environment: getEnvironmentContext() } });
+                    }
+                }
+
             // Issue 6: enter idle-combat mode immediately (fights nearby threats
             // until a new instruction cancels the token).
             } else if (action.action === 'wait') {
