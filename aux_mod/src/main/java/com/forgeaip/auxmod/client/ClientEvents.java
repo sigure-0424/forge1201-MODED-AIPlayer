@@ -6,6 +6,7 @@ import com.forgeaip.auxmod.network.OrchestratorClient;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.*;
@@ -13,6 +14,9 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import org.lwjgl.glfw.GLFW;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Client-side event handlers: keybind registration, tick-based entity tracking,
@@ -116,13 +120,29 @@ public class ClientEvents {
             String dimension = mc.level.dimension().location().toString();
             String playerName = mc.player.getName().getString();
 
+            // Build players[] — all other loaded client players (not self).
+            // This restores out-of-view follow capability: the bot reads this list
+            // to track the target even when the target is outside render range.
+            List<String> playerEntries = new ArrayList<>();
+            for (Player p : mc.level.players()) {
+                if (p == mc.player) continue; // self already in top-level fields
+                Vec3 pp = p.position();
+                playerEntries.add(String.format(
+                    "{\"name\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,\"dim\":\"%s\"}",
+                    escapeJson(p.getName().getString()), pp.x, pp.y, pp.z,
+                    escapeJson(dimension)
+                ));
+            }
+            String playersJson = "[" + String.join(",", playerEntries) + "]";
+
             String body = String.format(
-                "{\"playerName\":\"%s\",\"position\":{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f},\"dimension\":\"%s\"}",
+                "{\"playerName\":\"%s\",\"position\":{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f},\"dimension\":\"%s\",\"players\":%s}",
                 escapeJson(playerName),
                 playerPos.x,
                 playerPos.y,
                 playerPos.z,
-                escapeJson(dimension)
+                escapeJson(dimension),
+                playersJson
             );
 
             OrchestratorClient.getInstance().postJson("/api/entity_updates", body);
@@ -151,10 +171,23 @@ public class ClientEvents {
             String playerName = mc.player.getName().getString();
             String dimension  = mc.level.dimension().location().toString();
 
+            // Include other players in chat-triggered snapshot too.
+            List<String> playerEntries = new ArrayList<>();
+            for (Player p : mc.level.players()) {
+                if (p == mc.player) continue;
+                Vec3 ppos = p.position();
+                playerEntries.add(String.format(
+                    "{\"name\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,\"dim\":\"%s\"}",
+                    escapeJson(p.getName().getString()), ppos.x, ppos.y, ppos.z,
+                    escapeJson(dimension)
+                ));
+            }
+            String playersJson = "[" + String.join(",", playerEntries) + "]";
+
             String body = String.format(
-                "{\"playerName\":\"%s\",\"position\":{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f},\"dimension\":\"%s\"}",
+                "{\"playerName\":\"%s\",\"position\":{\"x\":%.1f,\"y\":%.1f,\"z\":%.1f},\"dimension\":\"%s\",\"players\":%s}",
                 escapeJson(playerName), pp.x, pp.y, pp.z,
-                escapeJson(dimension));
+                escapeJson(dimension), playersJson);
 
             OrchestratorClient.getInstance().postJson("/api/entity_updates", body);
         } catch (Exception ex) {

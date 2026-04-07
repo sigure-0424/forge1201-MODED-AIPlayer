@@ -399,6 +399,11 @@ class WebUIServer {
         // POST /api/entity_updates — receive entity tracking data from the aux mod
         this.app.post('/api/entity_updates', (req, res) => {
             if (req.body) {
+                // Debug: log receipt so we can confirm aux_mod is sending
+                const playerName = req.body.playerName || '?';
+                const players = Array.isArray(req.body.players) ? req.body.players.map(p => p.name).join(',') : '(none)';
+                console.log(`[WebUI] entity_update from ${playerName} — players[]: ${players}`);
+
                 // If there's a targeted block, inject it into all online bots' current environments
                 if (req.body.targetedBlock) {
                     for (const [id, status] of this.manager.botStatus.entries()) {

@@ -1,0 +1,102 @@
+# docker/forge-server/compose.yaml
+#
+# 実験用フルスタック構成
+# ─────────────────────────────────────────────────────────────
+# 起動方法:
+#   cd docker/forge-server
+#   docker compose up -d
+#
+# 事前準備:
+#   1. .env.forge (このファイルと同じディレクトリ) を作成して環境変数を設定。
+#      テンプレートは下の environment セクションのコメントを参照。
+#   2. MODS_DIR に既存の mods フォルダへのパスを指定する (.env.forge 内)。
+#      例: MODS_DIR=E:/forge1201server/mods
+#   3. SERVER_DIR は Forge サーバー本体があるフォルダ。レジストリや設定を共有する。
+#      例: SERVER_DIR=E:/forge1201server
+#
+# ポート:
+#   25565  Minecraft サーバー (ホスト公開)
+#   3000   Bot WebUI (ホスト公開)
+#   3001   Debug WebSocket (ホスト内のみ)
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Minecraft Forge 1.20.1 サーバー ────────────────────────
+  forge-server:
+    image: itzg/minecraft-server:java17
+    container_name: forgeaip-mc-server
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    environment:
+      # Forge 自動インストール
+      EULA: "TRUE"
+      TYPE: FORGE
+      VERSION: "1.20.1"
+      FORGE_VERSION: "47.4.10"
+      # メモリ — 必要に応じて変更
+      MEMORY: "4G"
+      JVM_XX_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=50"
+      # テスト用にオフラインモードを許可 (本番では FALSE に)
+      ONLINE_MODE: "false"
+      # ウォッチドッグ・クラッシュ対策
+      MAX_TICK_TIME: "-1"
+      # ForgeAIP aux_mod がレジストリを書き出すパス
+      # コンテナ内 /data が SERVER_DIR にマウントされる
+    volumes:
+      # SERVER_DIR をコンテナの /data にマウント
+      # (既存サーバーデータを再利用。mods/ config/ も含まれる)
+      - ${SERVER_DIR:-../../..}/forge1201server:/data
+    ports:
+      - "25565:25565"
+    networks:
+      - forgeaip-net
+    healthcheck:
+      test: ["CMD", "mc-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s   # Forge 初回起動は時間がかかる
+
+  # ── Bot システム (Node.js) ──────────────────────────────────
+  bot-system:
+    build:
+      context: ../..          # リポジトリルート
+      dockerfile: docker/bot.Dockerfile
+    container_name: forgeaip-bot
+    restart: unless-stopped
+    depends_on:
+      forge-server:
+        condition: service_healthy
+    environment:
+      # Minecraft サーバーへの接続先 (Docker 内部ネットワーク名を使用)
+      MC_HOST: forge-server
+      MC_PORT: "25565"
+      # LLM エンドポイント (ホスト側 Ollama など)
+      OLLAMA_URL: ${OLLAMA_URL}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:20b-cloud}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_AUTH_SCHEME: ${OLLAMA_AUTH_SCHEME:-Bearer}
+      # aux_mod がレジストリを書き出したパスをコンテナから読む
+      MC_SERVER_DIR: /mc-server
+      # WebUI
+      WEBUI_PORT: "3000"
+      # OBS 録画 (任意)
+      OBS_WS_URL: ${OBS_WS_URL:-}
+      OBS_WS_PASSWORD: ${OBS_WS_PASSWORD:-}
+    volumes:
+      # サーバーディレクトリを読み取り専用でマウント (forgeaip_registry.json 取得用)
+      - ${SERVER_DIR:-../../..}/forge1201server:/mc-server:ro
+      # ログ・デバッグファイルをホストに出力
+      - ../../debug_trace.jsonl:/app/debug_trace.jsonl
+      - ../../data:/app/data
+    ports:
+      - "3000:3000"     # WebUI
+      - "3001:3001"     # Debug WebSocket
+    networks:
+      - forgeaip-net
+
+networks:
+  forgeaip-net:
+    driver: bridge

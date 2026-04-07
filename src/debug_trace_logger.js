@@ -49,7 +49,7 @@ function logEvent(botId, event, actionName, position, extra = {}) {
             pos,
             extra
         }) + '\n';
-        fs.appendFile(TRACE_FILE, line, () => {});
+        fs.appendFileSync(TRACE_FILE, line);
     } catch (e) {
         // never crash the bot over logging
     }
@@ -69,7 +69,7 @@ function logStatus(botId, statusPayload) {
             event: 'status',
             payload: statusPayload
         }) + '\n';
-        fs.appendFile(TRACE_FILE, line, () => {});
+        fs.appendFileSync(TRACE_FILE, line);
     } catch (e) {
         // never crash the bot over logging
     }

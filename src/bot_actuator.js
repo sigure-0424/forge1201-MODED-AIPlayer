@@ -234,6 +234,36 @@ let _pendingIpcActions = [];
 const _externalPlayerPositions = new Map(); // playerName -> { x, y, z, dimension, updatedAt }
 let _lastBridgeFailureReason = null;
 
+// Server-side player position file (written every 2s by ServerPlayerTracker.java).
+// This is the primary out-of-view tracking source — works for any player regardless
+// of whether they have the client-side aux_mod installed.
+const _PLAYERS_JSON_CANDIDATES = [
+    process.env.MC_SERVER_DIR ? require('path').join(process.env.MC_SERVER_DIR, 'forgeaip_players.json') : null,
+    'E:/forge1201server/forgeaip_players.json',
+    require('path').join(process.cwd(), 'forgeaip_players.json'),
+].filter(Boolean);
+
+setInterval(() => {
+    for (const candidate of _PLAYERS_JSON_CANDIDATES) {
+        try {
+            if (!fs.existsSync(candidate)) continue;
+            const raw = fs.readFileSync(candidate, 'utf8').trim();
+            if (!raw || raw === '[]') break;
+            const players = JSON.parse(raw);
+            const now = Date.now();
+            for (const p of players) {
+                if (!p.name) continue;
+                _externalPlayerPositions.set(p.name, {
+                    x: p.x, y: p.y, z: p.z,
+                    dimension: p.dimension || 'minecraft:overworld',
+                    updatedAt: now,
+                });
+            }
+            break; // first successful candidate wins
+        } catch (_) {}
+    }
+}, 2000);
+
 function _normPlayerName(name) {
     return String(name || '')
         .trim()
@@ -1073,20 +1103,45 @@ bot.on('spawn', async () => {
     }, 5000);
 
     // VDS-001: Stuck detection — every 5s compare position against previous sample.
-    let _stuckLastPos = null;
-    let _stuckSeconds = 0;
-    let _obsRecording = false;
+    //
+    // BUG-A fix: reset _stuckSeconds when currentAction changes.
+    //   Previously the counter accumulated across different actions, causing false
+    //   reports like "stuck give duration_sec:150" immediately after a long goto.
+    //
+    // BUG-B fix: skip stuck detection for non-movement actions.
+    //   chat/give/equip/wait/sleep etc. are stationary by design; reporting them
+    //   as stuck creates noise and triggers OBS recording falsely.
+    const MOVEMENT_ACTIONS = new Set([
+        'goto', 'come', 'follow', 'collect', 'find_land', 'navigate_portal',
+        'explore', 'fly', 'kill', 'recover_gravestone', 'find_and_equip',
+        'loot_chest_special', 'smelt', 'brew', 'enchant', 'place', 'place_pattern',
+        'activate_end_portal', 'boat', 'withdraw_from_container',
+        'deposit_to_container', 'transfer_between_containers',
+    ]);
+    let _stuckLastPos    = null;
+    let _stuckSeconds    = 0;
+    let _stuckLastAction = null; // BUG-A: track which action the counter belongs to
+    let _obsRecording    = false;
     setInterval(() => {
         if (!bot.entity) return;
         const pos = bot.entity.position;
-        if (_stuckLastPos && currentAction && currentAction !== 'stop') {
+        const act = currentAction;
+
+        // BUG-A: reset counter whenever the action name changes
+        if (act !== _stuckLastAction) {
+            _stuckSeconds    = 0;
+            _stuckLastAction = act;
+        }
+
+        // BUG-B: only check movement actions
+        if (_stuckLastPos && act && act !== 'stop' && MOVEMENT_ACTIONS.has(act)) {
             const dx = pos.x - _stuckLastPos.x;
             const dy = pos.y - _stuckLastPos.y;
             const dz = pos.z - _stuckLastPos.z;
             const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
             if (dist < 0.5) {
                 _stuckSeconds += 5;
-                debugTrace.logEvent(botId, 'stuck', currentAction, pos, { duration_sec: _stuckSeconds });
+                debugTrace.logEvent(botId, 'stuck', act, pos, { duration_sec: _stuckSeconds });
                 debugWS.broadcast('stuck', {
                     botId,
                     pos: [Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z)],
@@ -1607,14 +1662,149 @@ const NON_RESUMABLE_ACTIONS = new Set(['give', 'smelt', 'brew', 'enchant', 'acti
 // ─── Aviation: Jetpack Mod Registry ───────────────────────────────────────────
 // Maps mod namespace → control config. itemPattern matches the local item name
 // (part after ':' in the full Minecraft item ID). ascendControl is the Mineflayer
-// control state to hold for upward thrust. Add entries when new jetpack mods appear.
+// control state to hold for upward thrust. activatePulse: true means the mod
+// needs a brief bot.activateItem() call before ascent to toggle the jetpack ON.
+// Item names confirmed from forgeaip_registry.json (2026-04-07):
+//   create_jetpack:jetpack, create_jetpack:netherite_jetpack
+//   create_sa:brass_jetpack_chestplate, create_sa:andesite_jetpack_chestplate,
+//   create_sa:copper_jetpack_chestplate, create_sa:netherite_jetpack_chestplate
+// ── Jetpack mod registry ──────────────────────────────────────────────────────
+//
+// activateMethod — how the jetpack is switched on BEFORE ascending:
+//   'none'        Passive: worn item provides thrust whenever jump is held while
+//                 airborne.  No explicit activation needed.  Most modern mods.
+//   'right_click' Toggle: right-click (use-item) cycles the jetpack state.
+//                 Must be sent once to switch on, once to switch off.
+//   'auto'        Unknown mod: try passive first; if the bot stalls (not rising
+//                 for 3 s despite jump held), fire one right-click recovery pulse
+//                 and retry.  Used for the generic fallback.
+//
+// hoverMode — if true, the mod provides a hover/float mode: releasing jump
+//   stops vertical movement instead of letting gravity pull the bot down.
+//   (e.g. Modular Powersuits)
+//
+// fuelType — how to read remaining fuel:
+//   'durability'  Item damage bar = fuel used.  Universal fallback.
+//                 Works for: Create Jetpack (air pressure shown as durability),
+//                 IC2, most non-RF mods.
+//   'nbt_fe'      Forge Energy / RF stored in item NBT.  The function tries
+//                 common key names (Energy, MaxEnergy, etc.) plus fuelNbtPath /
+//                 fuelNbtMaxPath if provided.  Falls back to durability on failure.
+//   'none'        Infinite fuel (hypothetical / creative-mode items).
+//
+// fuelNbtPath / fuelNbtMaxPath — array of NBT keys to traverse for nbt_fe mods.
+//   Each entry is the next nested key.  e.g. ['Energy'] reads nbt.Energy.
+//   Mineflayer wraps typed NBT as {type,value}, so the reader unwraps
+//   automatically.
+//
+// fuelLow — ratio (0..1) below which the bot warns and discourages new flights.
+//   Default: 0.20  (20 % remaining)
+//
+// fuelCritical — ratio below which an in-progress flight is aborted.
+//   Default: 0.05  (5 % remaining)
+//
+// ── Fuel replenishment note ─────────────────────────────────────────────────
+// Refueling is highly mod-specific and cannot be fully automated without wiki /
+// config RAG.  Known methods:
+//   Create Jetpack     — place item on shaft encoder connected to rotational source
+//   Simply Jetpacks 2  — charging station (RF)
+//   Thermal Innovation — energetic infuser / charging pad (RF)
+//   Mekanism           — energy cube / charging station
+//   PneumaticCraft     — charging station (pressure)
+//   IC2                — batbox / MFE / generator (EU)
+// When fuelCritical is reached, the system reports to AgentManager which can
+// query the wiki RAG for mod-specific refueling instructions.
+//
+// ── Activation / fuel category reference ───────────────────────────────────
+// Category A (passive, durability): Create Jetpack, create_sa
+// Category A (passive, nbt_fe): Simply Jetpacks 2, Iron Jetpacks, Powah,
+//   Bigger/Extreme Reactors, PneumaticCraft, Mekanism
+// Category B (right_click, nbt_fe): Thermal, Ender IO, Galacticraft
+// Category B (right_click, durability): IC2, IC2Classic, Advanced Rocketry
+// Category C (hover, nbt_fe): Modular Powersuits
 const JETPACK_MOD_REGISTRY = {
-    simplyjetpacks2:  { itemPattern: /jetpack/i, ascendControl: 'jump' },
-    simplerjetpacks2: { itemPattern: /jetpack/i, ascendControl: 'jump' },
-    // Create Jetpack mod — uses jump for thrust, same as others.
-    create_jetpack:   { itemPattern: /jetpack/i, ascendControl: 'jump' },
-    // Generic fallback: covers any mod item with "jetpack" in the local name.
-    _generic:         { itemPattern: /jetpack/i, ascendControl: 'jump' },
+    // ── Category A: passive ─────────────────────────────────────────────────
+    // Simply Jetpacks 2: RF stored as NBT Energy/MaxEnergy (long values).
+    simplyjetpacks2:  { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe',   fuelNbtPath: ['Energy'], fuelNbtMaxPath: ['MaxEnergy'] },
+    simplerjetpacks2: { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe',   fuelNbtPath: ['Energy'], fuelNbtMaxPath: ['MaxEnergy'] },
+    // Create Jetpack: compressed air shown as durability bar (universal read).
+    create_jetpack:   { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'durability' },
+    // Create Stuff & Additions (brass/andesite/copper/netherite variants).
+    create_sa:        { itemPattern: /jetpack_chestplate/i,
+                        activateMethod: 'none',
+                        fuelType: 'durability' },
+    // Jetpacks! (Lonazark / reforged ports) — RF, nbt Energy/MaxEnergy.
+    jetpacks:         { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe' },
+    // PneumaticCraft Repressurized — pressure shown as NBT Air/MaxAir.
+    pneumaticcraft:   { itemPattern: /pneumatic_chestplate|jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe',   fuelNbtPath: ['Air'], fuelNbtMaxPath: ['MaxAir'] },
+    // Mekanism: meka-suit with jetpack unit — FE in nested EnergyContainers.
+    mekanism:         { itemPattern: /mekasuit_bodyarmor|jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe' },
+    // Powah: RF stored as Energy/MaxEnergy.
+    powah:            { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe' },
+    // Bigger Reactors / Extreme Reactors accessory jetpack.
+    biggerreactors:   { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe' },
+    extremereactors:  { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe' },
+    // Iron Jetpacks — FE stored as Energy/MaxEnergy.
+    ironjetpacks:     { itemPattern: /jetpack/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe' },
+    // ── Category B: right-click toggle ─────────────────────────────────────
+    // Thermal Series (Thermal Innovation / Thermal Locomotion) — RF.
+    thermal:          { itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'nbt_fe' },
+    thermalinnovation:{ itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'nbt_fe' },
+    // Ender IO — capacitor jetpack, RF.
+    enderio:          { itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'nbt_fe' },
+    // IC2 / IC2 Classic — EU stored as durability bar.
+    ic2:              { itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'durability' },
+    ic2classic:       { itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'durability' },
+    // Galacticraft — fuel stored as durability.
+    galacticraftcore: { itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'durability' },
+    // Advanced Rocketry — durability-based fuel.
+    advancedrocketry: { itemPattern: /jetpack/i,
+                        activateMethod: 'right_click',
+                        fuelType: 'durability' },
+    // ── Category C: hover mode ──────────────────────────────────────────────
+    // Modular Powersuits — releasing jump stops vertical movement (hover).
+    powersuits:       { itemPattern: /powersuit/i,
+                        activateMethod: 'none',
+                        fuelType: 'nbt_fe',
+                        hoverMode: true },
+    // ── Generic fallback ────────────────────────────────────────────────────
+    // activateMethod:'auto' = passive first; right_click recovery on stall.
+    // fuelType:'auto' tries nbt_fe first, then durability.
+    _generic:         { itemPattern: /jetpack/i,
+                        activateMethod: 'auto',
+                        fuelType: 'auto' },
 };
 
 // ─── Blackboard (Change 2) ────────────────────────────────────────────────────
@@ -2089,51 +2279,325 @@ function detectAviationMethod(torsoItem) {
     return null;
 }
 
-// Fly to (destX, destY, destZ) using a jetpack.
-// Phase 1: rise to target altitude using the mod's ascendControl (default: jump).
-// Phase 2: navigate horizontally while holding thrust.
-// Phase 3: release thrust and descend.
+// Helper: send player abilities packet to tell the server the bot is (or is not)
+// flying.  Required to avoid "multiplayer.disconnect.flying" kicks during
+// jetpack flight even when allow-flight=true is set in server.properties.
+// Forge servers still run the vanilla anti-cheat which checks the client-reported
+// flying flag, not just the server property.
+function _setServerFlyingFlag(flying) {
+    try {
+        // flags byte: bit0=invulnerable, bit1=flying, bit2=allowFly, bit3=creative
+        const flags = flying ? 0x06 : 0x00; // 0x02(flying) | 0x04(allowFly)
+        bot._client.write('abilities', {
+            flags,
+            flyingSpeed: flying ? 0.05 : 0.0,
+            walkingSpeed: 0.1,
+        });
+        if (bot.entity && bot.entity.abilities) {
+            bot.entity.abilities.flying = flying;
+            bot.entity.abilities.allowFlight = flying;
+        }
+    } catch (_) { /* non-fatal; packet may not exist on old protocol */ }
+}
+
+// ── Jetpack fuel level reader ─────────────────────────────────────────────────
+// Returns a ratio 0.0 (empty) … 1.0 (full) for the jetpack item in the torso
+// slot.  Tries NBT energy first for energy-based mods, then falls back to item
+// durability (the universal proxy used by durability-bar mods like Create Jetpack
+// and IC2).  Returns 1.0 when fuel cannot be determined (assume charged).
+//
+// fuelType values handled:
+//   'durability' — (maxDurability - durabilityUsed) / maxDurability
+//   'nbt_fe'     — traverse fuelNbtPath/fuelNbtMaxPath or common FE key names
+//   'auto'       — try nbt_fe first, then durability
+//   'none'       — always 1.0 (infinite / creative)
+function getJetpackFuelRatio(torsoItem, config) {
+    if (!torsoItem) return 0;
+    const fuelType = config.fuelType || 'auto';
+    if (fuelType === 'none') return 1.0;
+
+    // ── Helper: read a typed NBT value (Mineflayer wraps as {type, value}) ─
+    function _nbtGet(obj, keyPath) {
+        let cur = obj;
+        for (const key of keyPath) {
+            if (cur === null || cur === undefined) return undefined;
+            // Unwrap typed NBT compound/list wrapper
+            if (typeof cur === 'object' && 'value' in cur && typeof cur.value === 'object') cur = cur.value;
+            cur = cur[key];
+        }
+        // Unwrap final typed NBT primitive
+        if (cur !== null && cur !== undefined && typeof cur === 'object' && 'value' in cur) cur = cur.value;
+        return cur;
+    }
+
+    // ── NBT energy read ────────────────────────────────────────────────────
+    if (fuelType === 'nbt_fe' || fuelType === 'auto') {
+        try {
+            const nbtRoot = torsoItem.nbt;
+            if (nbtRoot) {
+                const root = (nbtRoot.value || nbtRoot);
+                let energy = null, maxEnergy = null;
+
+                // 1. Try explicit paths from registry entry
+                if (config.fuelNbtPath) {
+                    energy = _nbtGet(root, config.fuelNbtPath);
+                }
+                if (config.fuelNbtMaxPath) {
+                    maxEnergy = _nbtGet(root, config.fuelNbtMaxPath);
+                }
+
+                // 2. Fall back: probe common FE/RF/pressure key names
+                if (energy === null || energy === undefined) {
+                    for (const k of ['Energy', 'energy', 'Charge', 'RF', 'Air', 'Pressure']) {
+                        const v = _nbtGet(root, [k]);
+                        if (typeof v === 'number') { energy = v; break; }
+                    }
+                }
+                if (maxEnergy === null || maxEnergy === undefined) {
+                    for (const k of ['MaxEnergy', 'maxEnergy', 'MaxCharge', 'MaxRF', 'MaxAir', 'MaxPressure', 'Capacity', 'capacity']) {
+                        const v = _nbtGet(root, [k]);
+                        if (typeof v === 'number') { maxEnergy = v; break; }
+                    }
+                }
+
+                if (typeof energy === 'number' && typeof maxEnergy === 'number' && maxEnergy > 0) {
+                    return Math.max(0, Math.min(1, energy / maxEnergy));
+                }
+                // Partial info: energy known but max unknown → estimate via item max durability
+                if (typeof energy === 'number' && energy === 0) return 0; // definitely empty
+            }
+        } catch (_) { /* NBT parse error — fall through to durability */ }
+        if (fuelType === 'nbt_fe') {
+            // Explicit nbt_fe but read failed — optimistically return 0.5 so flight
+            // isn't blocked, but log a warning.
+            console.warn(`[Actuator] getJetpackFuelRatio: could not read NBT energy for ${torsoItem.name}; assuming 50%.`);
+            return 0.5;
+        }
+    }
+
+    // ── Durability fallback ────────────────────────────────────────────────
+    const maxDur = torsoItem.maxDurability;
+    if (!maxDur || maxDur <= 0) return 1.0; // unbreakable → no durability → infinite
+    const damage = torsoItem.durabilityUsed || 0;
+    return Math.max(0, Math.min(1, (maxDur - damage) / maxDur));
+}
+
+// Fly to (destX, destY, destZ) using any modded jetpack.
+//
+// ── Universal design ─────────────────────────────────────────────────────────
+// Mod-agnostic.  All behaviour is driven by the `config` object from
+// JETPACK_MOD_REGISTRY (activateMethod, hoverMode, fuelType, fuelLow,
+// fuelCritical).
+//
+// ── Why physicsTick velocity override is universal ───────────────────────────
+// Mineflayer applies gravity (-0.08/tick).  setControlState('jump',true) fires a
+// one-shot upward impulse → bot bounces.  physicsTick fires AFTER each physics
+// step; overwriting velocity.y here sets the NEXT step's starting velocity,
+// effectively replacing gravity with controlled thrust for all mods.
+//
+// ── How server mods detect "flying" ─────────────────────────────────────────
+// A (passive): reads player.jumping from player_input packet (0x16) — set
+//   automatically by Mineflayer while setControlState('jump',true) is active.
+// B (toggle): right-click (use-item) toggles item NBT activation state; then
+//   same jump-flag detection applies.
+// C (hover): same as A but releasing jump freezes vertical movement server-side.
+//
+// ── Phases ───────────────────────────────────────────────────────────────────
+// PRE  Fuel check — abort if below fuelCritical before even starting.
+// 0    Pre-flight activation (right_click toggle mods only).
+// 1    Ascend to targetY + stall detector + per-100ms fuel monitor.
+// 2    Horizontal navigation + altitude PID + per-5s fuel monitor.
+// 3    Safe descent: sneak held + slow-fall physicsTick override → no fall
+//      damage.  Toggle OFF for B-mods.  Report fuel status to AgentManager.
 async function flyWithJetpack(destX, destY, destZ, config, cancelToken) {
-    const ctrl = config.ascendControl || 'jump';
-    const targetY = destY !== null ? destY : bot.entity.position.y;
+    const targetY      = destY !== null ? destY : bot.entity.position.y;
+    const actMethod    = config.activateMethod || 'auto';
+    const hoverMode    = !!config.hoverMode;
+    const fuelLow      = config.fuelLow      ?? 0.20; // warn threshold
+    const fuelCritical = config.fuelCritical ?? 0.05; // abort threshold
+
+    // ── Helper: read current fuel from the torso slot ─────────────────────
+    const _torsoIdx = () => bot.getEquipmentDestSlot('torso');
+    const _fuelNow  = () => getJetpackFuelRatio(bot.inventory.slots[_torsoIdx()], config);
+
+    // ── PRE: Fuel check before starting ──────────────────────────────────
+    const preFuel = _fuelNow();
+    if (preFuel <= fuelCritical) {
+        const pct = Math.round(preFuel * 100);
+        bot.chat(`[System Error] Jetpack fuel critically low (${pct}%) — refusing to fly. Refuel first.`);
+        process.send({ type: 'USER_CHAT', data: {
+            username: 'System',
+            message: `Jetpack fuel is at ${pct}% (below ${Math.round(fuelCritical*100)}% critical threshold). ` +
+                     `Cannot fly safely. Please refuel the ${bot.inventory.slots[_torsoIdx()]?.name || 'jetpack'}.`,
+            environment: getEnvironmentContext(),
+        }});
+        return;
+    }
+    if (preFuel <= fuelLow) {
+        bot.chat(`[System] Warning: Jetpack fuel low (${Math.round(preFuel*100)}%). Proceeding with caution.`);
+    }
 
     bot.chat(`[System] Jetpack engaging — heading to X:${Math.round(destX)} Y:${Math.round(targetY)} Z:${Math.round(destZ)}.`);
     bot.pathfinder.setGoal(null);
+    bot.clearControlStates();
 
-    // Phase 1: Ascend to target altitude.
-    bot.setControlState(ctrl, true);
-    const riseDeadline = Date.now() + 15000;
-    while (bot.entity.position.y < targetY - 0.5 && Date.now() < riseDeadline && !cancelToken.cancelled) {
-        await new Promise(r => setTimeout(r, 100));
+    // Tell the server the client is flying (prevents vanilla anti-cheat kicks
+    // even on allow-flight=true servers; client abilities packet must report
+    // flying=true).
+    _setServerFlyingFlag(true);
+    await new Promise(r => setTimeout(r, 100));
+
+    // ── Phase 0: Pre-flight activation ───────────────────────────────────────
+    // Category B mods require right-click to toggle ON before jump detection.
+    if (actMethod === 'right_click') {
+        try { bot.activateItem(); } catch (_) {}
+        await new Promise(r => setTimeout(r, 350));
     }
 
-    // Phase 2: Horizontal navigation while holding thrust.
+    // ── Physics override (universal) ─────────────────────────────────────────
+    // Overwrite velocity.y every tick to replace gravity with controlled thrust.
+    let _flyPhase = 'ascend'; // 'ascend' | 'cruise' | 'descend' | 'done'
+    const _flyTick = () => {
+        if (_flyPhase === 'done') return;
+        const diff = targetY - bot.entity.position.y;
+        if (_flyPhase === 'ascend') {
+            if (diff > 0.5) {
+                bot.entity.velocity.y = 0.28; // net +0.20 b/tick after gravity
+            } else {
+                _flyPhase = 'cruise';
+                bot.entity.velocity.y = 0;
+            }
+        } else if (_flyPhase === 'cruise') {
+            // Proportional altitude hold (works for hover and non-hover mods).
+            bot.entity.velocity.y = Math.max(-0.12, Math.min(0.18, diff * 0.18));
+        } else if (_flyPhase === 'descend') {
+            // Controlled descent: cap downward speed so most mods' fall-damage
+            // prevention (sneak-hold) has time to engage server-side.
+            bot.entity.velocity.y = Math.max(-0.15, bot.entity.velocity.y);
+        }
+    };
+
+    bot.on('physicsTick', _flyTick);
+    bot.setControlState('jump', true); // propagates as jump=true in player_input (0x16)
+    await new Promise(r => setTimeout(r, 200));
+
+    // ── Phase 1: Ascend ───────────────────────────────────────────────────────
+    const riseDeadline = Date.now() + 20000;
+    let _stallMs    = 0;
+    let _lastY      = bot.entity.position.y;
+    let _recoveries = 0;
+
+    while (bot.entity.position.y < targetY - 0.5 && Date.now() < riseDeadline && !cancelToken.cancelled) {
+        await new Promise(r => setTimeout(r, 100));
+        const dy = bot.entity.position.y - _lastY;
+        _lastY = bot.entity.position.y;
+
+        // ── In-flight fuel check (every tick during ascent) ───────────────
+        const fuel = _fuelNow();
+        if (fuel <= fuelCritical) {
+            bot.chat(`[System] Jetpack fuel critical (${Math.round(fuel*100)}%) mid-flight — aborting ascent!`);
+            break;
+        }
+
+        if (dy < 0.01) {
+            _stallMs += 100;
+            // ── Universal stall recovery ──────────────────────────────────
+            if (_stallMs >= 3000 && _recoveries < 2) {
+                if (actMethod === 'auto' || actMethod === 'right_click') {
+                    bot.chat('[System] Jetpack stall — retrying activation toggle.');
+                    try { bot.activateItem(); } catch (_) {}
+                    _recoveries++;
+                } else {
+                    bot.chat('[System] Jetpack not ascending — possible fuel exhaustion.');
+                    break;
+                }
+                _stallMs = 0;
+            }
+        } else {
+            _stallMs = 0;
+        }
+    }
+
+    // ── Phase 2: Horizontal navigation ───────────────────────────────────────
+    _flyPhase = 'cruise';
+    if (hoverMode) bot.setControlState('jump', false);
     bot.setControlState('forward', true);
     bot.setControlState('sprint', true);
+
     const horizDeadline = Date.now() + 90000;
+    let _lastFuelCheck  = Date.now();
+
     while (Date.now() < horizDeadline && !cancelToken.cancelled) {
         const dx = destX - bot.entity.position.x;
         const dz = destZ - bot.entity.position.z;
         if (Math.sqrt(dx * dx + dz * dz) < 3) break;
-        // Altitude regulation: release thrust briefly if above target, re-engage if below.
-        if (bot.entity.position.y > targetY + 3) {
-            bot.setControlState(ctrl, false);
-        } else {
-            bot.setControlState(ctrl, true);
+
+        // ── In-flight fuel check (every 5 s during cruise) ────────────────
+        if (Date.now() - _lastFuelCheck >= 5000) {
+            _lastFuelCheck = Date.now();
+            const fuel = _fuelNow();
+            if (fuel <= fuelCritical) {
+                bot.chat(`[System] Jetpack fuel critical (${Math.round(fuel*100)}%) — aborting flight!`);
+                break;
+            }
+            if (fuel <= fuelLow) {
+                bot.chat(`[System] Jetpack fuel low (${Math.round(fuel*100)}%) — returning soon.`);
+            }
+        }
+
+        // hoverMode: tap jump to correct altitude sag; _flyTick handles non-hover.
+        if (hoverMode && bot.entity.position.y < targetY - 1.5) {
+            bot.setControlState('jump', true);
+            await new Promise(r => setTimeout(r, 150));
+            bot.setControlState('jump', false);
         }
         try { await bot.lookAt(new Vec3(destX, bot.entity.position.y, destZ), true); } catch (_) {}
         await new Promise(r => setTimeout(r, 150));
     }
 
-    // Phase 3: Release thrust and descend to ground.
-    bot.setControlState(ctrl, false);
+    // ── Phase 3: Safe descent ─────────────────────────────────────────────────
+    // Hold sneak so server-side mod engages fall-damage prevention / hover mode.
+    // physicsTick 'descend' phase caps downward velocity to a safe speed while
+    // sneak is held (most mods cap fall speed when sneak+airborne).
+    _flyPhase = 'descend';
     bot.setControlState('forward', false);
     bot.setControlState('sprint', false);
-    const landDeadline = Date.now() + 10000;
+    bot.setControlState('jump', false);
+    bot.setControlState('sneak', true); // triggers soft-landing on most jetpacks
+
+    // Toggle OFF for right-click mods.
+    if (actMethod === 'right_click' || (actMethod === 'auto' && _recoveries > 0)) {
+        try { bot.activateItem(); } catch (_) {}
+        await new Promise(r => setTimeout(r, 200));
+    }
+    _setServerFlyingFlag(false);
+
+    const landDeadline = Date.now() + 12000;
     while (!bot.entity.onGround && Date.now() < landDeadline && !cancelToken.cancelled) {
         await new Promise(r => setTimeout(r, 100));
     }
+
+    // Clean up
+    _flyPhase = 'done';
+    bot.removeListener('physicsTick', _flyTick);
     bot.clearControlStates();
+
+    // ── Post-flight fuel report ───────────────────────────────────────────────
+    const postFuel = _fuelNow();
+    const postPct  = Math.round(postFuel * 100);
+    const jetpackName = bot.inventory.slots[_torsoIdx()]?.name || 'jetpack';
+    if (postFuel <= fuelCritical) {
+        // Report to AgentManager so the LLM can look up refueling instructions
+        // via wiki RAG if needed.
+        process.send({ type: 'USER_CHAT', data: {
+            username: 'System',
+            message: `Jetpack (${jetpackName}) fuel critically low after landing: ${postPct}%. ` +
+                     `Refuel before next flight.`,
+            environment: getEnvironmentContext(),
+        }});
+    } else if (postFuel <= fuelLow) {
+        bot.chat(`[System] Jetpack fuel at ${postPct}% after landing. Consider refueling soon.`);
+    }
 }
 
 // Fly to (destX, destY, destZ) using an Elytra + firework rockets.
@@ -3740,16 +4204,27 @@ async function processActionQueue() {
                     }
 
                     bot.chat(`[System] Following ${action.target}!`);
-                    if (targetEntity?.isValid) {
-                        bot.pathfinder.setGoal(new goals.GoalFollow(targetEntity, 2), true);
-                    } else {
-                        bot.pathfinder.setGoal(new goals.GoalNear(tracked.x, tracked.y, tracked.z, 3), true);
+                    // Always use GoalNear with server-authoritative coordinates.
+                    // GoalFollow is avoided because it requires a live entity reference
+                    // and uses a different goal type that conflicts with the out-of-view
+                    // GoalNear path, causing the "instanceof" check to mismatch and reset
+                    // the goal unnecessarily. aux_mod / forgeaip_players.json updates at
+                    // 2s intervals — precise enough for smooth following at any distance.
+                    const _initPos = tracked
+                        ? { x: tracked.x, y: tracked.y, z: tracked.z }
+                        : (targetEntity?.isValid
+                            ? { x: targetEntity.position.x, y: targetEntity.position.y, z: targetEntity.position.z }
+                            : null);
+                    if (_initPos) {
+                        bot.pathfinder.setGoal(new goals.GoalNear(_initPos.x, _initPos.y, _initPos.z, 3), true);
                     }
                     process.send({ type: 'USER_CHAT', data: { username: "System", message: `Now following ${action.target}.`, environment: getEnvironmentContext() } });
 
-                    // Hold the queue slot until a 'stop' command cancels the token.
-                    // Also monitor the goal — if something external clears it (e.g. the
-                    // pathfinder's own stop(), or a bug), re-set it so following continues.
+                    // Normalize dimension strings: "minecraft:overworld" → "overworld"
+                    // bot.game.dimension uses the short form; forgeaip_players.json uses the
+                    // fully-qualified form. Strip the namespace prefix before comparing.
+                    const _normDim = d => (d ? d.replace(/^[^:]+:/, '') : null);
+
                     await new Promise(resolve => {
                         let lastKnown = tracked ? { ...tracked } : null;
                         let lastSeenAt = tracked ? Date.now() : 0;
@@ -3761,33 +4236,23 @@ async function processActionQueue() {
                                 resolve();
                                 return;
                             }
-                            // Re-validate: target still visible?
-                            const t = bot.players[action.target]?.entity;
+
+                            // Best position source: aux_mod / forgeaip_players.json first,
+                            // then entity (in-view fallback) so entity is never preferred
+                            // over the server-authoritative file data.
                             let p = getTrackedPlayerSnapshot(action.target);
-                            if (t && t.isValid) {
-                                lastKnown = {
-                                    x: t.position.x,
-                                    y: t.position.y,
-                                    z: t.position.z,
+                            const t = bot.players[action.target]?.entity;
+
+                            // Use entity to update position if aux_mod has no data yet
+                            if (!p && t?.isValid) {
+                                p = {
+                                    x: t.position.x, y: t.position.y, z: t.position.z,
                                     dimension: bot.game?.dimension || null,
                                     updatedAt: Date.now()
                                 };
-                                lastSeenAt = Date.now();
-                                missingSince = 0;
-                                const dxNow = t.position.x - bot.entity.position.x;
-                                const dzNow = t.position.z - bot.entity.position.z;
-                                const distNow = Math.hypot(dxNow, dzNow);
-                                if (distNow > 2.5) {
-                                    const afNow = Math.atan2(dzNow, dxNow);
-                                    if (!isSafeForward(afNow) && (hasForwardGap(afNow) || hasLikelyBridgeNeed(afNow))) {
-                                        try { await tryBridgeForward(afNow, action.block || action.material, 2); } catch (_) {}
-                                    }
-                                }
-                                if (!(bot.pathfinder.goal instanceof goals.GoalFollow)) {
-                                    bot.pathfinder.setGoal(new goals.GoalFollow(t, 2), true);
-                                }
-                                return;
                             }
+
+                            // Evict stale aux_mod entries (>2 min without update)
                             if (p && Date.now() - (p.updatedAt || 0) > 120000) {
                                 for (const [k, v] of _externalPlayerPositions.entries()) {
                                     if (v === p || _normPlayerName(k) === _normPlayerName(action.target)) {
@@ -3796,21 +4261,18 @@ async function processActionQueue() {
                                 }
                                 p = null;
                             }
+
                             if (p) {
-                                lastKnown = p;
+                                lastKnown  = p;
                                 lastSeenAt = Date.now();
                                 missingSince = 0;
-                            }
-
-                            if (!p && lastKnown && Date.now() - lastSeenAt <= 30000) {
-                                p = lastKnown;
+                            } else if (lastKnown && Date.now() - lastSeenAt <= 30000) {
+                                p = lastKnown; // use last-known for up to 30s
                             }
 
                             if (!p) {
                                 if (!missingSince) missingSince = Date.now();
-                                if (Date.now() - missingSince < 15000) {
-                                    return;
-                                }
+                                if (Date.now() - missingSince < 15000) return; // 15s grace
                                 clearInterval(check);
                                 bot.pathfinder.setGoal(null);
                                 bot.chat(`[System Error] Lost sight of ${action.target}.`);
@@ -3819,14 +4281,19 @@ async function processActionQueue() {
                                 return;
                             }
 
-                            if (bot.game?.dimension && p.dimension && bot.game.dimension !== p.dimension) {
+                            // Dimension check — normalize both to short form before comparing
+                            const botDim = _normDim(bot.game?.dimension);
+                            const tgtDim = _normDim(p.dimension);
+                            if (botDim && tgtDim && botDim !== tgtDim) {
                                 clearInterval(check);
                                 bot.pathfinder.setGoal(null);
-                                bot.chat(`[System] ${action.target} moved to ${p.dimension}; come finished in current dimension.`);
+                                bot.chat(`[System] ${action.target} is in ${tgtDim}, bot is in ${botDim}. Come finished.`);
+                                process.send({ type: 'USER_CHAT', data: { username: "System", message: `${action.target} is in a different dimension. Come finished.`, environment: getEnvironmentContext() } });
                                 resolve();
                                 return;
                             }
 
+                            // Bridge check when gap is ahead
                             const dx = p.x - bot.entity.position.x;
                             const dz = p.z - bot.entity.position.z;
                             const dist = Math.hypot(dx, dz);
@@ -3837,10 +4304,8 @@ async function processActionQueue() {
                                 }
                             }
 
-                            // If the goal was cleared externally, restore it
-                            if (!bot.pathfinder.goal || !(bot.pathfinder.goal instanceof goals.GoalNear)) {
-                                bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 3), true);
-                            }
+                            // Always update goal to latest server-authoritative position
+                            bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 3), true);
                         }, 700);
                     });
 
@@ -3969,6 +4434,41 @@ async function processActionQueue() {
                         bot.chat('[System] Detected large water body ahead. Using boat for travel.');
                         actionQueue.unshift({ action: 'boat', x: destX, z: destZ, timeout: action.timeout || 120 });
                         continue;
+                    }
+                }
+
+                // ── Jetpack auto-promotion for long-distance goto ─────────────────────
+                // If a jetpack is equipped with sufficient fuel AND the destination is
+                // farther than JETPACK_GOTO_MIN_DIST blocks, switch to fly action.
+                // This allows the LLM to issue a plain "goto" and the bot will
+                // automatically choose the most efficient transport method.
+                // Skipped when: action._noJetpack is set (prevents infinite loops),
+                // destination is same dimension portal, or jetpack has low fuel.
+                const JETPACK_GOTO_MIN_DIST = 80; // blocks XZ
+                if (!action._noJetpack && destX !== undefined && destZ !== undefined && bot.entity) {
+                    const _jXZDist = Math.hypot(destX - bot.entity.position.x, destZ - bot.entity.position.z);
+                    if (_jXZDist >= JETPACK_GOTO_MIN_DIST) {
+                        const _jTorsoIdx = bot.getEquipmentDestSlot('torso');
+                        const _jTorsoItem = bot.inventory.slots[_jTorsoIdx];
+                        const _jAviation  = detectAviationMethod(_jTorsoItem);
+                        if (_jAviation && _jAviation.type === 'jetpack') {
+                            const _jFuel = getJetpackFuelRatio(_jTorsoItem, _jAviation.config);
+                            const _jLow  = _jAviation.config.fuelLow ?? 0.20;
+                            if (_jFuel > _jLow) {
+                                // Target altitude: destination Y if given, else +25 above current
+                                const _jFlyY = destY !== undefined
+                                    ? Math.max(destY + 5, bot.entity.position.y + 15)
+                                    : bot.entity.position.y + 25;
+                                console.log(`[Actuator] goto: ${Math.round(_jXZDist)}b distance with jetpack (${Math.round(_jFuel*100)}% fuel) → promoting to fly.`);
+                                bot.chat(`[System] Long distance (${Math.round(_jXZDist)} blocks) — using jetpack for travel.`);
+                                // After fly lands, fall back to goto for any remaining XZ gap
+                                actionQueue.unshift(
+                                    { action: 'fly', x: destX, y: _jFlyY, z: destZ },
+                                    { action: 'goto', x: destX, y: destY, z: destZ, _noJetpack: true },
+                                );
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -4182,8 +4682,19 @@ async function processActionQueue() {
                     let _stLastPos  = bot.entity.position.clone();
                     let _stLastTime = Date.now();
                     let _stuckCount = 0;
+                    // BUG-D: absolute wall-clock cap so sidestep resets cannot loop forever.
+                    // wpTimeout is already Math.max(timeoutMs,120000) — use it as the ceiling.
+                    const _gotoLoopStart = Date.now();
 
                     while (!currentCancelToken.cancelled) {
+                        // BUG-D fix: hard exit if total elapsed > wpTimeout
+                        if (Date.now() - _gotoLoopStart > wpTimeout) {
+                            gotoAborted    = true;
+                            gotoAbortReason = `overall time limit (${Math.round(wpTimeout / 1000)}s)`;
+                            console.log(`[Actuator] goto XZ loop exceeded ${Math.round(wpTimeout / 1000)}s wall-clock limit. Aborting.`);
+                            bot.pathfinder.setGoal(null);
+                            break;
+                        }
                         await new Promise(r => setTimeout(r, 250)); // poll at ~4 Hz
 
                         const cx = bot.entity.position.x, cz = bot.entity.position.z;

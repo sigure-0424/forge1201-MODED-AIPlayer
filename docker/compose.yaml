@@ -1,3 +1,5 @@
+# docker/compose.yaml — CUDA 開発環境 (Node.js + GPU)
+# 実験用フルスタック (Forge サーバー + Bot) は docker/forge-server/compose.yaml を使用。
 services:
   dev:
     build:

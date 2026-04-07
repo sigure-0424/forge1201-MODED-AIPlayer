@@ -1,24 +1,33 @@
 {
-  "timestamp": "2026-04-06T15:52:15.750Z",
+  "timestamp": "2026-04-07T16:34:37.086Z",
   "ready": true,
   "position": {
-    "x": -390.3,
-    "y": 65,
-    "z": -540.5
+    "x": -180.5,
+    "y": 118,
+    "z": -17.5
   },
   "health": 20,
   "food": 20,
   "dimension": "overworld",
   "isExecuting": true,
-  "currentAction": "give",
+  "currentAction": "come",
   "actionQueue": [],
   "treeDir": null,
-  "inventory": [],
+  "inventory": [
+    {
+      "name": "gravestone:obituary",
+      "count": 1
+    },
+    {
+      "name": "netherite_sword",
+      "count": 1
+    }
+  ],
   "armor": {
     "head": null,
-    "torso": null,
+    "torso": "create_jetpack:jetpack",
     "legs": null,
     "feet": null,
-    "hand": null
+    "hand": "gravestone:obituary"
   }
 }
