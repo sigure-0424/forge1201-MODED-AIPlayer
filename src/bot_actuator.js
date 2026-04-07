@@ -827,6 +827,41 @@ bot.on('spawn', async () => {
         }
     } catch(e) {}
 
+    // ── Start server-side player position poller ──
+    // aux_mod writes forgeaip_players.json every 2s with ALL online player positions.
+    // This ensures come/follow works at any distance even without aux_mod on the client.
+    ;(function startPlayerFilePoller() {
+        const _fs2   = require('fs');
+        const _path2 = require('path');
+        const candidates = [
+            process.env.MC_SERVER_DIR ? _path2.join(process.env.MC_SERVER_DIR, 'forgeaip_players.json') : null,
+            'E:/forge1201server/forgeaip_players.json',
+        ].filter(Boolean);
+        const playerFilePath = candidates.find(p => { try { return _fs2.existsSync(p); } catch { return false; } }) || candidates[0];
+        if (!playerFilePath) return;
+
+        let lastMtime = 0;
+        setInterval(() => {
+            try {
+                const stat = _fs2.statSync(playerFilePath);
+                if (!stat || stat.mtimeMs === lastMtime) return;
+                lastMtime = stat.mtimeMs;
+                const raw = _fs2.readFileSync(playerFilePath, 'utf8');
+                const entries = JSON.parse(raw);
+                if (!Array.isArray(entries)) return;
+                for (const entry of entries) {
+                    if (!entry.name || !Number.isFinite(entry.x)) continue;
+                    _externalPlayerPositions.set(entry.name, {
+                        x: entry.x, y: entry.y, z: entry.z,
+                        dimension: entry.dimension || 'minecraft:overworld',
+                        updatedAt: Date.now(),
+                    });
+                }
+            } catch (_e) { /* file not yet written or parse error — ignore */ }
+        }, 2000);
+        console.log(`[Actuator] Server player file poller started: ${playerFilePath}`);
+    })();
+
     // ── Mark bot ready EARLY so test harness can start, then escape water in background ──
     bot.chat('[System] Forge AI Player Ready.');
     _botReady = true;
