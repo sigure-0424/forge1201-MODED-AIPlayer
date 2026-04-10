@@ -31,6 +31,7 @@ class AgentManager {
         this.bots = new Map(); // Map of botId to ChildProcess
         this.botConnOptions = new Map(); // Preserves host/port so restarts reconnect to the same server
         this.restartingBots = new Set();
+        this.restartTimers = new Map(); // Map of botId to pending restart setTimeout handle
         this.llm = new LLMClient(process.env.OLLAMA_MODEL || 'gpt-oss:20b-cloud');
         this.activeLlmRequests = new Map(); // Concurrency control
         this.chatQueue = new Map(); // Map of botId to array of queued messages
@@ -121,8 +122,16 @@ class AgentManager {
 
     handleIPCMessage(botId, message) {
         if (message.type === 'ERROR') {
-            console.error(`[AgentManager] Received ERROR from bot ${botId}: ${message.category} - ${message.details}`);
-            this._appendChatLog(botId, 'System', `[Error] ${message.category}: ${message.details}`);
+            const category = message.category || 'Unknown';
+            const details = message.details || '';
+            console.error(`[AgentManager] Received ERROR from bot ${botId}: ${category} - ${details}`);
+            
+            // Connection-related errors (Disconnected, Kicked) should NOT be logged to chat history
+            // to avoid flooding the UI with transient connection noise. Recovery pipeline handles them.
+            const isConnectionError = category === 'Disconnected' || category === 'Kicked';
+            if (!isConnectionError) {
+                this._appendChatLog(botId, 'System', `[Error] ${category}: ${details}`);
+            }
             this.triggerRecoveryPipeline(botId, message);
         } else if (message.type === 'BOT_STATUS') {
             this.botStatus.set(botId, message.data);
@@ -132,6 +141,9 @@ class AgentManager {
                 console.log(`[AgentManager] Bot ${botId} is healthy — resetting reconnect backoff counter.`);
                 this.restartAttempts.delete(botId);
             }
+        } else if (message.type === 'PATH_UPDATE') {
+            // Relay pathfinding visualization to WebUI clients (for debug overlay support)
+            if (this.onEvent) this.onEvent({ type: 'path_update', botId, data: message.data });
         } else if (message.type === 'LOG') {
             console.log(`[Bot ${botId}] ${message.data}`);
         } else if (message.type === 'USER_CHAT') {
@@ -246,9 +258,12 @@ class AgentManager {
                         }
                         return; // Done
                     } else {
-                        // Unrelated chatter, ignore and keep waiting for y/n
-                        console.log(`[AgentManager] Ignoring unrelated chat during recovery prompt: ${msgLow}`);
-                        return;
+                        // New task instruction arrived while recovery prompt is pending.
+                        // Auto-decline recovery so the bot is not frozen indefinitely waiting
+                        // for a y/n answer that the user most likely does not know they need.
+                        console.log(`[AgentManager] New instruction during recovery prompt for ${botId} — auto-declining recovery and processing instruction.`);
+                        this.awaitingRecoveryChoice.set(botId, false);
+                        // Fall through to normal instruction processing below.
                     }
                 }
 
@@ -497,7 +512,14 @@ Do NOT return any action other than chat.`;
         // 5 second cooldown between LLM requests to prevent spam
         this.llmCooldown.set(botId, Date.now() + 5000);
 
-        this.processChatWithLLM(botId, nextData, 0, thoughtId);
+        this.processChatWithLLM(botId, nextData, 0, thoughtId).catch(err => {
+            console.error(`[AgentManager] processChatWithLLM unhandled rejection for ${botId}:`, err);
+            // Release the lock so future messages are not blocked forever.
+            if (this.activeLlmRequests.get(botId) === thoughtId) {
+                this.activeLlmRequests.delete(botId);
+            }
+            this.processNextQueueItem(botId);
+        });
     }
 
     sanitizeLLMAction(action) {
@@ -1189,6 +1211,13 @@ Storage MOD remote access:     send_custom_payload (channel from wiki)
     }
 
     scheduleRestart(botId) {
+        // Cancel any existing pending restart timer for this bot
+        const existingTimer = this.restartTimers.get(botId);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+            this.restartTimers.delete(botId);
+        }
+
         this.restartingBots.add(botId);
         const existingProcess = this.bots.get(botId);
         if (existingProcess) {
@@ -1204,10 +1233,12 @@ Storage MOD remote access:     send_custom_payload (channel from wiki)
         console.log(`[AgentManager] Scheduling restart for ${botId} in ${delayMs}ms (attempt ${attempt}).`);
 
         const connOpts = this.botConnOptions.get(botId) || {};
-        setTimeout(() => {
+        const timer = setTimeout(() => {
+            this.restartTimers.delete(botId);
             console.log(`[AgentManager] Restarting ${botId}...`);
             this.startBot(botId, { ...connOpts, isRestart: true });
         }, delayMs);
+        this.restartTimers.set(botId, timer);
     }
 
     restartBot(botId) {

@@ -67,14 +67,19 @@ class WebUIServer {
             res.json({ ok: true, botId: name });
         });
 
-        // DELETE /api/bots/:id — remove a bot
+        // DELETE /api/bots/:id — remove a bot (handles both running and restarting states)
         this.app.delete('/api/bots/:id', (req, res) => {
             const { id } = req.params;
             const proc = m.bots.get(id);
-            if (!proc) return res.status(404).json({ error: 'Bot not found' });
-            // Clear connection options first so handleProcessCrash won't auto-restart this bot
+            const isKnown = proc || m.botConnOptions.has(id);
+            if (!isKnown) return res.status(404).json({ error: 'Bot not found' });
+            // Cancel any pending restart timer first so the bot won't come back
+            const timer = m.restartTimers && m.restartTimers.get(id);
+            if (timer) { clearTimeout(timer); m.restartTimers.delete(id); }
+            // Remove from all tracking maps so handleProcessCrash won't re-queue a restart
             m.botConnOptions.delete(id);
-            proc.kill('SIGINT');
+            m.restartingBots.delete(id);
+            if (proc) proc.kill('SIGINT');
             res.json({ ok: true });
         });
 

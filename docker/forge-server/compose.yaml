@@ -50,6 +50,9 @@ services:
       # SERVER_DIR をコンテナの /data にマウント
       # (既存サーバーデータを再利用。mods/ config/ も含まれる)
       - ${SERVER_DIR:-E:/forge1201server}:/data
+    ports:
+      # Minecraft クライアントから localhost:25566 で接続できるように公開
+      - "25566:25566"
     networks:
       - forgeaip-net
     healthcheck:

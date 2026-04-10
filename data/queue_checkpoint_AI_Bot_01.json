@@ -1,0 +1,9 @@
+{
+  "savedAt": "2026-04-10T11:10:05.324Z",
+  "queue": [
+    {
+      "action": "navigate_portal",
+      "target": "overworld"
+    }
+  ]
+}

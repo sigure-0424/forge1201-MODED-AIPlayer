@@ -291,7 +291,7 @@
   let ws = null;
   function connectWS() {
     try {
-      ws = new WebSocket('ws://localhost:3001');
+      ws = new WebSocket('ws://' + location.hostname + ':3001');
       ws.onopen = () => { wsEl.textContent = 'WS: connected'; wsEl.style.color = '#44ff44'; };
       ws.onclose = () => {
         wsEl.textContent = 'WS: disconnected';
@@ -330,7 +330,18 @@
   }
   connectWS();
 
-  // ── Drawing ───────────────────────────────────────────────────────────────
+  // Relay path/status from the main WebSocket (port 3000) so the canvas works
+  // even when the debug WebSocket (port 3001) is unreachable (e.g. remote browser).
+  window.addEventListener('forgeaip_path_update', (e) => {
+    if (!e.detail) return;
+    lastPath = e.detail;
+    drawMap();
+  });
+  window.addEventListener('forgeaip_status_update', (e) => {
+    if (!e.detail) return;
+    lastStatus = e.detail;
+    drawMap();
+  });
   function worldToCanvas(wx, wz, botX, botZ) {
     const dx = wx - botX;
     const dz = wz - botZ;

@@ -51,9 +51,9 @@ process.on('uncaughtException', (err) => {
     }
     // Forge/modpack chat payloads can violate minecraft-protocol assumptions
     // and throw from client/chat.js when reading player message signatures.
-    // Treat this as non-fatal to keep the bot connected and operational.
-    if (err.message && err.message.includes("Cannot read properties of undefined (reading '0')")
-        && String(err.stack || '').includes('minecraft-protocol/src/client/chat.js')) {
+    // Common crash patterns: BigInt mixing, undefined property reads, etc.
+    // Treat ALL chat.js errors as non-fatal to keep the bot connected.
+    if (String(err.stack || '').includes('minecraft-protocol/src/client/chat.js')) {
         const head = String(err.stack || '').split('\n').slice(0, 4).join(' | ');
         console.log(`[Actuator] Suppressed chat parser compatibility exception: ${err.message}`);
         console.log(`[Actuator] Chat parser stack head: ${head}`);
@@ -78,9 +78,21 @@ console.log(`[Actuator] Initializing ${botId}...`);
 try {
     const mcDataGlobal = require('minecraft-data')('1.20.1');
     const types = mcDataGlobal.protocol.play.toClient.types;
-    // Suppress partial packet read exceptions by ignoring packets known to desync (like world_particles with custom Forge particle types).
-    const bypass = ['declare_recipes', 'tags', 'advancements', 'declare_commands', 'unlock_recipes', 'craft_recipe_response', 'nbt_query_response', 'world_particles', 'player_chat', 'system_chat'];
-    const dynamicChatBypass = Object.keys(types).filter(name => /(^|_)chat($|_)/i.test(name));
+    // Suppress partial packet read exceptions by ignoring packets known to desync.
+    // NOTE: Do NOT bypass inbound chat packets here. Doing so prevents the bot
+    // from receiving player commands (e.g. "-hi", "-follow me").
+    // Chat packets (player_chat, system_chat) must flow normally so bot.on('chat') fires.
+    const bypass = ['declare_recipes', 'tags', 'advancements', 'declare_commands', 'unlock_recipes', 'craft_recipe_response', 'nbt_query_response', 'world_particles'];
+    // Dynamically bypass chat-named packet variants ONLY if they are NOT the
+    // core mineflayer chat event sources. This prevents Forge-specific rare packet
+    // variants from crashing without silencing player command delivery.
+    // IMPORTANT: minecraft-data type keys are prefixed with 'packet_' (e.g. 'packet_player_chat')
+    // so we must include both bare and packet_-prefixed forms in CHAT_EVENTS_KEEP.
+    const CHAT_EVENTS_KEEP = new Set([
+        'player_chat', 'system_chat', 'profileless_chat', 'disguised_chat', 'chat_message', 'chat',
+        'packet_player_chat', 'packet_system_chat', 'packet_profileless_chat', 'packet_disguised_chat',
+    ]);
+    const dynamicChatBypass = Object.keys(types).filter(name => /(^|_)chat($|_)/i.test(name) && !CHAT_EVENTS_KEEP.has(name));
     const bypassAll = Array.from(new Set([...bypass, ...dynamicChatBypass]));
     bypassAll.forEach(p => {
         types[p] = 'restBuffer';
@@ -110,31 +122,57 @@ function hardenClientChatParsers() {
     if (!client) return;
 
     if (!client.__forgeAipEmitPatchApplied) {
-        const blockedEvents = new Set([
-            'declare_commands',
-            'player_chat',
-            'system_chat',
-            'profileless_chat',
-            'disguised_chat'
-        ]);
+        // Keep inbound chat event flow intact so bot.on('chat') continues to work.
+        // Only block declare_commands which is known to be noisy/fragile on modded stacks.
+        const blockedEvents = new Set(['declare_commands']);
         const originalEmit = client.emit;
+        // CHAT SAFETY: Forge 1.20.1 player_chat packets include BigInt fields (index/timestamp/salt)
+        // that cause "Cannot mix BigInt" crashes in minecraft-protocol/src/client/chat.js.
+        // Wrap those specific events with try-catch to prevent process crashes.
+        // On parse failure, fall back to extracting the raw message field for bot.on('chat').
+        const CHAT_SAFE_EVENTS = new Set(['player_chat', 'system_chat', 'profileless_chat', 'disguised_chat']);
         client.emit = function patchedEmit(eventName, ...args) {
             if (blockedEvents.has(eventName)) return false;
+            if (CHAT_SAFE_EVENTS.has(eventName)) {
+                try {
+                    return originalEmit.call(this, eventName, ...args);
+                } catch (e) {
+                    // Suppress BigInt or other parse errors from Forge chat packets.
+                    // Attempt a manual fallback so player commands still reach bot.on('chat').
+                    if (eventName === 'player_chat') {
+                        try {
+                            const pkt = args[0];
+                            // 1.20.1 player_chat packet fields: plainMessage, networkName, senderUuid
+                            const msgText = pkt && (pkt.plainMessage || pkt.message);
+                            if (typeof msgText === 'string' && msgText.length > 0) {
+                                let senderName = 'Player';
+                                try {
+                                    // networkName is a JSON text component e.g. {"text":"PlayerName"}
+                                    const parsed = JSON.parse(pkt.networkName || '{}');
+                                    senderName = parsed.text || parsed.translate || String(pkt.networkName);
+                                } catch (_) {
+                                    const senderUuid = String(pkt.senderUuid || '');
+                                    const sender = Object.values(bot.players || {}).find(p =>
+                                        p && p.uuid && p.uuid.toLowerCase() === senderUuid.toLowerCase()
+                                    );
+                                    senderName = sender?.username || 'Player';
+                                }
+                                // Manually synthesize bot's 'chat' event for command processing
+                                bot.emit('chat', senderName, msgText, null, Buffer.alloc(0), null);
+                            }
+                        } catch (_) {}
+                    }
+                    return false;
+                }
+            }
             return originalEmit.call(this, eventName, ...args);
         };
         client.__forgeAipEmitPatchApplied = true;
     }
 
-    // Some Forge/modded servers send chat payload variants that crash
-    // minecraft-protocol's default chat listeners before spawn completes.
-    // Keep outgoing chat working, but replace fragile inbound listeners.
-    const fragileChatEvents = [
-        'player_chat',
-        'system_chat',
-        'profileless_chat',
-        'disguised_chat',
-        'declare_commands'
-    ];
+    // Do not detach mineflayer's chat listeners; bot.on('chat') depends on them.
+    // Only remove declare_commands listeners to suppress Forge protocol spam.
+    const fragileChatEvents = ['declare_commands'];
 
     for (const ev of fragileChatEvents) {
         try {
@@ -162,6 +200,12 @@ const mcData = require('minecraft-data')(bot.version);
 bot.on('inject_allowed', () => {
     console.log('[Actuator] Connection allowed. Starting handshake machine...');
     hardenClientChatParsers();
+    // DEBUG: hook raw packet events to diagnose chat silence
+    const _client = bot._client;
+    if (_client) {
+        _client.on('player_chat', (pkt) => console.log(`[Chat][PKT player_chat] sender=${pkt.networkName||pkt.senderUuid} plainMsg="${String(pkt.plainMessage||pkt.message||Buffer.isBuffer(pkt)?'[Buffer]':'?').slice(0,80)}"`));
+        _client.on('system_chat', (pkt) => console.log(`[Chat][PKT system_chat] content="${String(pkt.content||'?').slice(0,80)}"`));
+    }
     const handshake = new ForgeHandshakeStateMachine(bot._client);
     handshake.on('handshake_complete', (registrySyncBuffer) => {
         console.log('[Actuator] Handshake complete. Processing registries via Vanilla-First Mode...');
@@ -347,6 +391,8 @@ bot.on('login', () => {
 // Used as a fallback when target entities are temporarily out of render range.
 const _externalPlayerPositions = new Map(); // playerName -> { x, y, z, dimension, updatedAt }
 let _lastBridgeFailureReason = null;
+let _lastBridgeErrorMessageTime = 0;  // Rate-limiter for bridge error spam (ms)
+const BRIDGE_ERROR_COOLDOWN_MS = 5000;  // Only show bridge error once per 5 seconds
 
 // Server-side player position file (written every 2s by ServerPlayerTracker.java).
 // This is the primary out-of-view tracking source — works for any player regardless
@@ -539,7 +585,13 @@ bot.on('spawn', async () => {
                         }
                     }
                 }
-                if (points.length > 1) debugWS.broadcast('path', { botId, points });
+                if (points.length > 1) {
+                    debugWS.broadcast('path', { botId, points });
+                    // Also relay to parent process so web_ui_server can broadcast to connected clients
+                    if (process.send) {
+                        process.send({ type: 'PATH_UPDATE', data: { botId, points } });
+                    }
+                }
             } catch (_) {}
         });
     }
@@ -942,7 +994,7 @@ bot.on('spawn', async () => {
                     // terrain errors) still happen. MLG water covers those cases.
                     if (_fallStartY === null) _fallStartY = curY;
                     const fallDist = _fallStartY - curY;
-                    if (fallDist > 4 && !_mlgAttempted) {
+                    if (fallDist > 3 && !_mlgAttempted) {
                         // Issue 2 fix: if jetpack is equipped, engage sneak immediately to
                         // trigger the jetpack mod's slow-fall / hover mode.  Most mod jetpacks
                         // prevent fall damage while sneak is held while airborne.  Do this as
@@ -950,10 +1002,17 @@ bot.on('spawn', async () => {
                         if (!_jetpackSneakFallActive) {
                             const _ftTorso = bot.inventory.slots[bot.getEquipmentDestSlot('torso')];
                             const _ftAv = detectAviationMethod(_ftTorso);
-                            if (_ftAv && _ftAv.type === 'jetpack') {
+                            let jetpackFound = _ftAv && _ftAv.type === 'jetpack';
+                            // Also check hand slot as fallback (some mod configurations)
+                            if (!jetpackFound) {
+                                const _ftHand = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
+                                const _ftHandAv = detectAviationMethod(_ftHand);
+                                jetpackFound = _ftHandAv && _ftHandAv.type === 'jetpack';
+                            }
+                            if (jetpackFound) {
                                 _jetpackSneakFallActive = true;
                                 bot.setControlState('sneak', true);
-                                console.log('[Actuator] Unexpected fall detected — engaging jetpack sneak for soft landing.');
+                                console.log(`[Actuator] Fall detected (${fallDist.toFixed(1)}b) — engaging jetpack sneak.`);
                             }
                         }
 
@@ -1662,24 +1721,13 @@ function getEnvironmentContext() {
 // means the two Forge duplicate packets can arrive >1 s apart.
 const _chatDedup = new Map(); // 'username:message' → timestamp
 bot.on('chat', (username, message) => {
+    // DEBUG: log every raw chat event to diagnose silence issues
+    console.log(`[Chat][RAW] from="${username}" msg="${message.slice(0,120)}"`);
     if (username === bot.username) return;
     // Issue 3: Only treat messages prefixed with '-' as instructions.
     // All other chat (server notifications, player chatter) is ignored to prevent
     // system logs (e.g. difficulty changes) from accidentally triggering the AI.
     if (!message.startsWith('-')) return;
-
-    const directGoto = message.slice(1).trim().match(/^goto\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)$/i);
-    if (directGoto && bot.entity) {
-        const x = parseChatCoordToken(directGoto[1], bot.entity.position.x);
-        const y = parseChatCoordToken(directGoto[2], bot.entity.position.y);
-        const z = parseChatCoordToken(directGoto[3], bot.entity.position.z);
-        if (x == null || y == null || z == null) {
-            bot.chat('[System] Invalid -goto coordinates. Use: -goto x y z');
-            return;
-        }
-        enqueueDirectAction({ action: 'goto', x, y, z, timeout: 120000 });
-        return;
-    }
 
     const key = `${username}:${message}`;
     const now = Date.now();
@@ -1745,30 +1793,6 @@ function saveWaypoints(waypoints) {
 function findWaypoint(name) {
     const waypoints = loadWaypoints();
     return waypoints.find(w => w.name.toLowerCase() === name.toLowerCase()) || null;
-}
-
-function parseChatCoordToken(token, currentValue) {
-    const t = String(token || '').trim();
-    if (!t) return null;
-    if (t === '~') return currentValue;
-    if (t.startsWith('~')) {
-        const rel = Number(t.slice(1) || '0');
-        if (!Number.isFinite(rel)) return null;
-        return currentValue + rel;
-    }
-    const abs = Number(t);
-    if (!Number.isFinite(abs)) return null;
-    return abs;
-}
-
-function enqueueDirectAction(action) {
-    if (!_botReady) {
-        _pendingIpcActions.push([action]);
-        return;
-    }
-    _inStopMode = false;
-    actionQueue.push(action);
-    if (!isExecuting) processActionQueue();
 }
 
 // ─── Path Cache System ─────────────────────────────────────────────────────
@@ -1909,7 +1933,9 @@ let _inStopMode = false;
 // collection, combat). One-shot destructive actions (give, smelt, craft) are
 // excluded because replaying them after a partial execution would be incorrect.
 const QUEUE_CHECKPOINT_FILE = path.join(process.cwd(), 'data', `queue_checkpoint_${botId}.json`);
-const NON_RESUMABLE_ACTIONS = new Set(['give', 'smelt', 'brew', 'enchant', 'activate_end_portal', 'place_pattern', 'place', 'sleep', 'find_land', 'find_and_equip', 'loot_chest_special']);
+// come/fly/follow involve jetpack physics states that can trigger flying-kick.
+// Restoring them after a kick would immediately cause another flying-kick loop.
+const NON_RESUMABLE_ACTIONS = new Set(['give', 'smelt', 'brew', 'enchant', 'activate_end_portal', 'place_pattern', 'place', 'sleep', 'find_land', 'find_and_equip', 'loot_chest_special', 'come', 'fly', 'follow']);
 
 // ─── Aviation: Jetpack Mod Registry ───────────────────────────────────────────
 // Maps mod namespace → control config. itemPattern matches the local item name
@@ -4478,7 +4504,10 @@ async function processActionQueue() {
             } else if (action.action === 'come') {
                 const targetEntity = bot.players[action.target]?.entity;
                 const tracked = getTrackedPlayerSnapshot(action.target);
-                if (targetEntity || tracked) {
+                if (!targetEntity && !tracked) {
+                    bot.chat(`[System] Cannot locate ${action.target || 'target'} — are they online and in the same dimension?`);
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Cannot find player ${action.target} for come action.`, environment: getEnvironmentContext() } });
+                } else if (targetEntity || tracked) {
                     // Improvement 2: Disable digging during follow to prevent erratic block mining
                     // while moving. The bot should navigate around obstacles, not through them.
                     const savedCanDigCome = movements ? movements.canDig : true;
@@ -5197,10 +5226,15 @@ async function processActionQueue() {
                                             bot.pathfinder.setGoal(new goals.GoalXZ(_sw.x, _sw.z), true);
                                             continue;
                                         }
-                                        if (_lastBridgeFailureReason === 'no_block') {
-                                            bot.chat('[System] Cannot bridge void gap: no solid placeable blocks in inventory.');
-                                        } else {
-                                            bot.chat('[System] Bridge placement failed on this edge. Retrying a new approach...');
+                                        // Rate-limit bridge error messages to prevent spam in chat
+                                        const now = Date.now();
+                                        if (now - _lastBridgeErrorMessageTime >= BRIDGE_ERROR_COOLDOWN_MS) {
+                                            _lastBridgeErrorMessageTime = now;
+                                            if (_lastBridgeFailureReason === 'no_block') {
+                                                bot.chat('[System] Cannot bridge void gap: no solid placeable blocks in inventory.');
+                                            } else {
+                                                bot.chat('[System] Bridge placement failed on this edge. Retrying approach...');
+                                            }
                                         }
                                         if (_stuckCount >= 7) {
                                             gotoAborted = true;
@@ -7857,6 +7891,13 @@ bot.on('kicked', (reason) => {
     currentCancelToken.cancelled = true;
     actionQueue = [];
     try { bot.pathfinder.setGoal(null); } catch (_) {}
+    // If kicked for flying/floating, clear the task checkpoint so the bot does NOT
+    // immediately resume the action that caused the kick on next connect.
+    const kickLower = String(reason || '').toLowerCase();
+    if (kickLower.includes('fly') || kickLower.includes('float')) {
+        try { _clearQueueCheckpoint(); } catch (_) {}
+        console.log('[Actuator] Flying-kick detected — queue checkpoint cleared to prevent kick loop.');
+    }
     process.send({ type: 'ERROR', category: 'Kicked', details: reason });
 });
 bot.on('error', (err) => {

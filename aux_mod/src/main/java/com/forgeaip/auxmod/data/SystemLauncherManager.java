@@ -23,8 +23,10 @@ public class SystemLauncherManager {
     public static SystemLauncherManager getInstance() { return INSTANCE; }
 
     private static final int MAX_LOG_LINES = 120;
+    private static final String PID_FILE_NAME = "bot.pid";
 
     private Process nodeProcess = null;
+    private volatile String lastProjectDir = null;
     private final CopyOnWriteArrayList<String> logLines = new CopyOnWriteArrayList<>();
     private volatile String lastError = null;
 
@@ -102,8 +104,10 @@ public class SystemLauncherManager {
             pb.redirectInput(ProcessBuilder.Redirect.from(new File(
                     System.getProperty("os.name", "").toLowerCase().contains("win") ? "NUL" : "/dev/null")));
 
+            this.lastProjectDir = dir.getAbsolutePath();
             logLines.clear();
             nodeProcess = pb.start();
+            writePidFile(dir.toPath(), nodeProcess.pid());
             AuxMod.LOGGER.info("[ForgeAIP] Launcher: started '{}' in {}", nodeExec + " index.js", projectDir);
             addLog("[ForgeAIP] System started. Waiting for bots to connect...");
 
@@ -117,6 +121,7 @@ public class SystemLauncherManager {
                         addLog(line);
                     }
                 } catch (IOException ignored) {}
+                deletePidFile(Paths.get(lastProjectDir != null ? lastProjectDir : dir.getAbsolutePath()));
                 addLog("[ForgeAIP] System process exited.");
             }, "ForgeAIP-Launcher-Reader");
             reader.setDaemon(true);
@@ -129,13 +134,57 @@ public class SystemLauncherManager {
         }
     }
 
-    /** Kills the Node.js process. */
+    /** Kills the Node.js process. Falls back to bot.pid if started externally. */
     public void stop() {
+        stop(null);
+    }
+
+    /** Kills the Node.js process. Uses {@code fallbackProjectDir}/bot.pid if not started via this launcher. */
+    public void stop(String fallbackProjectDir) {
         if (nodeProcess != null) {
-            nodeProcess.destroyForcibly();
+            killProcessTree(nodeProcess.toHandle());
             nodeProcess = null;
+            deletePidFile(Paths.get(resolveProjectDir(fallbackProjectDir)));
             addLog("[ForgeAIP] System stopped.");
             AuxMod.LOGGER.info("[ForgeAIP] Launcher: process stopped.");
+            return;
+        }
+        // Fallback: read bot.pid and kill via ProcessHandle (handles external starts).
+        // If the pid file is missing/stale, scan for a matching `node index.js` process under the project dir.
+        String projDir = resolveProjectDir(fallbackProjectDir);
+        if (projDir == null || projDir.isEmpty()) {
+            addLog("[ForgeAIP] Nothing to stop.");
+            return;
+        }
+        try {
+            Path pidPath = Paths.get(projDir, PID_FILE_NAME);
+            if (Files.exists(pidPath)) {
+                String pidStr = Files.readString(pidPath, StandardCharsets.UTF_8).trim();
+                long pid = Long.parseLong(pidStr);
+                boolean found = ProcessHandle.of(pid).map(ph -> {
+                    killProcessTree(ph);
+                    AuxMod.LOGGER.info("[ForgeAIP] Launcher: killed external process PID {}", pid);
+                    return true;
+                }).orElse(false);
+                Files.deleteIfExists(pidPath);
+                addLog(found
+                        ? "[ForgeAIP] System stopped (via PID file)."
+                        : "[ForgeAIP] PID " + pid + " already gone; PID file removed.");
+                if (found) return;
+            }
+
+            Optional<ProcessHandle> discovered = findRunningOrchestrator(projDir);
+            if (discovered.isPresent()) {
+                ProcessHandle ph = discovered.get();
+                killProcessTree(ph);
+                deletePidFile(Paths.get(projDir));
+                addLog("[ForgeAIP] System stopped (via process scan, PID " + ph.pid() + ").");
+            } else {
+                addLog("[ForgeAIP] Nothing to stop (no running process, PID file, or matching node index.js process).");
+            }
+        } catch (Exception e) {
+            AuxMod.LOGGER.warn("[ForgeAIP] Launcher: PID-file stop failed: {}", e.getMessage());
+            addLog("[ForgeAIP] Stop failed: " + e.getMessage());
         }
     }
 
@@ -156,6 +205,71 @@ public class SystemLauncherManager {
     private void addLog(String line) {
         logLines.add(line);
         while (logLines.size() > MAX_LOG_LINES) logLines.remove(0);
+    }
+
+    private String resolveProjectDir(String fallbackProjectDir) {
+        if (fallbackProjectDir != null && !fallbackProjectDir.trim().isEmpty()) {
+            return fallbackProjectDir.trim();
+        }
+        return lastProjectDir;
+    }
+
+    private void writePidFile(Path projectDir, long pid) {
+        try {
+            Files.writeString(projectDir.resolve(PID_FILE_NAME), Long.toString(pid), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            AuxMod.LOGGER.warn("[ForgeAIP] Launcher: failed to write PID file: {}", e.getMessage());
+        }
+    }
+
+    private void deletePidFile(Path projectDir) {
+        try {
+            if (projectDir != null) Files.deleteIfExists(projectDir.resolve(PID_FILE_NAME));
+        } catch (IOException e) {
+            AuxMod.LOGGER.warn("[ForgeAIP] Launcher: failed to delete PID file: {}", e.getMessage());
+        }
+    }
+
+    private void killProcessTree(ProcessHandle root) {
+        if (root == null) return;
+        if (isWindows()) {
+            try {
+                new ProcessBuilder("taskkill", "/F", "/T", "/PID", Long.toString(root.pid()))
+                        .redirectErrorStream(true)
+                        .start()
+                        .waitFor();
+                return;
+            } catch (Exception e) {
+                AuxMod.LOGGER.warn("[ForgeAIP] Launcher: taskkill failed for PID {}: {}", root.pid(), e.getMessage());
+            }
+        }
+        root.descendants()
+                .sorted(Comparator.comparingLong(ProcessHandle::pid).reversed())
+                .forEach(ph -> {
+                    try { ph.destroyForcibly(); } catch (Exception ignored) {}
+                });
+        try { root.destroyForcibly(); } catch (Exception ignored) {}
+    }
+
+    private boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+    }
+
+    private Optional<ProcessHandle> findRunningOrchestrator(String projectDir) {
+        final String normalizedDir = projectDir.replace('\\', '/').toLowerCase(Locale.ROOT);
+        return ProcessHandle.allProcesses()
+                .filter(ProcessHandle::isAlive)
+                .filter(ph -> {
+                    try {
+                        String command = ph.info().command().orElse("").toLowerCase(Locale.ROOT);
+                        String commandLine = ph.info().commandLine().orElse("").replace('\\', '/').toLowerCase(Locale.ROOT);
+                        if (!command.contains("node")) return false;
+                        return commandLine.contains("index.js") && commandLine.contains(normalizedDir);
+                    } catch (Exception ignored) {
+                        return false;
+                    }
+                })
+                .findFirst();
     }
 
     /**

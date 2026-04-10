@@ -1,37 +1,53 @@
 {
-  "timestamp": "2026-04-09T08:26:00.035Z",
+  "timestamp": "2026-04-10T11:10:34.608Z",
   "ready": true,
   "position": {
-    "x": -87.7,
-    "y": 55.3,
-    "z": -104.3
+    "x": -62.3,
+    "y": 51,
+    "z": -53.7
   },
-  "health": 2,
-  "food": 17,
-  "dimension": "overworld",
-  "isExecuting": false,
-  "currentAction": null,
+  "health": 20,
+  "food": 20,
+  "dimension": "the_nether",
+  "isExecuting": true,
+  "currentAction": "navigate_portal",
   "actionQueue": [],
   "treeDir": null,
   "inventory": [
     {
-      "name": "waystones:gray_sharestone",
+      "name": "iron_pickaxe",
       "count": 1
     },
     {
-      "name": "create:potato_recovery",
+      "name": "createbigcannons:flowing_molten_nethersteel",
+      "count": 64
+    },
+    {
+      "name": "iron_shovel",
       "count": 1
     },
     {
-      "name": "createbigcannons:molten_bronze",
-      "count": 7
+      "name": "iron_chestplate",
+      "count": 1
+    },
+    {
+      "name": "createbigcannons:molten_cast_iron",
+      "count": 61
+    },
+    {
+      "name": "createbigcannons:flowing_molten_nethersteel",
+      "count": 40
+    },
+    {
+      "name": "create:limestone",
+      "count": 5
     }
   ],
   "armor": {
     "head": null,
-    "torso": null,
-    "legs": null,
+    "torso": "create_jetpack:jetpack",
+    "legs": "iron_leggings",
     "feet": null,
-    "hand": "waystones:gray_sharestone"
+    "hand": "createbigcannons:molten_cast_iron"
   }
 }

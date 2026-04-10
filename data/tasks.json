@@ -1,7 +1,7 @@
 [
   {
     "id": 1,
-    "status": "in_progress",
+    "status": "completed",
     "description": "kill 12 endermen"
   },
   {
@@ -11,12 +11,12 @@
   },
   {
     "id": 3,
-    "status": "in_progress",
+    "status": "completed",
     "description": "craft 12 eye_of_ender"
   },
   {
     "id": 4,
-    "status": "in_progress",
+    "status": "completed",
     "description": "activate_end_portal"
   },
   {

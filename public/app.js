@@ -106,6 +106,16 @@ function connectWS() {
                 mergeBotState({ id: msg.botId, online: true, ...msg.data });
                 renderBotCard(msg.botId);
                 if (state.selectedBot === msg.botId) renderStatusPanel();
+                if (msg.data && msg.data.position) {
+                    const p = msg.data.position;
+                    window.dispatchEvent(new CustomEvent('forgeaip_status_update', { detail: {
+                        botId: msg.botId,
+                        pos: [p.x, p.y, p.z],
+                        action: msg.data.currentAction || 'idle',
+                        health: msg.data.health || 20,
+                        stuckSec: 0
+                    }}));
+                }
                 break;
 
             case 'bot_chat':
@@ -126,6 +136,10 @@ function connectWS() {
                     renderBotCard(msg.botId);
                     updateHeaderCount();
                 }
+                break;
+
+            case 'path_update':
+                window.dispatchEvent(new CustomEvent('forgeaip_path_update', { detail: msg.data }));
                 break;
 
             case 'entity_update':

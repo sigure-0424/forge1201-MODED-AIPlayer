@@ -162,7 +162,7 @@ public class LauncherScreen extends Screen {
     }
 
     private void doStop() {
-        SystemLauncherManager.getInstance().stop();
+        SystemLauncherManager.getInstance().stop(fProjectDir.getValue());
     }
 
     private void doQuickAddBot() {
