@@ -1,16 +1,16 @@
 {
-  "timestamp": "2026-04-10T11:10:34.608Z",
+  "timestamp": "2026-04-10T17:20:16.604Z",
   "ready": true,
   "position": {
-    "x": -62.3,
-    "y": 51,
-    "z": -53.7
+    "x": -512.3,
+    "y": 64,
+    "z": -494.7
   },
   "health": 20,
   "food": 20,
-  "dimension": "the_nether",
+  "dimension": "overworld",
   "isExecuting": true,
-  "currentAction": "navigate_portal",
+  "currentAction": "collect",
   "actionQueue": [],
   "treeDir": null,
   "inventory": [

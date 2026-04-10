@@ -1,9 +1,11 @@
 {
-  "savedAt": "2026-04-10T11:10:05.324Z",
+  "savedAt": "2026-04-10T17:19:15.757Z",
   "queue": [
     {
-      "action": "navigate_portal",
-      "target": "overworld"
+      "action": "collect",
+      "target": "birch_log",
+      "quantity": 1000,
+      "timeout": 120
     }
   ]
 }
