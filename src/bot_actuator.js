@@ -4287,7 +4287,7 @@ async function processActionQueue() {
                     const itemToPlace = bot.inventory.items().find(item => item.name === action.target || (itemId !== undefined && item.type === itemId));
                     if (itemToPlace) {
                         try {
-                            await placeItemIntelligently(bot, itemToPlace, timeoutMs);
+                            await placeItemIntelligently(itemToPlace, timeoutMs);
                             process.send({ type: 'USER_CHAT', data: { username: "System", message: `Successfully placed ${action.target}.`, environment: getEnvironmentContext() } });
                         } catch (err) {
                             actionQueue = []; // Clear queue on failure
@@ -4535,7 +4535,7 @@ async function processActionQueue() {
                         const fi = bot.inventory.items().find(i => i.name === 'furnace');
                         if (fi) {
                             try {
-                                await placeItemIntelligently(bot, fi, null);
+                                await placeItemIntelligently(fi, null);
                                 furnaceBlock = furnaceBlockId !== undefined ? bot.findBlock({ matching: furnaceBlockId, maxDistance: 8 }) : null;
                             } catch (e) { console.log(`[Actuator] smelt place furnace: ${e.message}`); }
                         }
@@ -6301,6 +6301,7 @@ process.on('message', async (msg) => {
 
         // 4. Fresh token + queue for the new command
         currentCancelToken = { cancelled: false };
+        _actCtx.currentCancelToken = currentCancelToken;  // keep ctx in sync for extracted modules
         actionQueue.push(...actions);
         // Bug Fix 10: Persist the incoming queue so a crash/disconnect can resume it.
         _saveQueueCheckpoint(actionQueue);
