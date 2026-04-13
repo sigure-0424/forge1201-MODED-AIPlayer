@@ -2867,20 +2867,16 @@ async function processActionQueue() {
                 // (e.g. "sigure") while the in-game username is "Sigure". Search bot.players
                 // with a case-insensitive fallback so the resolved name matches exactly.
                 let _resolvedName = action.target;
-                {
-                    const _low = (action.target || '').toLowerCase();
-                    if (bot.players[action.target] === undefined) {
-                        for (const k of Object.keys(bot.players)) {
-                            if (k.toLowerCase() === _low) { _resolvedName = k; break; }
-                        }
+                if (action.target && bot.players[action.target] === undefined) {
+                    const _low = action.target.toLowerCase();
+                    for (const k of Object.keys(bot.players)) {
+                        if (k.toLowerCase() === _low) { _resolvedName = k; break; }
                     }
                 }
                 const targetEntity = bot.players[_resolvedName]?.entity;
-                const tracked = getTrackedPlayerSnapshot(action.target);
+                const tracked = getTrackedPlayerSnapshot(_resolvedName);
                 // isOnline: player appears in the server's tab-list even when out of render range
-                const isOnline = _resolvedName !== action.target
-                    ? !!bot.players[_resolvedName]
-                    : bot.players[action.target] !== undefined;
+                const isOnline = !!bot.players[_resolvedName];
                 if (!targetEntity && !tracked && !isOnline) {
                     const onlineList = Object.keys(bot.players)
                         .filter(k => k !== bot.username).join(', ') || 'none';
