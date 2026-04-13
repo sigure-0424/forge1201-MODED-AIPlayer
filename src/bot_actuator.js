@@ -12,6 +12,7 @@ const path = require('path');
 const util = require('util');
 const { resolveRequiredMaterials } = require('./material_resolver');
 const { executeMacro } = require('./mod_interaction_executor');
+const { buildSnapshot, buildGuiPrompt } = require('./gui_snapshot');
 const wikiRag = require('./wiki_rag');
 
 // ── Visual Debug System instrumentation ─────────────────────────────────────
@@ -6200,6 +6201,78 @@ async function processActionQueue() {
                         process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Sent custom packet to channel "${channel}" (${dataBuf.length} bytes).`, environment: getEnvironmentContext() } });
                     } catch (e) {
                         process.send({ type: 'USER_CHAT', data: { username: 'System', message: `send_custom_payload failed: ${e.message}`, environment: getEnvironmentContext() } });
+                    }
+                }
+
+            // ── interact_gui ───────────────────────────────────────────────────
+            // Universal MOD GUI interaction.
+            // 1. Navigate to the target block and right-click to open its GUI.
+            // 2. Wait for the window_open event (timeout: 3 s).
+            // 3. Build a text snapshot of the window slots.
+            // 4. Send the snapshot + user instruction to the LLM via IPC so that
+            //    AgentManager can construct a follow-up macro with GUI primitives.
+            //
+            // The AgentManager responds with a second EXECUTE_ACTION containing a
+            // "macro" whose steps use click_slot / transfer_slot / close_window.
+            //
+            // Example:
+            //   { "action": "interact_gui",
+            //     "x": 10, "y": 64, "z": 20,
+            //     "instruction": "put coal into the fuel slot" }
+            } else if (action.action === 'interact_gui') {
+                const { x, y, z } = action;
+                if (x === undefined || y === undefined || z === undefined) {
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: 'interact_gui: requires x, y, z coordinates.', environment: getEnvironmentContext() } });
+                } else {
+                    // Step 1 — navigate near the block
+                    await withTimeout(
+                        bot.pathfinder.goto(new goals.GoalNear(Number(x), Number(y), Number(z), 3)),
+                        timeoutMs, 'goto for interact_gui', () => bot.pathfinder.setGoal(null)
+                    ).catch(() => {});
+
+                    if (currentCancelToken.cancelled) {
+                        // action was cancelled while navigating
+                    } else {
+                        // Step 2 — right-click to open the GUI
+                        const block = bot.blockAt(new Vec3(Number(x), Number(y), Number(z)));
+                        if (!block || block.name === 'air') {
+                            process.send({ type: 'USER_CHAT', data: { username: 'System', message: `interact_gui: no block at (${x},${y},${z}).`, environment: getEnvironmentContext() } });
+                        } else {
+                            let windowOpened = false;
+                            try {
+                                // Step 3 — wait for window_open (up to 3 s)
+                                const windowPromise = new Promise(resolve => {
+                                    bot.once('windowOpen', () => resolve(true));
+                                    setTimeout(() => resolve(false), 3000);
+                                });
+                                await bot.activateBlock(block);
+                                windowOpened = await windowPromise;
+                            } catch (e) {
+                                process.send({ type: 'USER_CHAT', data: { username: 'System', message: `interact_gui: failed to open block: ${e.message}`, environment: getEnvironmentContext() } });
+                                windowOpened = false;
+                            }
+
+                            if (!windowOpened || !bot.currentWindow) {
+                                process.send({ type: 'USER_CHAT', data: { username: 'System', message: `interact_gui: no GUI opened for block ${block.name} at (${x},${y},${z}). Try activate_block or macro instead.`, environment: getEnvironmentContext() } });
+                            } else {
+                                // Step 4 — build snapshot and send to AgentManager
+                                const snapshot = buildSnapshot(bot);
+                                const instruction = String(action.instruction || 'inspect the GUI');
+                                const guiPromptText = buildGuiPrompt(snapshot, instruction);
+                                console.log(`[Actuator] interact_gui: window "${snapshot.windowType}" opened (${snapshot.totalSlots} slots)`);
+                                process.send({
+                                    type: 'USER_CHAT',
+                                    gui_context: true,        // flag so AgentManager uses GUI-specific prompt
+                                    gui_snapshot: snapshot,
+                                    gui_instruction: instruction,
+                                    data: {
+                                        username: 'System',
+                                        message: guiPromptText,
+                                        environment: getEnvironmentContext(),
+                                    },
+                                });
+                            }
+                        }
                     }
                 }
 
