@@ -2863,12 +2863,30 @@ async function processActionQueue() {
             // in BUGFIX-20260321-003) and tickTimeout=5 starving A* (fixed to 40
             // in BUGFIX-20260321-002).
             } else if (action.action === 'come') {
-                const targetEntity = bot.players[action.target]?.entity;
+                // Case-insensitive player name resolution: LLM may lowercase the name
+                // (e.g. "sigure") while the in-game username is "Sigure". Search bot.players
+                // with a case-insensitive fallback so the resolved name matches exactly.
+                let _resolvedName = action.target;
+                {
+                    const _low = (action.target || '').toLowerCase();
+                    if (bot.players[action.target] === undefined) {
+                        for (const k of Object.keys(bot.players)) {
+                            if (k.toLowerCase() === _low) { _resolvedName = k; break; }
+                        }
+                    }
+                }
+                const targetEntity = bot.players[_resolvedName]?.entity;
                 const tracked = getTrackedPlayerSnapshot(action.target);
-                if (!targetEntity && !tracked) {
-                    bot.chat(`[System] Cannot locate ${action.target || 'target'} — are they online and in the same dimension?`);
-                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Cannot find player ${action.target} for come action.`, environment: getEnvironmentContext() } });
-                } else if (targetEntity || tracked) {
+                // isOnline: player appears in the server's tab-list even when out of render range
+                const isOnline = _resolvedName !== action.target
+                    ? !!bot.players[_resolvedName]
+                    : bot.players[action.target] !== undefined;
+                if (!targetEntity && !tracked && !isOnline) {
+                    const onlineList = Object.keys(bot.players)
+                        .filter(k => k !== bot.username).join(', ') || 'none';
+                    bot.chat(`[System] Cannot locate ${action.target || 'target'} — online players: ${onlineList}`);
+                    process.send({ type: 'USER_CHAT', data: { username: 'System', message: `Cannot find player ${action.target}. Online players: ${onlineList}`, environment: getEnvironmentContext() } });
+                } else if (targetEntity || tracked || isOnline) {
                     // Improvement 2: Disable digging during follow to prevent erratic block mining
                     // while moving. The bot should navigate around obstacles, not through them.
                     const savedCanDigCome = movements ? movements.canDig : true;
@@ -2984,7 +3002,8 @@ async function processActionQueue() {
                             // then entity (in-view fallback) so entity is never preferred
                             // over the server-authoritative file data.
                             let p = getTrackedPlayerSnapshot(action.target);
-                            const t = bot.players[action.target]?.entity;
+                            // Use _resolvedName (case-corrected) for entity lookup
+                            const t = bot.players[_resolvedName]?.entity;
 
                             // Use entity to update position if aux_mod has no data yet
                             if (!p && t?.isValid) {
