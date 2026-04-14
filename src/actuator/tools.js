@@ -446,9 +446,18 @@ async function ensureToolFor(block) {
         }
     }
 
-    if (!hasRequirement) {
+    // BUGFIX: Force tool acquisition for logs/wood even though they don't strictly require tools.
+    // Logs can be collected bare-handed but axes are MUCH faster (5-6x speed improvement).
+    // This prevents the extremely slow wood collection complaints.
+    const isLogOrWood = bname.includes('log') || bname.includes('_wood') || 
+                        bname.includes('stem') || bname.includes('hyphae');
+    if (!hasRequirement && !isLogOrWood) {
         console.log(`[Actuator] No ${toolCat} found for ${block.name}. Continuing without optional tool.`);
         return;
+    }
+    if (!hasRequirement && isLogOrWood) {
+        console.log(`[Actuator] No axe in inventory for '${block.name}'. Auto-crafting one for efficiency...`);
+        // Fall through to auto-craft section below (force hasRequirement logic)
     }
 
     console.log(`[Actuator] No ${toolCat} found for ${block.name}. Auto-crafting tool...`);

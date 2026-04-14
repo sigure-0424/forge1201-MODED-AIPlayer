@@ -551,6 +551,20 @@ bot.on('spawn', async () => {
         }
     }
 
+    // BUGFIX (Issue 3/4): Add leaf blocks to blocksToAvoid to prevent pathfinding walking on tree leaves
+    // This prevents the bot from traversing dangerous leaf canopies during tree harvesting.
+    // Leaves are not marked breakable during pathfinding, but the pathfinder might still
+    // consider them walkable. Force them to be avoided/navigated around.
+    const leafBlockIds = ['oak_leaves', 'spruce_leaves', 'birch_leaves', 'jungle_leaves',
+                          'acacia_leaves', 'dark_oak_leaves', 'mangrove_leaves', 'cherry_leaves',
+                          'azalea_leaves', 'flowering_azalea_leaves']
+        .map(name => bot.registry.blocksByName[name]?.id)
+        .filter(id => id !== undefined);
+    for (const leafId of leafBlockIds) {
+        movements.blocksToAvoid.add(leafId);
+    }
+    console.log(`[Actuator] Added ${leafBlockIds.length} leaf block types to blocksToAvoid to prevent tree canopy traversal.`);
+
     // Goal 1 & 2: Avoid magma block damage & only break specific blocks (e.g. non-construct blocks)
     // Add magma_block to blocksCantBreak and set its pathfinding cost higher if it was toAvoid
     const magmaBlockId = bot.registry.blocksByName['magma_block']?.id;
@@ -1913,6 +1927,36 @@ const DROP_TO_SOURCE = {
     quartz:         ['nether_quartz_ore'],
     glowstone_dust: ['glowstone'],
 };
+
+// BUGFIX: Wood-type name normalization (Issue 1 - Birch vs Oak)
+// When user says "collect birch", normalize to "birch_log" to search for the correct block type.
+// Without this, "birch" doesn't match registry and falls back to TAG_GROUPS expansion
+// which indiscriminately collects ANY log type (oak, spruce, birch, etc.).
+// This enforces type-specific collection when user specifies a wood type.
+const WOOD_TYPE_NORMALIZATION = {
+    'birch': 'birch_log',
+    'oak': 'oak_log',
+    'spruce': 'spruce_log',
+    'jungle': 'jungle_log',
+    'acacia': 'acacia_log',
+    'dark_oak': 'dark_oak_log',
+    'mangrove': 'mangrove_log',
+    'cherry': 'cherry_log',
+    'bamboo': 'bamboo_block',
+    'birch_wood': 'birch_log',
+    'oak_wood': 'oak_log',
+    'spruce_wood': 'spruce_log',
+    'jungle_wood': 'jungle_log',
+    'acacia_wood': 'acacia_log',
+    'dark_oak_wood': 'dark_oak_log',
+    'mangrove_wood': 'mangrove_log',
+    'cherry_wood': 'cherry_log',
+};
+
+function normalizeWoodTarget(target) {
+    const lower = String(target).toLowerCase().trim();
+    return WOOD_TYPE_NORMALIZATION[lower] || lower;
+}
 
 
 // Safety check before any blind forward movement.
@@ -3819,6 +3863,15 @@ async function processActionQueue() {
 
             // ── collect (3× candidate pool + progressive radius fallback) ─────
             } else if (action.action === 'collect') {
+                // BUGFIX: Normalize wood-type targets to proper log block names
+                if (action.target) {
+                    const normalized = normalizeWoodTarget(action.target);
+                    if (normalized !== action.target) {
+                        console.log(`[collect] Target normalized: '${action.target}' → '${normalized}'`);
+                        action.target = normalized;
+                    }
+                }
+                
                 // Resolve which blocks to search for.
                 // Some items only exist as drops, not as placed blocks (e.g. cobblestone comes
                 // from mining stone; flint comes from gravel). DROP_TO_SOURCE maps the requested
@@ -3831,6 +3884,9 @@ async function processActionQueue() {
 
                 // Issue 9: Tag-group expansion — if exact block is unknown, try all variants.
                 // This prevents "cannot find oak_log" in a birch/spruce forest.
+                // IMPORTANT: Tag group expansion is now a FALLBACK only (after type-specific
+                // search fails). If user specified "birch_log", do NOT fall back to ALL logs.
+                // This preserves type-specificity when user indicates intention.
                 if (searchIds.length === 0) {
                     const tagGroup = MATERIAL_TAG_GROUPS[action.target];
                     if (tagGroup) {
@@ -3861,13 +3917,17 @@ async function processActionQueue() {
                             .reduce((s, i) => s + i.count, 0);
                     };
 
-                    // Search passes: 32 → 64 → 128 blocks.
-                    // Underground resources (stone, ores) rarely appear within 64 blocks
-                    // of the surface spawn point, so the wider passes matter a lot for them.
+                    // Search passes: 32 → 64 → 128 → 256 blocks.
+                    // BUGFIX (Issue 2): Increased max search from 128 to 256 blocks to find wood
+                    // beyond the immediate visible range. Underground resources (stone, ores) rarely
+                    // appear within 64 blocks of the surface spawn point, so the wider passes matter.
+                    // NOTE: 256b search with full palette scan would cause ECONNRESET (>30s event loop block),
+                    // so only use numeric (optimized) matching for 256b pass.
                     const SEARCH_PASSES = [
                         { maxDistance: 32,  count: Math.min(quantity * 3, 64) },
                         { maxDistance: 64,  count: Math.min((quantity + 4) * 2, 64) },
                         { maxDistance: 128, count: Math.min(quantity + 8, 32) },
+                        { maxDistance: 256, count: Math.min(quantity + 16, 16) },  // BUGFIX: Extended for out-of-view searches
                     ];
                     const triedSet = new Set(); // keyed by 'x,z' — one attempt per XZ column
                     let toolCheckDone = false;
@@ -4033,9 +4093,17 @@ async function processActionQueue() {
                                 const visited = new Set([`${blockPos.x},${blockPos.y},${blockPos.z}`]);
                                 const offsets = [{x:1,y:0,z:0}, {x:-1,y:0,z:0}, {x:0,y:1,z:0}, {x:0,y:-1,z:0}, {x:0,y:0,z:1}, {x:0,y:0,z:-1}];
 
-                                while(queue.length > 0 && veinMined < 64 && collected + veinMined < quantity && !currentCancelToken.cancelled) {
+                                // BUGFIX (Issue 3/4): Exhaustive tree harvesting - mine all connected logs before moving to next tree
+                                // Priority: mine UP first (logs above), then around, to maximize tree harvesting without item loss
+                                while(queue.length > 0 && veinMined < 128 && collected + veinMined < quantity && !currentCancelToken.cancelled) {
                                     const curr = queue.shift();
-                                    for (const off of offsets) {
+                                    // Sort offsets to prioritize vertical mining (UP first for trees)
+                                    const sortedOffsets = offsets.sort((a, b) => {
+                                        const aUp = a.y > 0 ? 0 : (a.y < 0 ? 2 : 1); // up=0, same=1, down=2
+                                        const bUp = b.y > 0 ? 0 : (b.y < 0 ? 2 : 1);
+                                        return aUp - bUp;
+                                    });
+                                    for (const off of sortedOffsets) {
                                         const nx = curr.x + off.x, ny = curr.y + off.y, nz = curr.z + off.z;
                                         const key = `${nx},${ny},${nz}`;
                                         if (!visited.has(key)) {
@@ -4045,21 +4113,47 @@ async function processActionQueue() {
                                                 const held = bot.inventory.slots[bot.getEquipmentDestSlot('hand')];
                                                 if (held && held.maxDurability) {
                                                     const usesLeft = held.maxDurability - (held.durabilityUsed || 0);
-                                                    if (usesLeft <= 5) break;
+                                                    if (usesLeft <= 5) {
+                                                        console.log(`[collect] ${action.target}: tool durability critical (${usesLeft} uses left), stopping vein mine`);
+                                                        break;
+                                                    }
                                                 }
                                                 try {
                                                     await withTimeout(bot.pathfinder.goto(new goals.GoalNear(nx, ny, nz, 2)), 5000, 'vein goto', () => bot.pathfinder.setGoal(null));
                                                     await bot.lookAt(adjBlock.position.offset(0.5, 0.5, 0.5));
-                                                    await withTimeout(bot.dig(adjBlock, true), maxDigMs, 'vein dig', () => {});
+                                                    const adjDigTimeMs = adjBlock.digTime(held?.type ?? null, false, false, false, [], bot.entity.effects);
+                                                    await withTimeout(bot.dig(adjBlock, true), Math.max(8000, adjDigTimeMs + 3000), 'vein dig', () => {});
                                                     queue.push(adjBlock.position);
                                                     veinMined++;
-                                                } catch(e) {}
+                                                } catch(e) {
+                                                    console.log(`[collect] Failed to mine connected log at (${nx},${ny},${nz}): ${e.message}`);
+                                                }
                                             }
                                         }
                                     }
                                 }
 
-                                await new Promise(r => setTimeout(r, 600)); // pause for item drop + auto-collect
+                                // BUGFIX (Issue 3/4): Wait longer for items to drop and auto-collect, then explicitly pick up any remaining drops
+                                await new Promise(r => setTimeout(r, 1000)); // 1s for all items to drop and settle
+                                console.log(`[collect] Mined ${veinMined} ${action.target} blocks from tree. Checking for dropped items...`);
+                                
+                                // Explicit item collection: if drops are visible on the ground, navigate and pick them up
+                                const groundBelowTree = bot.blockAt(blockPos.offset(0, -1, 0));
+                                if (groundBelowTree && groundBelowTree.name !== 'air') {
+                                    // Search for dropped items in the tree area
+                                    const dropItems = Object.values(bot.entities).filter(e =>
+                                        e.name && e.name.includes('item') &&
+                                        Math.abs(e.position.x - blockPos.x) <= 3 &&
+                                        Math.abs(e.position.z - blockPos.z) <= 3 &&
+                                        Math.abs(e.position.y - blockPos.y) <= 5
+                                    );
+                                    for (const item of dropItems.slice(0, 5)) {
+                                        try {
+                                            await withTimeout(bot.pathfinder.goto(new goals.GoalNear(item.position.x, item.position.y, item.position.z, 1.5)), 3000, 'pickup item', () => bot.pathfinder.setGoal(null));
+                                            await new Promise(r => setTimeout(r, 200)); // let auto-pickup trigger
+                                        } catch(_) {}
+                                    }
+                                }
 
                                 // Issue 4: count via inventory delta, not dig calls.
                                 // This correctly handles stone→cobblestone, gravel→flint, etc.
@@ -4091,10 +4185,14 @@ async function processActionQueue() {
                     } else {
                         actionQueue = []; // Clear queue on failure
                         bot.chat(`[System Error] Could not find any ${action.target} nearby.`);
-                        const undergroundHint = UNDERGROUND_BLOCKS.has(action.target)
-                            ? ` This is an underground resource. You must mine down through stone layers to find it — issue a collect for "stone" first to dig a shaft, then retry.`
-                            : '';
-                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not find ${action.target} within 128 blocks.${undergroundHint}`, environment: getEnvironmentContext() } });
+                        // BUGFIX (Issue 2): Improved error message with search distance info
+                        let hint = '';
+                        if (UNDERGROUND_BLOCKS.has(action.target)) {
+                            hint = ` This is an underground resource. You must mine down through stone layers to find it — issue a collect for "stone" first to dig a shaft, then retry.`;
+                        } else if (action.target.toLowerCase().includes('log') || action.target.toLowerCase().includes('wood')) {
+                            hint = ` ${action.target} not found within 256 blocks. If there's a forest far away, navigate there first, then retry. For example: "go to X Y Z" then "collect ${action.target}".`;
+                        }
+                        process.send({ type: 'USER_CHAT', data: { username: "System", message: `Could not find ${action.target} within search range (32/64/128/256b).${hint}`, environment: getEnvironmentContext() } });
                     }
                 }
 

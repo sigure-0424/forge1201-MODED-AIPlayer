@@ -1,30 +1,74 @@
 {
-  "timestamp": "2026-04-13T05:12:04.225Z",
+  "timestamp": "2026-04-14T06:39:33.163Z",
   "ready": true,
   "position": {
-    "x": -381.7,
-    "y": 174,
-    "z": -539.7
+    "x": -776.8,
+    "y": 64,
+    "z": -803.7
   },
   "health": 20,
   "food": 20,
   "dimension": "overworld",
   "isExecuting": true,
-  "currentAction": "come",
+  "currentAction": "collect",
   "actionQueue": [],
   "treeDir": null,
   "inventory": [
     {
-      "name": "iron_pickaxe",
-      "count": 1
+      "name": "createbigcannons:built_up_heating",
+      "count": 2
+    },
+    {
+      "name": "createbigcannons:molten_cast_iron",
+      "count": 34
+    },
+    {
+      "name": "createaddition:seed_oil",
+      "count": 4
+    },
+    {
+      "name": "oak_log",
+      "count": 64
+    },
+    {
+      "name": "birch_log",
+      "count": 64
     },
     {
       "name": "wheat_seeds",
       "count": 1
     },
     {
+      "name": "birch_log",
+      "count": 56
+    },
+    {
+      "name": "create:stock_keeper_category",
+      "count": 3
+    },
+    {
+      "name": "create:limestone",
+      "count": 5
+    },
+    {
+      "name": "createbigcannons:set_delayed_inertia_fuze-",
+      "count": 4
+    },
+    {
+      "name": "iron_pickaxe",
+      "count": 1
+    },
+    {
+      "name": "oak_log",
+      "count": 5
+    },
+    {
       "name": "createbigcannons:flowing_molten_nethersteel",
-      "count": 29
+      "count": 59
+    },
+    {
+      "name": "stick",
+      "count": 6
     },
     {
       "name": "iron_shovel",
@@ -33,18 +77,6 @@
     {
       "name": "iron_chestplate",
       "count": 1
-    },
-    {
-      "name": "createbigcannons:molten_cast_iron",
-      "count": 29
-    },
-    {
-      "name": "createbigcannons:flowing_molten_nethersteel",
-      "count": 30
-    },
-    {
-      "name": "create:limestone",
-      "count": 5
     }
   ],
   "armor": {
@@ -52,6 +84,6 @@
     "torso": "create_jetpack:jetpack",
     "legs": "iron_leggings",
     "feet": null,
-    "hand": "createbigcannons:molten_cast_iron"
+    "hand": "create:limestone"
   }
 }
